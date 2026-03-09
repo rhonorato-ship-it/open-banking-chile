@@ -1,8 +1,10 @@
+import bice from "./banks/bice";
 import falabella from "./banks/falabella";
 import type { BankScraper } from "./types";
 
 /** Registro de todos los bancos disponibles */
 export const banks: Record<string, BankScraper> = {
+  bice,
   falabella,
 };
 
@@ -30,4 +32,5 @@ export type {
 } from "./types";
 
 // Re-export individual banks for direct import
+export { default as bice } from "./banks/bice";
 export { default as falabella } from "./banks/falabella";

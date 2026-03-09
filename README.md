@@ -9,6 +9,7 @@ Scrapers open source para bancos chilenos. Obtén tus movimientos bancarios y sa
 | Banco | ID | Estado |
 |-------|----|--------|
 | Banco Falabella | `falabella` | ✅ Funcional |
+| Banco BICE | `bice` | ✅ Funcional |
 | Banco de Chile | `bchile` | 🔜 Próximamente |
 | Banco Santander | `santander` | 🔜 Próximamente |
 | BCI | `bci` | 🔜 Próximamente |
@@ -48,8 +49,16 @@ npm run build
 
 ```bash
 # Configurar credenciales
+
+# Banco Falabella
 export FALABELLA_RUT=12345678-9
 export FALABELLA_PASS=tu_clave
+
+# Banco BICE
+export BICE_RUT=12345678-9
+export BICE_PASS=tu_clave
+## Opcional:  
+export BICE_MONTHS=1 
 
 # Consultar banco
 npx open-banking-chile --bank falabella --pretty
@@ -162,6 +171,9 @@ interface BankScraper {
 ```bash
 # Ejemplo: sincronizar Falabella diariamente a las 7 AM
 0 7 * * * source /home/user/.env && node /path/to/dist/cli.js --bank falabella >> /var/log/bank-sync.log 2>&1
+
+# Ejemplo: sincronizar BICE diariamente y con 3 meses históricos
+0 7 * * * source /home/user/.env && BICE_MONTHS=3 node /path/to/dist/cli.js --bank bice >> /var/log/bank-sync.log 2>&1
 ```
 
 ## Troubleshooting
