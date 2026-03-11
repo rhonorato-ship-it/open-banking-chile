@@ -1,8 +1,9 @@
-import puppeteer, { type Page } from "puppeteer-core";
+import puppeteer, { type Frame, type Page } from "puppeteer-core";
 import type { BankMovement, BankScraper, ScrapeResult, ScraperOptions } from "../types";
 import { closePopups, delay, findChrome, formatRut, saveScreenshot } from "../utils";
 
 const BANK_URL = "https://banco.santander.cl/personas";
+type LoginContext = Page | Frame;
 
 function parseChileanAmount(value: string): number {
   const clean = value.replace(/[^0-9-]/g, "");
@@ -12,11 +13,33 @@ function parseChileanAmount(value: string): number {
   return isNegative ? -amount : amount;
 }
 
-async function fillRut(page: Page, rut: string): Promise<boolean> {
+function normalizeMovementDate(raw: string): string {
+  const value = raw.trim();
+  const fullMatch = value.match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})$/);
+  if (fullMatch) {
+    const day = fullMatch[1].padStart(2, "0");
+    const month = fullMatch[2].padStart(2, "0");
+    const year = fullMatch[3].length === 2 ? `20${fullMatch[3]}` : fullMatch[3];
+    return `${day}-${month}-${year}`;
+  }
+
+  const shortMatch = value.match(/^(\d{1,2})[\/.\-](\d{1,2})$/);
+  if (shortMatch) {
+    const day = shortMatch[1].padStart(2, "0");
+    const month = shortMatch[2].padStart(2, "0");
+    const year = String(new Date().getFullYear());
+    return `${day}-${month}-${year}`;
+  }
+
+  return value;
+}
+
+async function fillRut(context: LoginContext, rut: string): Promise<boolean> {
   const formattedRut = formatRut(rut);
   const cleanRut = rut.replace(/[.\-]/g, "");
 
   const selectors = [
+    "#rut",
     'input[name*="rut"]',
     'input[id*="rut"]',
     'input[placeholder*="RUT"]',
@@ -30,10 +53,10 @@ async function fillRut(page: Page, rut: string): Promise<boolean> {
 
   for (const sel of selectors) {
     try {
-      const el = await page.$(sel);
+      const el = await context.$(sel);
       if (el) {
         await el.click({ clickCount: 3 });
-        await el.type(formattedRut, { delay: 45 });
+        await el.type(sel === "#rut" ? cleanRut : formattedRut, { delay: 45 });
         return true;
       }
     } catch {
@@ -42,7 +65,7 @@ async function fillRut(page: Page, rut: string): Promise<boolean> {
   }
 
   try {
-    const wasFilled = await page.evaluate((rutWithFormat: string, rutWithoutFormat: string) => {
+    const wasFilled = await context.evaluate((rutWithFormat: string, rutWithoutFormat: string) => {
       const candidates = Array.from(document.querySelectorAll("input"));
       for (const input of candidates) {
         const el = input as HTMLInputElement;
@@ -62,8 +85,9 @@ async function fillRut(page: Page, rut: string): Promise<boolean> {
   }
 }
 
-async function fillPassword(page: Page, password: string): Promise<boolean> {
+async function fillPassword(context: LoginContext, password: string): Promise<boolean> {
   const selectors = [
+    "#pass",
     'input[type="password"]',
     'input[name*="pass"]',
     'input[id*="pass"]',
@@ -75,7 +99,7 @@ async function fillPassword(page: Page, password: string): Promise<boolean> {
 
   for (const sel of selectors) {
     try {
-      const el = await page.$(sel);
+      const el = await context.$(sel);
       if (el) {
         await el.click();
         await el.type(password, { delay: 45 });
@@ -86,6 +110,116 @@ async function fillPassword(page: Page, password: string): Promise<boolean> {
     }
   }
 
+  return false;
+}
+
+async function submitLogin(context: LoginContext, page: Page): Promise<void> {
+  const clicked = await context.evaluate(() => {
+    const selectors = ['button[type="submit"]', 'input[type="submit"]', "#btn_login"];
+    for (const sel of selectors) {
+      const el = document.querySelector(sel) as HTMLElement | null;
+      if (!el) continue;
+      const disabled =
+        (el as HTMLButtonElement).disabled ||
+        el.getAttribute("aria-disabled") === "true" ||
+        el.className.includes("disabled");
+      if (disabled) continue;
+      el.click();
+      return true;
+    }
+
+    const candidates = Array.from(document.querySelectorAll("button, a"));
+    for (const candidate of candidates) {
+      const text = (candidate as HTMLElement).innerText?.trim().toLowerCase() || "";
+      if (!text.includes("ingresar") && !text.includes("entrar")) continue;
+      const disabled =
+        (candidate as HTMLButtonElement).disabled ||
+        candidate.getAttribute("aria-disabled") === "true" ||
+        candidate.className.includes("disabled");
+      if (disabled) continue;
+      (candidate as HTMLElement).click();
+      return true;
+    }
+    return false;
+  });
+
+  if (!clicked) {
+    await page.keyboard.press("Enter");
+  }
+}
+
+async function getLoginFrame(page: Page): Promise<Frame | null> {
+  const iframeHandle = await page.$("iframe#login-frame");
+  if (!iframeHandle) return null;
+  return await iframeHandle.contentFrame();
+}
+
+async function waitForLoginInputs(context: LoginContext, timeoutMs: number): Promise<boolean> {
+  try {
+    await context.waitForSelector("#rut", { timeout: timeoutMs });
+    await context.waitForSelector("#pass", { timeout: timeoutMs });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readText(context: LoginContext): Promise<string> {
+  return await context.evaluate(() => (document.body?.innerText || "").toLowerCase());
+}
+
+function has2FAChallenge(text: string): boolean {
+  return (
+    text.includes("clave dinámica") ||
+    text.includes("clave dinamica") ||
+    text.includes("superclave") ||
+    text.includes("segundo factor") ||
+    text.includes("código de verificación") ||
+    text.includes("codigo de verificacion") ||
+    text.includes("ingresa tu token")
+  );
+}
+
+function pickAuthError(candidates: string[]): string | null {
+  const authErrorPattern =
+    /(error|incorrect|inv[aá]lid|rechazad|bloquead|fall[oó]|intenta nuevamente|credencial|autentic|clave.*(err[oó]nea|incorrecta)|rut.*(err[oó]neo|incorrecto))/i;
+
+  for (const candidate of candidates) {
+    const text = candidate.trim();
+    if (!text || text.length < 4 || text.length > 250) continue;
+    if (authErrorPattern.test(text)) return text;
+  }
+
+  return null;
+}
+
+async function getCombinedPageText(page: Page): Promise<string> {
+  let text = await readText(page);
+  const frame = await getLoginFrame(page);
+  if (frame) {
+    try {
+      text += "\n" + (await readText(frame));
+    } catch {
+      // ignore if frame detached/reloaded
+    }
+  }
+  return text;
+}
+
+async function waitForManual2FA(page: Page, debugLog: string[], timeoutSeconds: number): Promise<boolean> {
+  const start = Date.now();
+
+  while ((Date.now() - start) / 1000 < timeoutSeconds) {
+    const text = await getCombinedPageText(page);
+    if (!has2FAChallenge(text)) {
+      debugLog.push("  2FA completado, continuando flujo.");
+      return true;
+    }
+
+    await delay(1500);
+  }
+
+  debugLog.push(`  Timeout esperando aprobación 2FA (${timeoutSeconds}s).`);
   return false;
 }
 
@@ -169,13 +303,17 @@ async function extractMovements(page: Page): Promise<BankMovement[]> {
 
       if (!hasHeader) continue;
 
+      let lastDate = "";
       for (const row of rows) {
         const cells = row.querySelectorAll("td");
         if (cells.length < 3) continue;
 
         const values = Array.from(cells).map((c) => (c as HTMLElement).innerText?.trim() || "");
-        const date = values[dateIndex] || "";
-        if (!date.match(/\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4}/)) continue;
+        const rawDate = values[dateIndex] || "";
+        const hasDate = /^\d{1,2}[\/.\-]\d{1,2}([\/.\-]\d{2,4})?$/.test(rawDate);
+        const date = hasDate ? rawDate : lastDate;
+        if (!date) continue;
+        if (hasDate) lastDate = rawDate;
 
         const description = descriptionIndex >= 0 ? (values[descriptionIndex] || "") : "";
 
@@ -233,7 +371,7 @@ async function extractMovements(page: Page): Promise<BankMovement[]> {
     const balance = movement.balance ? parseChileanAmount(movement.balance) : 0;
 
     return {
-      date: movement.date,
+      date: normalizeMovementDate(movement.date),
       description: movement.description,
       amount,
       balance,
@@ -288,6 +426,111 @@ async function paginateAndExtract(page: Page, debugLog: string[]): Promise<BankM
     seen.add(key);
     return true;
   });
+}
+
+async function navigateToMovements(page: Page, debugLog: string[]): Promise<void> {
+  const sidebarClicked = await page.evaluate(() => {
+    const byId = document.querySelector("#menu-uid-0410") as HTMLElement | null;
+    if (byId) {
+      byId.click();
+      return "sidebar:#menu-uid-0410";
+    }
+
+    const buttons = Array.from(document.querySelectorAll("button, a, span"));
+    for (const button of buttons) {
+      const text = (button as HTMLElement).innerText?.trim().toLowerCase() || "";
+      const rect = (button as HTMLElement).getBoundingClientRect();
+      if (rect.x > 280) continue; // left sidebar area
+      if (text === "cuentas" || text.includes("cuentas")) {
+        (button as HTMLElement).click();
+        return `sidebar:text:${text}`;
+      }
+    }
+    return null;
+  });
+
+  if (sidebarClicked) {
+    debugLog.push(`  Sidebar click: ${sidebarClicked}`);
+    await delay(2000);
+  }
+
+  const submenuByIdClicked = await page.evaluate(() => {
+    const btn = document.querySelector("#menu-uid-0413") as HTMLElement | null;
+    if (!btn) return false;
+    btn.click();
+    return true;
+  });
+
+  if (submenuByIdClicked) {
+    debugLog.push("  Sidebar submenu click: #menu-uid-0413 (Movimientos)");
+    await delay(4500);
+    return;
+  }
+
+  const submenuMovementsClicked = await page.evaluate(() => {
+    const candidates = Array.from(document.querySelectorAll("button, a, span, li, div"));
+    for (const candidate of candidates) {
+      const text = (candidate as HTMLElement).innerText?.trim().toLowerCase() || "";
+      if (text !== "movimientos") continue;
+      const rect = (candidate as HTMLElement).getBoundingClientRect();
+      if (rect.x > 280) continue; // left menu only
+      (candidate as HTMLElement).click();
+      return true;
+    }
+    return false;
+  });
+
+  if (submenuMovementsClicked) {
+    debugLog.push("  Sidebar submenu click: Movimientos");
+    await delay(4500);
+    return;
+  }
+
+  const accountClicked = await page.evaluate(() => {
+    const selectors = [
+      "#cuentas .box-product",
+      "#cuentas .mat-ripple.box-product",
+      "#cuentas .datos",
+      "#cuentas .product-container .mat-ripple",
+    ];
+
+    for (const sel of selectors) {
+      const el = document.querySelector(sel) as HTMLElement | null;
+      if (!el) continue;
+      el.click();
+      return sel;
+    }
+
+    return null;
+  });
+
+  if (accountClicked) {
+    debugLog.push(`  Account click: ${accountClicked}`);
+    await delay(4500);
+    return;
+  }
+
+  const cardMovementsClicked = await page.evaluate(() => {
+    const selectors = [
+      "#tarjetas-creditos .movement",
+      "#tarjetas-creditos .menu-popup .movement",
+      "#tarjetas-creditos .container-hover .movement",
+    ];
+    for (const sel of selectors) {
+      const el = document.querySelector(sel) as HTMLElement | null;
+      if (!el) continue;
+      el.click();
+      return sel;
+    }
+    return null;
+  });
+
+  if (cardMovementsClicked) {
+    debugLog.push(`  Card movements click: ${cardMovementsClicked}`);
+    await delay(4500);
+  } else {
+    debugLog.push("  No direct movement entry point found from dashboard.");
+  }
 }
 
 async function scrape(options: ScraperOptions): Promise<ScrapeResult> {
@@ -361,12 +604,52 @@ async function scrape(options: ScraperOptions): Promise<ScrapeResult> {
     await doSave(page, "01-homepage");
 
     debugLog.push("2. Opening login form...");
-    await clickByText(page, ["ingresar", "acceso clientes", "banco en linea", "iniciar sesión", "iniciar sesion"]);
+    const openLoginClicked =
+      (await page.$eval("#btnIngresar", (el) => {
+        (el as HTMLElement).click();
+        return true;
+      }).catch(() => false)) ||
+      (await clickByText(page, ["ingresar", "acceso clientes", "banco en linea", "iniciar sesión", "iniciar sesion"]));
+
+    if (!openLoginClicked) {
+      const screenshot = await page.screenshot({ encoding: "base64" });
+      return {
+        success: false,
+        bank,
+        movements: [],
+        error: "No se encontró el botón de ingreso de Santander (#btnIngresar).",
+        screenshot: screenshot as string,
+        debug: debugLog.join("\n"),
+      };
+    }
+
     await delay(3500);
     await doSave(page, "02-login");
 
+    let loginContext: LoginContext = page;
+    const loginFrame = await getLoginFrame(page);
+    if (loginFrame) {
+      loginContext = loginFrame;
+      debugLog.push(`  Login iframe detectado: ${loginFrame.url()}`);
+    } else {
+      debugLog.push("  Login iframe no detectado; usando contexto principal.");
+    }
+
+    const loginInputsReady = await waitForLoginInputs(loginContext, 15000);
+    if (!loginInputsReady) {
+      const screenshot = await page.screenshot({ encoding: "base64" });
+      return {
+        success: false,
+        bank,
+        movements: [],
+        error: "No cargaron los campos de login de Santander (#rut/#pass).",
+        screenshot: screenshot as string,
+        debug: debugLog.join("\n"),
+      };
+    }
+
     debugLog.push("3. Filling RUT...");
-    const rutFilled = await fillRut(page, rut);
+    const rutFilled = await fillRut(loginContext, rut);
     if (!rutFilled) {
       const screenshot = await page.screenshot({ encoding: "base64" });
       return {
@@ -380,11 +663,10 @@ async function scrape(options: ScraperOptions): Promise<ScrapeResult> {
     }
 
     await delay(1000);
-    await clickByText(page, ["continuar", "siguiente"]);
     await delay(2500);
 
     debugLog.push("4. Filling password...");
-    const passwordFilled = await fillPassword(page, password);
+    const passwordFilled = await fillPassword(loginContext, password);
     if (!passwordFilled) {
       const screenshot = await page.screenshot({ encoding: "base64" });
       return {
@@ -400,36 +682,32 @@ async function scrape(options: ScraperOptions): Promise<ScrapeResult> {
     await delay(700);
 
     debugLog.push("5. Submitting login...");
-    const submitted = await clickByText(page, ["ingresar", "entrar", "iniciar sesión", "iniciar sesion"]);
-    if (!submitted) {
-      await page.keyboard.press("Enter");
-    }
+    await submitLogin(loginContext, page);
 
     await delay(7000);
     await doSave(page, "03-post-login");
 
-    const pageContent = (await page.content()).toLowerCase();
-    if (
-      pageContent.includes("clave dinámica") ||
-      pageContent.includes("clave dinamica") ||
-      pageContent.includes("superclave") ||
-      pageContent.includes("segundo factor") ||
-      pageContent.includes("token") ||
-      pageContent.includes("código de verificación") ||
-      pageContent.includes("codigo de verificacion")
-    ) {
-      const screenshot = await page.screenshot({ encoding: "base64" });
-      return {
-        success: false,
-        bank,
-        movements: [],
-        error: "El banco pidió segundo factor (2FA), por lo que no se puede completar automáticamente.",
-        screenshot: screenshot as string,
-        debug: debugLog.join("\n"),
-      };
+    let pageContent = await getCombinedPageText(page);
+    if (has2FAChallenge(pageContent)) {
+      const waitSeconds = Math.max(30, parseInt(process.env.SANTANDER_2FA_TIMEOUT_SEC || "180", 10) || 180);
+      debugLog.push(`  2FA detectado. Esperando aprobación manual (${waitSeconds}s máx)...`);
+      const approved = await waitForManual2FA(page, debugLog, waitSeconds);
+      await doSave(page, "03b-after-2fa-wait");
+      if (!approved) {
+        const screenshot = await page.screenshot({ encoding: "base64" });
+        return {
+          success: false,
+          bank,
+          movements: [],
+          error: "Timeout esperando aprobación de 2FA. Aumenta SANTANDER_2FA_TIMEOUT_SEC o vuelve a intentar.",
+          screenshot: screenshot as string,
+          debug: debugLog.join("\n"),
+        };
+      }
+      pageContent = await getCombinedPageText(page);
     }
 
-    const loginError = await page.evaluate(() => {
+    const pageMessages = await page.evaluate(() => {
       const selectors = [
         '[class*="error"]',
         '[class*="alert"]',
@@ -437,18 +715,46 @@ async function scrape(options: ScraperOptions): Promise<ScrapeResult> {
         '[class*="warning"]',
       ];
 
+      const messages: string[] = [];
       for (const selector of selectors) {
         const elements = document.querySelectorAll(selector);
         for (const element of elements) {
           const text = (element as HTMLElement).innerText?.trim();
-          if (text && text.length >= 4 && text.length <= 250) {
-            return text;
-          }
+          if (text) messages.push(text);
         }
       }
 
-      return null;
+      return messages;
     });
+    let loginError = pickAuthError(pageMessages);
+
+    const refreshedFrame = await getLoginFrame(page);
+    if (!loginError && refreshedFrame) {
+      try {
+        const frameMessages = await refreshedFrame.evaluate(() => {
+          const selectors = [
+            '[class*="error"]',
+            '[class*="alert"]',
+            '[role="alert"]',
+            '[class*="warning"]',
+          ];
+
+          const messages: string[] = [];
+          for (const selector of selectors) {
+            const elements = document.querySelectorAll(selector);
+            for (const element of elements) {
+              const text = (element as HTMLElement).innerText?.trim();
+              if (text) messages.push(text);
+            }
+          }
+
+          return messages;
+        });
+        loginError = pickAuthError(frameMessages);
+      } catch {
+        // ignore if frame changed during evaluation
+      }
+    }
 
     if (loginError) {
       const screenshot = await page.screenshot({ encoding: "base64" });
@@ -467,7 +773,7 @@ async function scrape(options: ScraperOptions): Promise<ScrapeResult> {
     await closePopups(page);
 
     debugLog.push("7. Navigating to movements...");
-    await clickByText(page, ["cuentas", "movimientos", "cartola", "últimos movimientos", "ultimos movimientos"]);
+    await navigateToMovements(page, debugLog);
     await delay(4000);
     await doSave(page, "04-movements");
 
