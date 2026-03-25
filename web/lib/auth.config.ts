@@ -12,11 +12,8 @@ export const authConfig = {
   ],
   session: { strategy: "jwt" as const },
   callbacks: {
-    async signIn({ user, account }) {
-      if (account?.provider !== "google" || !user.email) return false;
-      const whitelist = process.env.AUTH_WHITELIST_EMAILS?.split(",").map((e) => e.trim()) ?? [];
-      if (whitelist.length > 0 && !whitelist.includes(user.email)) return false;
-      return true;
+    async signIn({ account }) {
+      return account?.provider === "google";
     },
     async jwt({ token, account, user }) {
       if (account && user) token.sub = user.id;
