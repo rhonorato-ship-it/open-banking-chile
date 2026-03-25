@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { signOut, useSession } from "next-auth/react";
+import { signOut } from "next-auth/react";
 import Link from "next/link";
 import ScrapeProgress from "@/components/ScrapeProgress";
 
@@ -21,7 +21,6 @@ function fmt(n: number) {
 }
 
 export default function DashboardPage() {
-  const { data: session } = useSession();
   const [banks, setBanks] = useState<BankStatus[]>([]);
   const [scraping, setScraping] = useState<{ id: string; name: string } | null>(null);
 
@@ -39,8 +38,6 @@ export default function DashboardPage() {
   const totalChange = connected.reduce((s, b) => s + (b.change30d ?? 0), 0);
   const hasBalance = connected.some((b) => b.balance !== null);
 
-  const initial = session?.user?.name?.[0]?.toUpperCase() ?? session?.user?.email?.[0]?.toUpperCase() ?? "?";
-
   return (
     <div className="min-h-screen bg-[#05050a] text-white">
       {/* Nav */}
@@ -57,7 +54,7 @@ export default function DashboardPage() {
             className="w-8 h-8 rounded-full bg-white/10 hover:bg-white/20 transition-colors flex items-center justify-center text-xs font-bold text-white/70"
             title="Salir"
           >
-            {initial}
+            ↩
           </button>
         </div>
       </nav>

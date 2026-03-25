@@ -25,7 +25,7 @@ export async function GET() {
     ORDER BY bank_id, date DESC, synced_at DESC
   `);
   const balanceMap: Record<string, number> = {};
-  for (const row of latestBalances as { bank_id: string; balance: string }[]) {
+  for (const row of latestBalances as unknown as { bank_id: string; balance: string }[]) {
     balanceMap[row.bank_id] = parseFloat(row.balance);
   }
 
