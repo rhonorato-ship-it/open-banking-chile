@@ -117,7 +117,18 @@ movements (
 
 **Concurrency control:** The `is_syncing` flag on `bank_credentials` acts as a mutex. The SSE route checks `is_syncing = true` and returns 409 if another scrape is already running for that bank+user. The flag is reset to `false` in a `finally` block (success or error). The UI disables the "Sync" button while `is_syncing` is true.
 
-**Stale lock recovery:** If the Vercel function instance is killed (timeout, OOM) before `finally` runs, `is_syncing` stays `true` permanently. To handle this, the lock check also considers the lock stale if `last_synced_at < now() - interval '10 minutes'` — in that case the route treats the bank as unlocked and proceeds. The SSE route sets `is_syncing = true` via `UPDATE ... WHERE user_id = $1 AND bank_id = $2 AND (is_syncing = false OR last_synced_at < now() - interval '10 minutes') RETURNING id` — if the UPDATE returns no rows, another scrape is genuinely in progress and the route returns 409.
+**Stale lock recovery:** If the Vercel function instance is killed (timeout, OOM) before `finally` runs, `is_syncing` stays `true` permanently. To handle this, the lock acquisition and gate check happen in a **single atomic UPDATE**:
+
+```sql
+UPDATE bank_credentials
+SET is_syncing = true
+WHERE user_id = $1
+  AND bank_id = $2
+  AND (is_syncing = false OR last_synced_at < now() - interval '10 minutes')
+RETURNING id
+```
+
+If the UPDATE returns no rows, another scrape is genuinely in progress and the route returns 409. The gate check and `SET is_syncing = true` must not be split into a SELECT + UPDATE — that introduces a race condition.
 
 ---
 
@@ -136,7 +147,14 @@ movements (
 
 `GET /api/scrape/[bankId]`
 
-Uses Vercel Fluid Compute (extended timeout). Returns `text/event-stream`.
+Uses Vercel Fluid Compute. The route file must export two segment config constants to enable streaming and extended timeout:
+
+```ts
+export const dynamic = 'force-dynamic'; // prevents response buffering / static caching
+export const maxDuration = 800;         // seconds; requires Vercel Pro plan
+```
+
+Returns `text/event-stream`.
 
 **Keepalive:** The server emits a comment ping every 20 seconds (`": keepalive\n\n"`) to prevent load balancer and browser idle-connection timeouts during long scrapes (1–3 min). The client EventSource ignores comment lines automatically.
 
@@ -226,10 +244,10 @@ AUTH_GOOGLE_SECRET=
 DATABASE_URL=
 
 # Credential encryption
-CREDENTIALS_SECRET=   # 32-byte hex key
+CREDENTIALS_SECRET=   # 64-character hex string (32 raw bytes) — generate with: openssl rand -hex 32
 
-# Vercel Fluid Compute
-NEXT_PUBLIC_APP_URL=
+# App
+NEXT_PUBLIC_APP_URL=  # e.g. https://your-app.vercel.app (used for Auth.js callback URL)
 ```
 
 ---
