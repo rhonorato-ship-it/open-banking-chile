@@ -11,7 +11,7 @@
   },
   "dependencies": {
     "@auth/core": "^0.37.4",
-    "@neondatabase/serverless": "^0.10.4",
+    "postgres": "^3.4.5",
     "@sparticuz/chromium": "^133.0.0",
     "drizzle-orm": "^0.40.1",
     "next": "^15.3.0",

@@ -1,56 +1,148 @@
 # Open Banking Chile
 
-## For all Agents (open standard)
+## For all Agents (Claude, Codex, Gemini, etc.)
 
 ### What this project does
-Open source multi-bank scraping framework for Chilean banks. Extracts movements and balances as JSON using Puppeteer (headless Chrome). Plugin architecture for adding new banks.
+Open source scraping framework for Chilean banks. Extracts account movements and balances as JSON using Puppeteer (headless Chrome). Includes a multi-user web dashboard deployed on Vercel with Google OAuth.
 
-### Currently supported banks
+### Supported banks (10)
+- Banco de Chile (`bchile`)
+- BCI (`bci`)
+- BancoEstado (`bestado`)
+- BICE (`bice`)
+- Citibank (`citi`)
+- Banco Edwards (`edwards`)
 - Banco Falabella (`falabella`)
+- Itaú (`itau`)
+- Santander (`santander`)
+- Scotiabank (`scotiabank`)
 
-### Setup
+---
+
+## Project structure
+
+```
+src/
+  index.ts                 — Registry of all banks, getBank(), listBanks()
+  types.ts                 — BankScraper interface, BankMovement, ScrapeResult, ScraperOptions
+  utils.ts                 — Shared utilities (formatRut, findChrome, parseChileanAmount, normalizeDate, etc.)
+  cli.ts                   — CLI entry point (--bank, --list, --pretty, --movements)
+  infrastructure/
+    browser.ts             — Centralized browser launch, session management, anti-detection
+    scraper-runner.ts      — Execution pipeline: validate → launch → scrape → logout → cleanup
+  actions/
+    login.ts               — Generic login (RUT formats, password, submit, error detection)
+    navigation.ts          — DOM navigation (click by text, sidebars, banner dismissal)
+    extraction.ts          — Movement extraction from HTML tables with fallbacks
+    pagination.ts          — Multi-page iteration (Siguiente, Ver más)
+    credit-card.ts         — Credit card movement extraction (tabs, billing periods)
+    balance.ts             — Balance extraction (regex + CSS selector fallbacks)
+    two-factor.ts          — 2FA detection and wait (configurable keywords/timeout)
+  banks/
+    falabella.ts, bchile.ts, bci.ts, bestado.ts, bice.ts,
+    edwards.ts, itau.ts, santander.ts, scotiabank.ts, citi.ts
+
+web/                       — Next.js 15 multi-user dashboard (App Router)
+  app/
+    dashboard/             — Bank list, sync buttons
+    banks/                 — Add / edit / remove bank credentials
+    movements/             — Transaction history with filters
+    login/                 — Google OAuth sign-in
+    api/
+      banks/               — CRUD for encrypted bank credentials
+      movements/           — Query movements with filters
+      scrape/[bankId]/     — SSE endpoint: runs scraper, streams progress phases
+  components/
+    ScrapeProgress.tsx     — Full-screen Fintoc-style phase animation
+  lib/
+    auth.ts                — Auth.js v5 (Google OAuth, JWT, email whitelist)
+    db.ts                  — Drizzle ORM + postgres driver
+    schema.ts              — users, bank_credentials, movements tables
+    credentials.ts         — AES-256-GCM encrypt/decrypt for stored credentials
+    hash.ts                — SHA-256 deduplication hash for movements
+  middleware.ts            — Route protection (redirect to /login if unauthenticated)
+  drizzle.config.ts        — Drizzle Kit config (reads DATABASE_URL)
+```
+
+---
+
+## Setup
+
+### CLI
 ```bash
-git clone https://github.com/kaihv/open-banking-chile.git
-cd open-banking-chile
 npm install && npm run build
-cp .env.example .env  # edit with credentials
+cp .env.example .env  # fill in credentials
 ```
 
-### Usage
+### Web dashboard
 ```bash
-# CLI
+cd web && npm install
+# Env vars come from Doppler (see below)
+```
+
+---
+
+## Running
+
+### CLI
+```bash
 source .env && node dist/cli.js --bank falabella --pretty
-
-# Library
-import { getBank } from "open-banking-chile";
-const result = await getBank("falabella")!.scrape({ rut: "...", password: "..." });
 ```
 
-### Adding a new bank
-1. Create `src/banks/<id>.ts` implementing `BankScraper` from `src/types.ts`
-2. Register in `src/index.ts`
-3. See CONTRIBUTING.md for details
-
-### File structure
-```
-src/banks/falabella.ts  — Banco Falabella scraper
-src/types.ts            — BankScraper, BankMovement, ScrapeResult interfaces
-src/utils.ts            — Shared utilities
-src/index.ts            — Bank registry
-src/cli.ts              — CLI entry point
+### Web dashboard (requires Doppler)
+```bash
+cd web
+doppler run --project open-banking-chile --config dev -- npm run dev
+# Open http://localhost:3000
 ```
 
-### Security
-All local, no external servers, credentials via env vars only.
+Required env vars (managed via Doppler project `open-banking-chile`):
+- `DATABASE_URL` — Postgres connection string (Supabase or any standard Postgres)
+- `AUTH_GOOGLE_ID` / `AUTH_GOOGLE_SECRET` — Google OAuth credentials
+- `AUTH_SECRET` — Auth.js session secret (base64, 32 bytes)
+- `CREDENTIALS_SECRET` — AES-256 key for bank credentials (hex, 64 chars = 32 bytes)
+- `AUTH_WHITELIST_EMAILS` — Comma-separated list of allowed emails (optional)
+
+---
+
+## Adding a new bank
+
+1. Create `src/banks/<bank-id>.ts` implementing `BankScraper`
+2. Use `runScraper()` from infrastructure and compose actions from `src/actions/`
+3. Register in `src/index.ts`
+4. Add env vars to `.env.example`
+5. Add bank name to `BANK_NAMES` map in `web/app/movements/page.tsx`
+
+See CONTRIBUTING.md for the full guide.
+
+---
 
 ## Scraper development workflow
 
-When extending bank scrapers (e.g. Banco Edwards/Banco Chile), follow this procedure:
+When extending or debugging a bank scraper, follow this procedure:
 
 1. **Get to a point** — Run the scraper and reach the target page (e.g. post-login dashboard).
 2. **Scrape page** — Save HTML with `--screenshots` (writes to `debug/*.html` when enabled).
 3. **Analyze scraped HTML** — Inspect the DOM to identify selectors, menu labels, and structure.
 4. **Implement** — Add or adjust navigation/extraction logic based on findings.
-5. **Start again** — Run scraper, verify, then repeat for the next step (e.g. movements page).
+5. **Start again** — Run scraper, verify, then repeat for the next step.
 
-Do not skip step 2–3. Do not implement without inspecting the scraped HTML first.
+Do not skip steps 2–3. Do not implement without inspecting the scraped HTML first.
+
+---
+
+## Common issues
+
+- **Chrome not found** → install Chrome or set `CHROME_PATH`
+- **2FA prompt** → cannot be automated; bank security feature
+- **0 movements** → use `--screenshots` to debug DOM structure
+- **Bot detection** → some banks (Citi) require headed mode; `--screenshots` also helps diagnose
+
+---
+
+## Security
+
+- All credentials stored with AES-256-GCM encryption (separate IVs per field)
+- No credentials transmitted to external servers beyond the bank's own website
+- Screenshots may contain sensitive data — handle with care
+- Web dashboard uses JWT-only sessions (no server-side session store)

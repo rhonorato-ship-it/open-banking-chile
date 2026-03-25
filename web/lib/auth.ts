@@ -15,6 +15,8 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
   callbacks: {
     async signIn({ user, account }) {
       if (account?.provider !== "google" || !user.id || !user.email) return false;
+      const whitelist = process.env.AUTH_WHITELIST_EMAILS?.split(",").map((e) => e.trim()) ?? [];
+      if (whitelist.length > 0 && !whitelist.includes(user.email)) return false;
       // Upsert user row — JWT mode has no DB adapter, so we manage it manually
       await db
         .insert(users)
