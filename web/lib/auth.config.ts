@@ -16,7 +16,7 @@ export const authConfig = {
       return account?.provider === "google";
     },
     async jwt({ token, account, user }) {
-      if (account && user) token.sub = user.id;
+      if (account) token.sub = user?.id ?? account.providerAccountId;
       return token;
     },
     async session({ session, token }) {
