@@ -18,7 +18,7 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
             target: users.id,
             set: { name: user.name ?? null, image: user.image ?? null },
           })
-          .catch(() => {});
+          .catch((e) => console.error("[auth] user upsert failed:", e));
       }
       return true;
     },
