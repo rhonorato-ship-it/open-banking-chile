@@ -1,5 +1,6 @@
 "use client";
 
+import { Suspense } from "react";
 import { useEffect, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import Link from "next/link";
@@ -28,6 +29,10 @@ const BANK_NAMES: Record<string, string> = {
 };
 
 export default function MovementsPage() {
+  return <Suspense><MovementsPageContent /></Suspense>;
+}
+
+function MovementsPageContent() {
   const searchParams = useSearchParams();
   const [movements, setMovements] = useState<Movement[]>([]);
   const [loading, setLoading] = useState(true);

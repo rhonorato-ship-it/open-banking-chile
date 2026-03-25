@@ -1,5 +1,6 @@
 "use client";
 
+import { Suspense } from "react";
 import { useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
@@ -13,6 +14,10 @@ interface BankStatus {
 }
 
 export default function BanksPage() {
+  return <Suspense><BanksPageContent /></Suspense>;
+}
+
+function BanksPageContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const preselect = searchParams.get("add");

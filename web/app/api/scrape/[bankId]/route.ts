@@ -1,5 +1,5 @@
 export const dynamic = "force-dynamic";
-export const maxDuration = 800;
+export const maxDuration = 300;
 
 import { auth } from "@/lib/auth";
 import { db } from "@/lib/db";
@@ -63,7 +63,7 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
           RETURNING id
         `);
 
-        if (!locked.rows.length) {
+        if (!locked.length) {
           send({ phase: 1, error: true, message: "Ya hay una sincronización en curso para este banco." });
           controller.close();
           return;
