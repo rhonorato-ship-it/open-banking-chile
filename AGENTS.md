@@ -93,7 +93,7 @@ source .env && node dist/cli.js --bank falabella --pretty
 ```bash
 cd web
 doppler run --project open-banking-chile --config dev -- npm run dev
-# Open http://localhost:3000
+# Open http://localhost:3434
 ```
 
 Required env vars (managed via Doppler project `open-banking-chile`):
