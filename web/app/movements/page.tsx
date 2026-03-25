@@ -57,15 +57,16 @@ function MovementsPageContent() {
   const total = movements.reduce((sum, m) => sum + parseFloat(m.amount), 0);
 
   return (
-    <div className="min-h-screen">
-      <nav className="border-b border-white/5 px-6 py-4 flex items-center justify-between">
-        <Link href="/dashboard" className="flex items-center gap-2">
+    <div className="min-h-screen bg-[#05050a] text-white">
+      <nav className="border-b border-white/[0.06] px-6 py-4 flex items-center justify-between">
+        <Link href="/dashboard" className="flex items-center gap-2.5">
           <div className="w-6 h-6 rounded-full bg-[#0ea5e9]" />
           <span className="font-bold text-sm tracking-tight">Open Banking Chile</span>
         </Link>
-        <Link href="/banks" className="text-sm text-white/50 hover:text-white transition-colors">
-          Cuentas
-        </Link>
+        <div className="flex items-center gap-6">
+          <Link href="/dashboard" className="text-sm text-white/40 hover:text-white transition-colors">Dashboard</Link>
+          <Link href="/banks" className="text-sm text-white/40 hover:text-white transition-colors">Cuentas</Link>
+        </div>
       </nav>
 
       <main className="max-w-5xl mx-auto px-6 py-10">
