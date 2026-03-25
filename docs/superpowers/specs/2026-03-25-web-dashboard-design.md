@@ -70,9 +70,9 @@ open-banking-chile/
 ## Data Model
 
 ```sql
--- Managed by Auth.js
+-- Managed manually (JWT-only Auth.js mode — no DB adapter)
 users (
-  id           TEXT PRIMARY KEY,
+  id           TEXT PRIMARY KEY,              -- Google sub claim
   email        TEXT UNIQUE NOT NULL,
   name         TEXT,
   image        TEXT,
@@ -81,14 +81,16 @@ users (
 
 -- One row per bank per user
 bank_credentials (
-  id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id            TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  bank_id            TEXT NOT NULL,           -- e.g. "falabella", "bci"
-  encrypted_rut      TEXT NOT NULL,           -- AES-256-GCM ciphertext (base64)
-  encrypted_password TEXT NOT NULL,           -- AES-256-GCM ciphertext (base64)
-  iv                 TEXT NOT NULL,           -- random 12-byte IV per row (base64)
-  last_synced_at     TIMESTAMPTZ,
-  created_at         TIMESTAMPTZ DEFAULT now(),
+  id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id              TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  bank_id              TEXT NOT NULL,         -- e.g. "falabella", "bci"
+  encrypted_rut        TEXT NOT NULL,         -- AES-256-GCM ciphertext (base64)
+  encrypted_password   TEXT NOT NULL,         -- AES-256-GCM ciphertext (base64)
+  rut_iv               TEXT NOT NULL,         -- separate random 12-byte IV for RUT
+  password_iv          TEXT NOT NULL,         -- separate random 12-byte IV for password
+  is_syncing           BOOLEAN DEFAULT false, -- concurrency guard
+  last_synced_at       TIMESTAMPTZ,
+  created_at           TIMESTAMPTZ DEFAULT now(),
   UNIQUE (user_id, bank_id)
 )
 
@@ -102,14 +104,18 @@ movements (
   amount      NUMERIC NOT NULL,
   balance     NUMERIC,
   source      TEXT,                           -- "account" | "credit_card"
-  hash        TEXT UNIQUE NOT NULL,           -- sha256(userId+bankId+date+description+amount)
+  hash        TEXT UNIQUE NOT NULL,           -- sha256(userId + bankId + date + description + amount)
   synced_at   TIMESTAMPTZ DEFAULT now()
 )
 ```
 
-**Credential encryption:** AES-256-GCM. Key is a 32-byte `CREDENTIALS_SECRET` env var. Each `bank_credentials` row gets its own random 12-byte IV stored alongside the ciphertext. Decryption only happens inside the SSE API route — credentials are never returned to the client.
+**Credential encryption:** AES-256-GCM. Key is a 32-byte `CREDENTIALS_SECRET` env var. RUT and password each get their own independent random 12-byte IV (`rut_iv`, `password_iv`), stored alongside their respective ciphertexts. Sharing one IV across two encrypted values would break GCM security. Decryption only happens inside the SSE API route — credentials are never returned to the client.
 
-**Movement deduplication:** the `hash` column prevents duplicate rows across scrape runs. Uses `INSERT ... ON CONFLICT (hash) DO NOTHING` so old movements are never overwritten.
+**Movement deduplication:** the `hash` column prevents duplicate rows across scrape runs. Hash is computed as `sha256(userId + bankId + date + description + amount)` — `userId` is included to prevent cross-user hash collisions. Uses `INSERT ... ON CONFLICT (hash) DO NOTHING`.
+
+**Auth.js mode:** JWT-only (no DB adapter). `callbacks.signIn` upserts the user row into the `users` table on first login. Session is a signed JWT; no `sessions` table required.
+
+**Concurrency control:** The `is_syncing` flag on `bank_credentials` acts as a mutex. The SSE route checks `is_syncing = true` and returns 409 if another scrape is already running for that bank+user. The flag is set to `false` in a `finally` block (success or error). The UI disables the "Sync" button while `is_syncing` is true.
 
 ---
 
@@ -143,7 +149,19 @@ On error:
 { "phase": 2, "error": true, "message": "Credenciales incorrectas" }
 ```
 
-The `onProgress` callback on `ScraperOptions` is wired to emit SSE events. Phases 1–4 map to scraper lifecycle hooks; phase 5 fires after DB upsert completes.
+The `onProgress` callback on `ScraperOptions` has the signature `(step: string) => void` and emits free-form strings like `"Abriendo Falabella..."` or `"Extrayendo movimientos..."`. The SSE route maps these strings to phase numbers using keyword detection:
+
+```ts
+function stringToPhase(msg: string): 1 | 2 | 3 | 4 {
+  const m = msg.toLowerCase();
+  if (m.includes("abriendo") || m.includes("navegando") || m.includes("conectando")) return 1;
+  if (m.includes("login") || m.includes("autenti") || m.includes("credencial") || m.includes("ingresando")) return 2;
+  if (m.includes("extray") || m.includes("movimiento") || m.includes("listo")) return 3;
+  return 4; // default: processing
+}
+```
+
+Phase 5 ("Completado") is emitted explicitly by the SSE route after the DB upsert completes, not via `onProgress`.
 
 ---
 
@@ -212,6 +230,19 @@ NEXT_PUBLIC_APP_URL=
 1. `cd web && vercel link` → connect to Vercel project
 2. Install Neon integration from Vercel Marketplace → auto-provisions `DATABASE_URL`
 3. Set remaining env vars via `vercel env add`
-4. `vercel deploy --prod`
+4. Run DB migrations: `npx drizzle-kit push` (one-time; re-run after schema changes)
+5. `vercel deploy --prod`
 
 Vercel Pro plan required for Fluid Compute extended timeout (scrapes run 1–3 minutes per bank).
+
+### Next.js config requirements for @sparticuz/chromium
+
+`next.config.ts` must exclude Chromium from the Next.js bundle and mark it as a server-external package:
+
+```ts
+const nextConfig = {
+  serverExternalPackages: ["@sparticuz/chromium", "puppeteer-core"],
+};
+```
+
+Without this, Next.js will attempt to bundle `@sparticuz/chromium` (a native binary) and fail at build time. The binary is loaded at runtime from `node_modules` on the Vercel function instance.
