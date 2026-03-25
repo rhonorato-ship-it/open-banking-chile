@@ -1,0 +1,40 @@
+services:
+  open-banking-chile:
+    build: .
+    restart: unless-stopped
+    environment:
+      # ── Horario del cron (default: 7am todos los días) ──────
+      CRON_SCHEDULE: "0 7 * * *"
+
+      # ── Google Drive ────────────────────────────────────────
+      # ID de la carpeta donde se guardarán los archivos
+      GOOGLE_DRIVE_FOLDER_ID: ""
+      # Opción 1: JSON de la cuenta de servicio como string
+      GOOGLE_SERVICE_ACCOUNT_KEY: ""
+      # Opción 2: Montar el archivo JSON (ver volumes abajo)
+      # GOOGLE_SERVICE_ACCOUNT_KEY_FILE: /app/credentials/service-account.json
+
+      # ── Credenciales de bancos ──────────────────────────────
+      # Completa solo los bancos que uses
+      FALABELLA_RUT: ""
+      FALABELLA_PASS: ""
+      BCI_RUT: ""
+      BCI_PASS: ""
+      BCHILE_RUT: ""
+      BCHILE_PASS: ""
+      SANTANDER_RUT: ""
+      SANTANDER_PASS: ""
+      ITAU_RUT: ""
+      ITAU_PASS: ""
+      EDWARDS_RUT: ""
+      EDWARDS_PASS: ""
+      BICE_RUT: ""
+      BICE_PASS: ""
+      SCOTIABANK_RUT: ""
+      SCOTIABANK_PASS: ""
+      BESTADO_RUT: ""
+      BESTADO_PASS: ""
+
+    volumes: []
+      # Descomenta para montar el archivo de cuenta de servicio:
+      # - ./service-account.json:/app/credentials/service-account.json:ro
