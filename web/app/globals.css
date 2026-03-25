@@ -1,0 +1,15 @@
+@import "tailwindcss";
+
+:root {
+  --blue: #0ea5e9;
+  --blue-dim: rgba(14, 165, 233, 0.15);
+}
+
+* { box-sizing: border-box; }
+
+body { min-height: 100vh; }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: #111; }
+::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
