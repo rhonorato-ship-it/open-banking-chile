@@ -9,13 +9,17 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
     ...authConfig.callbacks,
     async signIn({ user, account }) {
       if (account?.provider !== "google") return false;
-      await db
-        .insert(users)
-        .values({ id: user.id!, email: user.email!, name: user.name ?? null, image: user.image ?? null })
-        .onConflictDoUpdate({
-          target: users.id,
-          set: { name: user.name ?? null, image: user.image ?? null },
-        });
+      const id = user.id ?? account.providerAccountId;
+      if (id && user.email) {
+        await db
+          .insert(users)
+          .values({ id, email: user.email, name: user.name ?? null, image: user.image ?? null })
+          .onConflictDoUpdate({
+            target: users.id,
+            set: { name: user.name ?? null, image: user.image ?? null },
+          })
+          .catch(() => {});
+      }
       return true;
     },
   },
