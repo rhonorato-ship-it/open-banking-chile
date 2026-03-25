@@ -109,19 +109,22 @@ movements (
 )
 ```
 
-**Credential encryption:** AES-256-GCM. Key is a 32-byte `CREDENTIALS_SECRET` env var. RUT and password each get their own independent random 12-byte IV (`rut_iv`, `password_iv`), stored alongside their respective ciphertexts. Sharing one IV across two encrypted values would break GCM security. Decryption only happens inside the SSE API route — credentials are never returned to the client.
+**Credential encryption:** AES-256-GCM. `CREDENTIALS_SECRET` is a **64-character hex string** (representing 32 raw bytes) stored as a Vercel env var. `lib/credentials.ts` decodes it with `Buffer.from(process.env.CREDENTIALS_SECRET!, "hex")` before passing to `crypto.subtle.importKey` — passing the raw 64-char string as the key would silently produce a 64-byte key and break decryption. RUT and password each get their own independent random 12-byte IV (`rut_iv`, `password_iv`), stored alongside their respective ciphertexts. Decryption only happens inside the SSE API route — credentials are never returned to the client.
 
-**Movement deduplication:** the `hash` column prevents duplicate rows across scrape runs. Hash is computed as `sha256(userId + bankId + date + description + amount)` — `userId` is included to prevent cross-user hash collisions. Uses `INSERT ... ON CONFLICT (hash) DO NOTHING`.
+**Movement deduplication:** the `hash` column prevents duplicate rows across scrape runs. Hash is computed as `sha256(userId + bankId + date + description + amount)` — `userId` is included to prevent cross-user hash collisions. Uses `INSERT ... ON CONFLICT (hash) DO NOTHING`. **Known trade-off:** two legitimately distinct transactions with the same date, description, and amount (e.g., two identical grocery purchases on the same day) will produce the same hash and only one will be stored. This matches the behavior of the existing CLI `deduplicateMovements()` utility and is acceptable.
 
 **Auth.js mode:** JWT-only (no DB adapter). `callbacks.signIn` upserts the user row into the `users` table on first login. Session is a signed JWT; no `sessions` table required.
 
-**Concurrency control:** The `is_syncing` flag on `bank_credentials` acts as a mutex. The SSE route checks `is_syncing = true` and returns 409 if another scrape is already running for that bank+user. The flag is set to `false` in a `finally` block (success or error). The UI disables the "Sync" button while `is_syncing` is true.
+**Concurrency control:** The `is_syncing` flag on `bank_credentials` acts as a mutex. The SSE route checks `is_syncing = true` and returns 409 if another scrape is already running for that bank+user. The flag is reset to `false` in a `finally` block (success or error). The UI disables the "Sync" button while `is_syncing` is true.
+
+**Stale lock recovery:** If the Vercel function instance is killed (timeout, OOM) before `finally` runs, `is_syncing` stays `true` permanently. To handle this, the lock check also considers the lock stale if `last_synced_at < now() - interval '10 minutes'` — in that case the route treats the bank as unlocked and proceeds. The SSE route sets `is_syncing = true` via `UPDATE ... WHERE user_id = $1 AND bank_id = $2 AND (is_syncing = false OR last_synced_at < now() - interval '10 minutes') RETURNING id` — if the UPDATE returns no rows, another scrape is genuinely in progress and the route returns 409.
 
 ---
 
 ## Security
 
 - All routes under `/dashboard`, `/banks`, `/movements`, and `/api/scrape` are protected via Next.js middleware checking the Auth.js session
+- The SSE route **must** authorize the request by fetching `bank_credentials WHERE user_id = session.userId AND bank_id = params.bankId`. Without this explicit check, any authenticated user could scrape another user's credentials by guessing a `bankId`.
 - Credentials encrypted at rest (AES-256-GCM), decrypted only server-side
 - `CREDENTIALS_SECRET` stored as a Vercel environment variable (never in code)
 - Bank credentials never logged, never included in error messages returned to client
@@ -134,6 +137,10 @@ movements (
 `GET /api/scrape/[bankId]`
 
 Uses Vercel Fluid Compute (extended timeout). Returns `text/event-stream`.
+
+**Keepalive:** The server emits a comment ping every 20 seconds (`": keepalive\n\n"`) to prevent load balancer and browser idle-connection timeouts during long scrapes (1–3 min). The client EventSource ignores comment lines automatically.
+
+**Error stream contract:** Every code path that exits abnormally (unhandled exception, DB error, Chromium launch failure) must emit `{ error: true, message: "..." }` before closing the stream. If the stream closes without a `done: true` or `error: true` event, the client must treat it as a connection error and show a generic "Conexión interrumpida — intenta de nuevo" message. The client calls `eventSource.close()` immediately upon receiving any event with `error: true` or `done: true`.
 
 **SSE event shape:**
 ```json
@@ -162,6 +169,8 @@ function stringToPhase(msg: string): 1 | 2 | 3 | 4 {
 ```
 
 Phase 5 ("Completado") is emitted explicitly by the SSE route after the DB upsert completes, not via `onProgress`.
+
+**Fragility note:** `stringToPhase` matches against free-form strings emitted by the bank scrapers. These strings are not a stable API and may change as scrapers are updated. If a string doesn't match any keyword, it falls to phase 4 (processing) — the animation will not stall, but may show the wrong phase label. This is acceptable for v1. Future improvement: add a structured `onPhase` callback to `ScraperOptions` in the library so phase mapping is explicit.
 
 ---
 
@@ -245,4 +254,6 @@ const nextConfig = {
 };
 ```
 
-Without this, Next.js will attempt to bundle `@sparticuz/chromium` (a native binary) and fail at build time. The binary is loaded at runtime from `node_modules` on the Vercel function instance.
+Without this, Next.js will attempt to bundle `@sparticuz/chromium` (a native binary) and fail at build time.
+
+**Binary loading mode:** use `@sparticuz/chromium` in **local binary mode** — the package ships its own pre-built binary inside `node_modules/@sparticuz/chromium/bin/`. Call `chromium.executablePath()` (no arguments) and it returns the path to the local binary. Do **not** call the S3-download variant (`chromium.executablePath("https://...")`) — that mode fetches the binary at runtime from a remote URL and is unreliable on Vercel. The local binary ships inside the Vercel function's `node_modules` and stays well under the 250MB uncompressed function size limit.
