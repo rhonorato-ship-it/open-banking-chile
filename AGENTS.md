@@ -110,15 +110,18 @@ vercel --prod
 ```
 
 Required env vars (managed via Doppler project `open-banking-chile`, config `dev` for local / `prd` for production):
-- `DATABASE_URL` — **Must use the Supabase session pooler URL** (`aws-0-*.pooler.supabase.com:5432`). The direct connection (`db.*.supabase.co:5432`) is unreachable from Vercel and will cause `ENOTFOUND` → auth failures. Get the correct URL from Doppler `prd` config.
+- `SUPABASE_URL` — `https://wcyxlyitcbmeczihaohq.supabase.co` — Supabase project URL for the HTTP client
+- `SUPABASE_ANON_KEY` — Supabase anon JWT — used server-side (RLS is disabled, anon has full table access)
 - `AUTH_URL` — Canonical app URL (`http://localhost:3434` for dev, `https://open-banking-chile.vercel.app` for prd)
 - `AUTH_GOOGLE_ID` / `AUTH_GOOGLE_SECRET` — Google OAuth credentials
 - `AUTH_SECRET` — Auth.js session secret (base64, 32 bytes)
 - `CREDENTIALS_SECRET` — AES-256 key for bank credentials (hex, 64 chars = 32 bytes)
 
+**Database client**: uses `@supabase/supabase-js` (PostgREST HTTP API, not a TCP postgres connection). This was necessary because Supabase's Supavisor TCP pooler credentials couldn't be used from Vercel. The HTTP client works from any serverless environment. `DATABASE_URL` is no longer used.
+
 **Access policy**: any Google account can sign in — there is no email whitelist. Access control is purely "authenticated with Google OAuth". Do not add `AUTH_WHITELIST_EMAILS` back.
 
-> Doppler syncs env vars to Vercel. Do not edit Vercel env vars manually — always update Doppler prd config instead.
+> **Note**: `SUPABASE_URL` and `SUPABASE_ANON_KEY` are set directly in Vercel (not via Doppler). Doppler still manages the other vars. Always add new secrets to Doppler prd config, but these two Supabase vars live in Vercel only.
 
 ---
 
