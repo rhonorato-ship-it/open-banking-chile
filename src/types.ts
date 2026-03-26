@@ -96,6 +96,11 @@ export interface ScraperOptions extends BankCredentials {
   owner?: "T" | "A" | "B";
   /** Callback de progreso para mostrar estado al usuario */
   onProgress?: (step: string) => void;
+  /**
+   * Override all Chrome launch args (replaces DEFAULT_ARGS).
+   * Pass chromium.args from @sparticuz/chromium when running on Vercel/Lambda.
+   */
+  launchArgs?: string[];
 }
 
 /** Interfaz que debe implementar cada banco */

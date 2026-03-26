@@ -89,11 +89,20 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
         send({ phase: 1, label: "Iniciando conexión", message: "Abriendo sesión segura" });
 
         const chromePath = await chromium.executablePath();
+        // @sparticuz/chromium bundles chrome-headless-shell. Its args include
+        // SwiftShader GPU emulation flags required in Lambda-style environments.
+        // Filter out the --headless flag — browser.ts sets headless: false when
+        // launchArgs is present so the flag embedded in the args takes effect.
+        const launchArgs = chromium.args.filter(
+          (a: string) => !a.startsWith("--headless"),
+        );
+        launchArgs.push("--headless=shell"); // explicit, no quoting issues
 
         const result = await bank.scrape({
           rut,
           password,
           chromePath,
+          launchArgs,
           onProgress: (msg: string) => {
             const phase = stringToPhase(msg);
             const labels: Record<Phase, string> = {

@@ -8,6 +8,12 @@ export interface BrowserOptions {
   forceHeadful?: boolean;
   extraArgs?: string[];
   viewport?: { width: number; height: number };
+  /**
+   * Override all Chrome launch args (replaces DEFAULT_ARGS + LAMBDA_ARGS).
+   * Pass chromium.args from @sparticuz/chromium when running on Vercel/Lambda.
+   * When provided, the headless flag must be included in these args.
+   */
+  launchArgs?: string[];
 }
 
 export interface BrowserSession {
@@ -56,7 +62,7 @@ export async function launchBrowser(
   options: BrowserOptions,
   saveScreenshots: boolean,
 ): Promise<BrowserSession> {
-  const { chromePath, headful, forceHeadful, extraArgs, viewport } = options;
+  const { chromePath, headful, forceHeadful, extraArgs, viewport, launchArgs } = options;
   const debugLog: string[] = [];
 
   // Some banks (e.g. BancoEstado) block headless browsers via TLS fingerprinting
@@ -80,11 +86,17 @@ export async function launchBrowser(
     );
   }
 
+  // When caller provides launchArgs (e.g. @sparticuz/chromium.args), the headless
+  // flag is already embedded in those args — pass headless: false so puppeteer
+  // doesn't prepend a conflicting --headless=new flag.
+  // Otherwise default to "shell" mode (compatible with both chrome-headless-shell
+  // and regular Chrome) rather than true (which maps to --headless=new in v22+).
   const isLambda = !!(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
+  const headlessMode: boolean | "shell" = forceHeadful ? false : (headful ? false : "shell");
   const browser = await puppeteer.launch({
     executablePath,
-    headless: forceHeadful ? false : !headful,
-    args: [...DEFAULT_ARGS, ...(isLambda ? LAMBDA_ARGS : []), ...(extraArgs || [])],
+    headless: launchArgs ? false : headlessMode,
+    args: launchArgs ?? [...DEFAULT_ARGS, ...(isLambda ? LAMBDA_ARGS : []), ...(extraArgs || [])],
   });
 
   const page = await browser.newPage();
