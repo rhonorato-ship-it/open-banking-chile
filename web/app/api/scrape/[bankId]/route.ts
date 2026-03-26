@@ -1,6 +1,7 @@
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
 
+import chromium from "@sparticuz/chromium";
 import { auth } from "@/lib/auth";
 import { supabase } from "@/lib/db";
 import { decrypt } from "@/lib/credentials";
@@ -87,9 +88,12 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
 
         send({ phase: 1, label: "Iniciando conexión", message: "Abriendo sesión segura" });
 
+        const chromePath = await chromium.executablePath();
+
         const result = await bank.scrape({
           rut,
           password,
+          chromePath,
           onProgress: (msg: string) => {
             const phase = stringToPhase(msg);
             const labels: Record<Phase, string> = {

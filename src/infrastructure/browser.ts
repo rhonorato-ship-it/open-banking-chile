@@ -27,6 +27,10 @@ const DEFAULT_ARGS = [
   "--disable-blink-features=AutomationControlled",
 ];
 
+// Required when running Chromium inside a container (Vercel / AWS Lambda)
+// without kernel namespace support. Harmless elsewhere.
+const LAMBDA_ARGS = ["--single-process", "--no-zygote"];
+
 const DEFAULT_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
@@ -76,10 +80,11 @@ export async function launchBrowser(
     );
   }
 
+  const isLambda = !!(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
   const browser = await puppeteer.launch({
     executablePath,
     headless: forceHeadful ? false : !headful,
-    args: [...DEFAULT_ARGS, ...(extraArgs || [])],
+    args: [...DEFAULT_ARGS, ...(isLambda ? LAMBDA_ARGS : []), ...(extraArgs || [])],
   });
 
   const page = await browser.newPage();
