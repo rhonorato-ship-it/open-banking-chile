@@ -110,7 +110,7 @@ vercel --prod
 ```
 
 Required env vars (managed via Doppler project `open-banking-chile`, config `dev` for local / `prd` for production):
-- `DATABASE_URL` — Postgres connection string (Supabase session pooler, port 5432)
+- `DATABASE_URL` — **Must use the Supabase session pooler URL** (`aws-0-*.pooler.supabase.com:5432`). The direct connection (`db.*.supabase.co:5432`) is unreachable from Vercel and will cause `ENOTFOUND` → auth failures. Get the correct URL from Doppler `prd` config.
 - `AUTH_URL` — Canonical app URL (`http://localhost:3434` for dev, `https://open-banking-chile.vercel.app` for prd)
 - `AUTH_GOOGLE_ID` / `AUTH_GOOGLE_SECRET` — Google OAuth credentials
 - `AUTH_SECRET` — Auth.js session secret (base64, 32 bytes)
