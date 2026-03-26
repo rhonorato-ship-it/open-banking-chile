@@ -141,7 +141,12 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
         send({ phase: 5, label: "Completado", message: `${inserted} movimientos nuevos sincronizados`, done: true });
       } catch (err) {
         const message = err instanceof Error ? err.message : "Error inesperado";
-        send({ phase: 2, error: true, message });
+        console.error(`[scrape:${bankId}]`, message);
+        send({
+          phase: 2,
+          error: true,
+          message: "No se pudo completar la sincronizacion. Reintenta en unos minutos.",
+        });
       } finally {
         clearInterval(keepaliveInterval);
         await db

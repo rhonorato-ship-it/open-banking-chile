@@ -73,6 +73,14 @@ describe("normalizeDate", () => {
   it("returns unknown format unchanged", () => {
     expect(normalizeDate("unknown")).toBe("unknown");
   });
+
+  it("returns unchanged for unknown textual month", () => {
+    expect(normalizeDate("9 xyz 2026")).toBe("9 xyz 2026");
+  });
+
+  it("returns unchanged when textual date year is missing", () => {
+    expect(normalizeDate("9 mar")).toBe("9 mar");
+  });
 });
 
 describe("normalizeInstallments", () => {

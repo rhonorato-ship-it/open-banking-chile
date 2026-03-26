@@ -69,9 +69,15 @@ export async function fillRut(
     try {
       const el = await context.$(sel);
       if (el) {
+        const maxLength = await el.evaluate((input) => (input as HTMLInputElement).maxLength);
+        const value = selectors?.rutFormat
+          ? formatted
+          : maxLength > 0 && maxLength <= 10
+            ? clean
+            : formatted;
         await el.click({ clickCount: 3 });
-        // For short-maxlength fields, use clean RUT; otherwise formatted
-        await el.type(sel === "#rut" ? clean : formatted, { delay: 45 });
+        // For short-maxlength fields, use clean RUT; otherwise formatted.
+        await el.type(value, { delay: 45 });
         return true;
       }
     } catch {

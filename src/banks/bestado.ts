@@ -62,6 +62,25 @@ async function fillPassword(page: Page, password: string): Promise<boolean> {
     }
   });
 
+  const typed = await page.evaluate((expectedLen: number) => {
+    const input = document.querySelector("#pass") as HTMLInputElement | null;
+    return !!input && input.value.length === expectedLen;
+  }, password.length);
+
+  if (!typed) {
+    const forced = await page.evaluate((pwd: string) => {
+      const input = document.querySelector("#pass") as HTMLInputElement | null;
+      if (!input) return false;
+      input.focus();
+      input.value = pwd;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      return input.value.length === pwd.length;
+    }, password);
+
+    if (!forced) return false;
+  }
+
   return true;
 }
 

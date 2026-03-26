@@ -63,6 +63,7 @@ export async function extractRawMovements(
       }
 
       if (!hasHeader) continue;
+      if (cargoIndex < 0 && abonoIndex < 0 && amountIndex < 0) continue;
 
       let lastDate = "";
       for (const row of rows) {

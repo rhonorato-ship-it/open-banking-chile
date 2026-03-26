@@ -13,6 +13,27 @@ export interface PaginationConfig {
 
 const DEFAULT_NEXT_TEXTS = ["siguiente", "ver más", "mostrar más"];
 
+function movementSignature(movements: BankMovement[]): string {
+  return movements
+    .slice(0, 5)
+    .map((m) => `${m.date}|${m.description}|${m.amount}`)
+    .join("||");
+}
+
+async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function clickNext(page: Page, texts: string[]): Promise<boolean> {
   return await page.evaluate((txts: string[]) => {
     const candidates = Array.from(document.querySelectorAll("button, a"));
@@ -48,12 +69,48 @@ export async function paginateAndExtract(
   const delayMs = config?.delayMs ?? 2500;
   const texts = config?.nextTexts ?? DEFAULT_NEXT_TEXTS;
   const allMovements: BankMovement[] = [];
+  const extractTimeoutMs = 15_000;
+  const clickTimeoutMs = 10_000;
+  let hasLastSignature = false;
+  let lastSignature = "";
+  let stagnantPages = 0;
 
   for (let i = 0; i < maxPages; i++) {
-    const movements = await extractFn(page);
+    let movements: BankMovement[] = [];
+    try {
+      movements = await withTimeout(extractFn(page), extractTimeoutMs, "movement extraction");
+    } catch (error) {
+      debugLog.push(
+        `  Pagination stopped at page ${i + 1}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      break;
+    }
+
+    const signature = movementSignature(movements);
+    if (hasLastSignature && signature === lastSignature) {
+      stagnantPages += 1;
+      if (stagnantPages >= 2) {
+        debugLog.push(`  Pagination stopped: detected repeated page content at page ${i + 1}`);
+        break;
+      }
+    } else {
+      stagnantPages = 0;
+    }
+    lastSignature = signature;
+    hasLastSignature = true;
+
     allMovements.push(...movements);
 
-    const nextClicked = await clickNext(page, texts);
+    let nextClicked = false;
+    try {
+      nextClicked = await withTimeout(clickNext(page, texts), clickTimeoutMs, "next-page click");
+    } catch (error) {
+      debugLog.push(
+        `  Pagination stopped at page ${i + 1}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      break;
+    }
+
     if (!nextClicked) break;
 
     debugLog.push(`  Pagination: loaded page ${i + 2}`);

@@ -296,7 +296,14 @@ async function fetchCreditCardData(page: Page, fullName: string, debugLog: strin
         const ccEntry = creditCards[creditCards.length - 1];
         if (fechas.listaNacional?.[0]) {
           const parts = fechas.listaNacional[0].fechaFacturacion.split("-");
-          if (parts.length >= 2) { const mi = parseInt(parts[1], 10); ccEntry.billingPeriod = `${MONTH_NAMES[mi] ?? parts[1]} ${parts[0]}`; }
+          if (parts.length >= 2) {
+            const mi = parseInt(parts[1], 10);
+            if (Number.isFinite(mi) && mi >= 1 && mi <= 12) {
+              ccEntry.billingPeriod = `${MONTH_NAMES[mi]} ${parts[0]}`;
+            } else {
+              ccEntry.billingPeriod = `${parts[1]} ${parts[0]}`;
+            }
+          }
         }
         const latestFecha = fechas.listaNacional?.[0]?.fechaFacturacion;
         const numeroCuenta = fechas.numeroCuenta;

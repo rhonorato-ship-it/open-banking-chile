@@ -137,13 +137,14 @@ export function normalizeDate(raw: string): string {
   const parts = value.split(/\s+/);
   if (parts.length >= 2) {
     const monthKey = parts.length === 3 ? parts[1].toLowerCase() : parts[0].toLowerCase();
-    if (MONTHS_MAP[monthKey]) {
-      if (parts.length === 3) {
-        return `${parts[0].padStart(2, "0")}-${MONTHS_MAP[monthKey]}-${parts[2]}`;
+    const monthNum = MONTHS_MAP[monthKey];
+    if (monthNum) {
+      if (parts.length >= 3 && parts[2]) {
+        return `${parts[0].padStart(2, "0")}-${monthNum}-${parts[2]}`;
       }
       const dayPart = parts.find((p) => /^\d{1,2}$/.test(p));
       if (dayPart) {
-        return `${dayPart.padStart(2, "0")}-${MONTHS_MAP[monthKey]}-${new Date().getFullYear()}`;
+        return `${dayPart.padStart(2, "0")}-${monthNum}-${new Date().getFullYear()}`;
       }
     }
   }

@@ -34,7 +34,7 @@ async function getLoginFrame(page: Page): Promise<Frame | null> {
   return null;
 }
 
-async function waitForIoBlackBox(frame: Frame | Page, timeoutMs = 8000): Promise<void> {
+async function waitForIoBlackBox(frame: Frame | Page, timeoutMs = 8000): Promise<boolean> {
   // ioBlackBox is a hidden field populated by ThreatMetrix/LexisNexis JS.
   // Submitting without it triggers bot detection — wait for it to be set.
   const deadline = Date.now() + timeoutMs;
@@ -43,10 +43,11 @@ async function waitForIoBlackBox(frame: Frame | Page, timeoutMs = 8000): Promise
       const el = document.querySelector<HTMLInputElement>('[name="ioBlackBox"], #ioBlackBox, input[id*="blackbox" i]');
       return el?.value ?? "";
     });
-    if (val.length > 10) return;
+    if (val.length > 10) return true;
     await delay(300);
   }
   // Proceed anyway — some Citi pages don't use ioBlackBox
+  return false;
 }
 
 async function citiLogin(
@@ -142,7 +143,10 @@ async function citiLogin(
   await page.keyboard.type(password, { delay: 95 });
 
   // Wait for ioBlackBox fingerprint to be populated before submitting
-  await waitForIoBlackBox(frame);
+  const ioBlackBoxReady = await waitForIoBlackBox(frame);
+  if (!ioBlackBoxReady) {
+    debugLog.push("  Warning: ioBlackBox did not populate before submit (continuing best effort)");
+  }
   await delay(1500);
   await doSave(page, "04-citi-pre-submit");
   debugLog.push("3. Submitting...");
