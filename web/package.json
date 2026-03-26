@@ -11,12 +11,13 @@
   },
   "dependencies": {
     "@auth/core": "^0.37.4",
-    "postgres": "^3.4.5",
     "@sparticuz/chromium": "^133.0.0",
+    "@supabase/supabase-js": "^2.100.0",
     "drizzle-orm": "^0.40.1",
     "next": "^15.3.0",
     "next-auth": "^5.0.0-beta.28",
     "open-banking-chile": "file:..",
+    "postgres": "^3.4.5",
     "puppeteer-core": "^24.0.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"

@@ -2,12 +2,10 @@ export const dynamic = "force-dynamic";
 export const maxDuration = 300;
 
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
-import { bankCredentials, movements } from "@/lib/schema";
+import { supabase } from "@/lib/db";
 import { decrypt } from "@/lib/credentials";
 import { movementHash } from "@/lib/hash";
 import { getBank } from "open-banking-chile";
-import { and, eq, sql } from "drizzle-orm";
 
 type Phase = 1 | 2 | 3 | 4 | 5;
 
@@ -53,39 +51,39 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
       keepaliveInterval = setInterval(keepalive, 20_000);
 
       try {
-        // Atomically acquire lock (handles stale locks older than 10 min)
-        const locked = await db.execute(sql`
-          UPDATE bank_credentials
-          SET is_syncing = true
-          WHERE user_id = ${userId}
-            AND bank_id = ${bankId}
-            AND (is_syncing = false OR last_synced_at < now() - interval '10 minutes')
-          RETURNING id
-        `);
+        // Atomically acquire sync lock via RPC
+        const { data: acquired, error: lockError } = await supabase.rpc("acquire_sync_lock", {
+          p_user_id: userId,
+          p_bank_id: bankId,
+        });
 
-        if (!locked.length) {
+        if (lockError || !acquired) {
           send({ phase: 1, error: true, message: "Ya hay una sincronización en curso para este banco." });
           controller.close();
           return;
         }
 
         // Fetch and decrypt credentials — always scoped to this user
-        const cred = await db.query.bankCredentials.findFirst({
-          where: and(eq(bankCredentials.userId, userId), eq(bankCredentials.bankId, bankId)),
-        });
+        const { data: cred } = await supabase
+          .from("bank_credentials")
+          .select("encrypted_rut, rut_iv, encrypted_password, password_iv")
+          .eq("user_id", userId)
+          .eq("bank_id", bankId)
+          .single();
 
         if (!cred) {
-          await db
-            .update(bankCredentials)
-            .set({ isSyncing: false })
-            .where(and(eq(bankCredentials.userId, userId), eq(bankCredentials.bankId, bankId)));
+          await supabase
+            .from("bank_credentials")
+            .update({ is_syncing: false })
+            .eq("user_id", userId)
+            .eq("bank_id", bankId);
           send({ phase: 1, error: true, message: "No se encontraron credenciales para este banco." });
           controller.close();
           return;
         }
 
-        const rut = await decrypt(cred.encryptedRut, cred.rutIv);
-        const password = await decrypt(cred.encryptedPassword, cred.passwordIv);
+        const rut = await decrypt(cred.encrypted_rut, cred.rut_iv);
+        const password = await decrypt(cred.encrypted_password, cred.password_iv);
 
         send({ phase: 1, label: "Iniciando conexión", message: "Abriendo sesión segura" });
 
@@ -112,31 +110,34 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
 
         send({ phase: 4, label: "Procesando datos", message: "Guardando movimientos..." });
 
-        // Upsert movements — conflict on hash is a no-op (known trade-off for same-day duplicates)
+        // Upsert movements — conflict on hash is a no-op (deduplication)
         let inserted = 0;
         for (const m of result.movements) {
           const hash = movementHash(userId, bankId, m.date, m.description, m.amount);
-          const rows = await db
-            .insert(movements)
-            .values({
-              userId,
-              bankId,
-              date: m.date,
-              description: m.description,
-              amount: String(m.amount),
-              balance: m.balance != null ? String(m.balance) : null,
-              source: m.source,
-              hash,
-            })
-            .onConflictDoNothing()
-            .returning({ id: movements.id });
-          inserted += rows.length;
+          const { data: rows } = await supabase
+            .from("movements")
+            .upsert(
+              {
+                user_id: userId,
+                bank_id: bankId,
+                date: m.date,
+                description: m.description,
+                amount: String(m.amount),
+                balance: m.balance != null ? String(m.balance) : null,
+                source: m.source,
+                hash,
+              },
+              { onConflict: "hash", ignoreDuplicates: true },
+            )
+            .select("id");
+          inserted += (rows ?? []).length;
         }
 
-        await db
-          .update(bankCredentials)
-          .set({ isSyncing: false, lastSyncedAt: new Date() })
-          .where(and(eq(bankCredentials.userId, userId), eq(bankCredentials.bankId, bankId)));
+        await supabase
+          .from("bank_credentials")
+          .update({ is_syncing: false, last_synced_at: new Date().toISOString() })
+          .eq("user_id", userId)
+          .eq("bank_id", bankId);
 
         send({ phase: 5, label: "Completado", message: `${inserted} movimientos nuevos sincronizados`, done: true });
       } catch (err) {
@@ -149,11 +150,12 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
         });
       } finally {
         clearInterval(keepaliveInterval);
-        await db
-          .update(bankCredentials)
-          .set({ isSyncing: false })
-          .where(and(eq(bankCredentials.userId, userId), eq(bankCredentials.bankId, bankId)))
-          .catch(() => {}); // best-effort reset
+        supabase
+          .from("bank_credentials")
+          .update({ is_syncing: false })
+          .eq("user_id", userId)
+          .eq("bank_id", bankId)
+          .then(() => {}, () => {}); // best-effort reset
         try { controller.close(); } catch { /* already closed */ }
       }
     },

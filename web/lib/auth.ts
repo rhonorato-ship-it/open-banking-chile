@@ -1,7 +1,6 @@
 import NextAuth from "next-auth";
 import { authConfig } from "./auth.config";
-import { db } from "./db";
-import { users } from "./schema";
+import { supabase } from "./db";
 
 export const { handlers, signIn, signOut, auth } = NextAuth({
   ...authConfig,
@@ -14,19 +13,16 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
       const id = user.id ?? account.providerAccountId;
       if (id) {
         try {
-          await db
-            .insert(users)
-            .values({ id, email: user.email, name: user.name ?? null, image: user.image ?? null })
-            .onConflictDoUpdate({
-              target: users.id,
-              set: {
-                email: user.email,
-                name: user.name ?? null,
-                image: user.image ?? null,
-              },
-            });
+          const { error } = await supabase.from("users").upsert(
+            { id, email: user.email, name: user.name ?? null, image: user.image ?? null },
+            { onConflict: "id" },
+          );
+          if (error) {
+            console.error("[auth] user upsert failed:", error);
+            return false;
+          }
         } catch (e) {
-          console.error("[auth] user upsert failed:", e);
+          console.error("[auth] user upsert exception:", e);
           return false;
         }
       }

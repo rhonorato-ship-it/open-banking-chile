@@ -1,10 +1,8 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
-import { bankCredentials, movements } from "@/lib/schema";
+import { supabase } from "@/lib/db";
 import { encrypt } from "@/lib/credentials";
 import { listBanks } from "open-banking-chile";
-import { and, eq, gte, sql, sum } from "drizzle-orm";
 
 function isValidIsoDate(value: string): boolean {
   return /^\d{4}-\d{2}-\d{2}$/.test(value);
@@ -16,21 +14,26 @@ export async function GET() {
 
   const userId = session.user.id;
   const allBanks = listBanks();
-  const saved = await db.query.bankCredentials.findMany({
-    where: eq(bankCredentials.userId, userId),
-    columns: { id: true, bankId: true, lastSyncedAt: true, isSyncing: true },
-  });
 
-  // Latest balance per bank (most recent movement that has a balance)
-  const latestBalances = await db.execute(sql`
-    SELECT DISTINCT ON (bank_id) bank_id, balance
-    FROM movements
-    WHERE user_id = ${userId} AND balance IS NOT NULL
-    ORDER BY bank_id, date DESC, synced_at DESC
-  `);
+  const { data: saved } = await supabase
+    .from("bank_credentials")
+    .select("id, bank_id, last_synced_at, is_syncing")
+    .eq("user_id", userId);
+
+  // Latest balance per bank: fetch movements with balance, deduplicate by bank_id in JS
+  const { data: balanceRows } = await supabase
+    .from("movements")
+    .select("bank_id, balance, date, synced_at")
+    .eq("user_id", userId)
+    .not("balance", "is", null)
+    .order("date", { ascending: false })
+    .order("synced_at", { ascending: false });
+
   const balanceMap: Record<string, number> = {};
-  for (const row of latestBalances as unknown as { bank_id: string; balance: string }[]) {
-    balanceMap[row.bank_id] = parseFloat(row.balance);
+  for (const row of balanceRows ?? []) {
+    if (!(row.bank_id in balanceMap)) {
+      balanceMap[row.bank_id] = parseFloat(row.balance);
+    }
   }
 
   // 30-day net change per bank
@@ -41,22 +44,24 @@ export async function GET() {
     return NextResponse.json({ error: "Invalid server date" }, { status: 500 });
   }
 
-  const changes = await db
-    .select({ bankId: movements.bankId, change: sum(movements.amount) })
-    .from(movements)
-    .where(and(eq(movements.userId, userId), gte(movements.date, sinceIso)))
-    .groupBy(movements.bankId);
-  const changeMap: Record<string, number> = Object.fromEntries(
-    changes.map((r) => [r.bankId, parseFloat(r.change ?? "0")])
-  );
+  const { data: changeRows } = await supabase
+    .from("movements")
+    .select("bank_id, amount")
+    .eq("user_id", userId)
+    .gte("date", sinceIso);
 
-  const savedMap = Object.fromEntries(saved.map((c) => [c.bankId, c]));
+  const changeMap: Record<string, number> = {};
+  for (const row of changeRows ?? []) {
+    changeMap[row.bank_id] = (changeMap[row.bank_id] ?? 0) + parseFloat(row.amount);
+  }
+
+  const savedMap = Object.fromEntries((saved ?? []).map((c) => [c.bank_id, c]));
   return NextResponse.json(
     allBanks.map((b) => ({
       ...b,
       connected: !!savedMap[b.id],
-      lastSyncedAt: savedMap[b.id]?.lastSyncedAt ?? null,
-      isSyncing: savedMap[b.id]?.isSyncing ?? false,
+      lastSyncedAt: savedMap[b.id]?.last_synced_at ?? null,
+      isSyncing: savedMap[b.id]?.is_syncing ?? false,
       balance: balanceMap[b.id] ?? null,
       change30d: changeMap[b.id] ?? null,
     })),
@@ -99,26 +104,19 @@ export async function POST(req: Request) {
   const encRut = await encrypt(normalizedRut);
   const encPass = await encrypt(password);
 
-  await db
-    .insert(bankCredentials)
-    .values({
-      userId,
-      bankId: normalizedBankId,
-      encryptedRut: encRut.ciphertext,
-      rutIv: encRut.iv,
-      encryptedPassword: encPass.ciphertext,
-      passwordIv: encPass.iv,
-    })
-    .onConflictDoUpdate({
-      target: [bankCredentials.userId, bankCredentials.bankId],
-      set: {
-        encryptedRut: encRut.ciphertext,
-        rutIv: encRut.iv,
-        encryptedPassword: encPass.ciphertext,
-        passwordIv: encPass.iv,
-      },
-    });
+  const { error } = await supabase.from("bank_credentials").upsert(
+    {
+      user_id: userId,
+      bank_id: normalizedBankId,
+      encrypted_rut: encRut.ciphertext,
+      rut_iv: encRut.iv,
+      encrypted_password: encPass.ciphertext,
+      password_iv: encPass.iv,
+    },
+    { onConflict: "user_id,bank_id" },
+  );
 
+  if (error) return NextResponse.json({ error: "Failed to save" }, { status: 500 });
   return NextResponse.json({ ok: true });
 }
 
@@ -141,9 +139,11 @@ export async function DELETE(req: Request) {
     return NextResponse.json({ error: "Missing or invalid bankId" }, { status: 400 });
   }
 
-  await db
-    .delete(bankCredentials)
-    .where(and(eq(bankCredentials.userId, session.user.id), eq(bankCredentials.bankId, bankId)));
+  await supabase
+    .from("bank_credentials")
+    .delete()
+    .eq("user_id", session.user.id)
+    .eq("bank_id", bankId);
 
   return NextResponse.json({ ok: true });
 }

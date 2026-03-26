@@ -1,8 +1,6 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/db";
-import { movements } from "@/lib/schema";
-import { and, desc, eq, gte, lte } from "drizzle-orm";
+import { supabase } from "@/lib/db";
 
 function isValidIsoDate(value: string): boolean {
   return /^\d{4}-\d{2}-\d{2}$/.test(value);
@@ -24,16 +22,30 @@ export async function GET(req: Request) {
     return NextResponse.json({ error: "Invalid 'to' date format. Expected YYYY-MM-DD." }, { status: 400 });
   }
 
-  const filters = [eq(movements.userId, session.user.id)];
-  if (bankId) filters.push(eq(movements.bankId, bankId));
-  if (from) filters.push(gte(movements.date, from));
-  if (to) filters.push(lte(movements.date, to));
+  let query = supabase
+    .from("movements")
+    .select("id, bank_id, date, description, amount, balance, source")
+    .eq("user_id", session.user.id)
+    .order("date", { ascending: false })
+    .limit(500);
 
-  const rows = await db.query.movements.findMany({
-    where: and(...filters),
-    orderBy: [desc(movements.date)],
-    limit: 500,
-  });
+  if (bankId) query = query.eq("bank_id", bankId);
+  if (from) query = query.gte("date", from);
+  if (to) query = query.lte("date", to);
 
-  return NextResponse.json(rows);
+  const { data: rows, error } = await query;
+  if (error) return NextResponse.json({ error: "Failed to fetch movements" }, { status: 500 });
+
+  // Map snake_case DB columns to camelCase for the frontend
+  return NextResponse.json(
+    (rows ?? []).map((r) => ({
+      id: r.id,
+      bankId: r.bank_id,
+      date: r.date,
+      description: r.description,
+      amount: r.amount,
+      balance: r.balance,
+      source: r.source,
+    })),
+  );
 }
