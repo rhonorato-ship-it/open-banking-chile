@@ -35,7 +35,8 @@ export function listBanks(): Array<{ id: string; name: string; url: string }> {
 
 /** Obtener un scraper por ID */
 export function getBank(id: string): BankScraper | undefined {
-  return banks[id];
+  const normalized = id.trim().toLowerCase();
+  return banks[normalized];
 }
 
 // Re-export types

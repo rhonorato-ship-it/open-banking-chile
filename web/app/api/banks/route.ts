@@ -6,6 +6,10 @@ import { encrypt } from "@/lib/credentials";
 import { listBanks } from "open-banking-chile";
 import { and, eq, gte, sql, sum } from "drizzle-orm";
 
+function isValidIsoDate(value: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
 export async function GET() {
   const session = await auth();
   if (!session?.user?.id) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -32,10 +36,15 @@ export async function GET() {
   // 30-day net change per bank
   const since = new Date();
   since.setDate(since.getDate() - 30);
+  const sinceIso = since.toISOString().slice(0, 10);
+  if (!isValidIsoDate(sinceIso)) {
+    return NextResponse.json({ error: "Invalid server date" }, { status: 500 });
+  }
+
   const changes = await db
     .select({ bankId: movements.bankId, change: sum(movements.amount) })
     .from(movements)
-    .where(and(eq(movements.userId, userId), gte(movements.date, since.toISOString().slice(0, 10))))
+    .where(and(eq(movements.userId, userId), gte(movements.date, sinceIso)))
     .groupBy(movements.bankId);
   const changeMap: Record<string, number> = Object.fromEntries(
     changes.map((r) => [r.bankId, parseFloat(r.change ?? "0")])
@@ -58,18 +67,43 @@ export async function POST(req: Request) {
   const session = await auth();
   if (!session?.user?.id) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-  const { bankId, rut, password } = await req.json();
-  if (!bankId || !rut || !password) return NextResponse.json({ error: "Missing fields" }, { status: 400 });
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON payload" }, { status: 400 });
+  }
+
+  const { bankId, rut, password } = (body ?? {}) as {
+    bankId?: unknown;
+    rut?: unknown;
+    password?: unknown;
+  };
+
+  if (typeof bankId !== "string" || typeof rut !== "string" || typeof password !== "string") {
+    return NextResponse.json({ error: "Missing or invalid fields" }, { status: 400 });
+  }
+
+  const normalizedBankId = bankId.trim();
+  const normalizedRut = rut.trim();
+  if (!normalizedBankId || !normalizedRut || !password) {
+    return NextResponse.json({ error: "Missing or invalid fields" }, { status: 400 });
+  }
+
+  const allBanks = listBanks();
+  if (!allBanks.some((b) => b.id === normalizedBankId)) {
+    return NextResponse.json({ error: "Unknown bank" }, { status: 400 });
+  }
 
   const userId = session.user.id;
-  const encRut = await encrypt(rut);
+  const encRut = await encrypt(normalizedRut);
   const encPass = await encrypt(password);
 
   await db
     .insert(bankCredentials)
     .values({
       userId,
-      bankId,
+      bankId: normalizedBankId,
       encryptedRut: encRut.ciphertext,
       rutIv: encRut.iv,
       encryptedPassword: encPass.ciphertext,
@@ -92,7 +126,21 @@ export async function DELETE(req: Request) {
   const session = await auth();
   if (!session?.user?.id) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-  const { bankId } = await req.json();
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON payload" }, { status: 400 });
+  }
+
+  const bankId = typeof (body as { bankId?: unknown })?.bankId === "string"
+    ? (body as { bankId: string }).bankId.trim()
+    : "";
+
+  if (!bankId) {
+    return NextResponse.json({ error: "Missing or invalid bankId" }, { status: 400 });
+  }
+
   await db
     .delete(bankCredentials)
     .where(and(eq(bankCredentials.userId, session.user.id), eq(bankCredentials.bankId, bankId)));

@@ -9,12 +9,18 @@ config();
 
 function parseDMY(date: string): number {
   const [d, m, y] = date.split("-").map(Number);
+  if (!Number.isFinite(d) || !Number.isFinite(m) || !Number.isFinite(y)) return NaN;
   return new Date(y, m - 1, d).getTime();
 }
 
 function parseYMD(date: string): number {
   const [y, m, d] = date.split("-").map(Number);
+  if (!Number.isFinite(d) || !Number.isFinite(m) || !Number.isFinite(y)) return NaN;
   return new Date(y, m - 1, d).getTime();
+}
+
+function isValidIsoDate(value?: string): value is string {
+  return !!value && /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(parseYMD(value));
 }
 
 function filterByDate(
@@ -112,6 +118,22 @@ Ejemplos:
 
   const fromDate = getArg("--from");
   const toDate = getArg("--to");
+
+  if (fromDate && !isValidIsoDate(fromDate)) {
+    console.error(`Error: --from inválido (esperado YYYY-MM-DD): ${fromDate}`);
+    process.exit(1);
+  }
+
+  if (toDate && !isValidIsoDate(toDate)) {
+    console.error(`Error: --to inválido (esperado YYYY-MM-DD): ${toDate}`);
+    process.exit(1);
+  }
+
+  if (fromDate && toDate && parseYMD(fromDate) > parseYMD(toDate)) {
+    console.error("Error: --from no puede ser mayor que --to");
+    process.exit(1);
+  }
+
   const ownerVal = getArg("--owner")?.toUpperCase();
   const owner =
     ownerVal === "T" || ownerVal === "A" || ownerVal === "B" ? ownerVal : undefined;
@@ -198,8 +220,8 @@ Ejemplos:
   }
 
   // ── Single bank mode ──────────────────────────────────────
-  const bankId = getArg("--bank");
-  if (!bankId) {
+  const bankArg = getArg("--bank");
+  if (!bankArg) {
     const available = Object.keys(banks).join(", ");
     console.error(
       `Error: Debes especificar un banco con --bank <id> o usar --all\n` +
@@ -209,10 +231,12 @@ Ejemplos:
     process.exit(1);
   }
 
+  const bankId = bankArg.trim().toLowerCase();
+
   const bank = getBank(bankId);
   if (!bank) {
     const available = Object.keys(banks).join(", ");
-    const safeBankId = bankId.replace(/[^a-z0-9]/gi, "").slice(0, 32);
+    const safeBankId = bankArg.replace(/[^a-z0-9]/gi, "").slice(0, 32);
     console.error(
       `Error: Banco "${safeBankId}" no encontrado.\n` +
         `Bancos disponibles: ${available}\n` +

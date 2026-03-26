@@ -35,7 +35,8 @@ export async function syncBank(
   bankId: string,
   newMovements: BankMovement[]
 ): Promise<SyncResult> {
-  if (!BANK_ID_RE.test(bankId)) {
+  const normalizedBankId = bankId.trim().toLowerCase();
+  if (!BANK_ID_RE.test(normalizedBankId)) {
     throw new Error(`Invalid bank ID: "${bankId.slice(0, 32)}"`);
   }
 
@@ -48,29 +49,29 @@ export async function syncBank(
   const client = new GoogleDriveClient();
 
   // ── Per-bank files ────────────────────────────────────────
-  const existingCSV = await client.downloadFile(`${bankId}.csv`, folderId);
+  const existingCSV = await client.downloadFile(`${normalizedBankId}.csv`, folderId);
   const existing = existingCSV ? parseCSV(existingCSV) : [];
   const merged = deduplicateMovements([...newMovements, ...existing]);
   merged.sort((a, b) => sortByDate(b.date) - sortByDate(a.date));
   const newCount = Math.max(0, merged.length - existing.length);
 
   await client.uploadOrUpdate(
-    `${bankId}.csv`,
+    `${normalizedBankId}.csv`,
     Buffer.from(toCSV(merged), "utf-8"),
     "text/csv",
     folderId
   );
-  await client.uploadOrUpdate(`${bankId}.xlsx`, await toXLSX(merged), XLSX_MIME, folderId);
+  await client.uploadOrUpdate(`${normalizedBankId}.xlsx`, await toXLSX(merged), XLSX_MIME, folderId);
 
   // ── Combined files ────────────────────────────────────────
   const existingCombinedCSV = await client.downloadFile(COMBINED_CSV, folderId);
   const otherBanks: MovementWithBank[] = existingCombinedCSV
-    ? parseCombinedCSV(existingCombinedCSV).filter((m) => m.bank !== bankId)
+    ? parseCombinedCSV(existingCombinedCSV).filter((m) => m.bank !== normalizedBankId)
     : [];
 
   const combined: MovementWithBank[] = [
     ...otherBanks,
-    ...merged.map((m) => ({ ...m, bank: bankId })),
+    ...merged.map((m) => ({ ...m, bank: normalizedBankId })),
   ];
   combined.sort((a, b) => sortByDate(b.date) - sortByDate(a.date));
 

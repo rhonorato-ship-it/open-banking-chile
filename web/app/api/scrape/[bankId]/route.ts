@@ -7,7 +7,7 @@ import { bankCredentials, movements } from "@/lib/schema";
 import { decrypt } from "@/lib/credentials";
 import { movementHash } from "@/lib/hash";
 import { getBank } from "open-banking-chile";
-import { and, eq, lt, or, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 
 type Phase = 1 | 2 | 3 | 4 | 5;
 

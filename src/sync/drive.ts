@@ -4,6 +4,10 @@ import { Readable } from "stream";
 export class GoogleDriveClient {
   private drive: ReturnType<typeof google.drive>;
 
+  private escapeQueryLiteral(value: string): string {
+    return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  }
+
   constructor() {
     const keyFile = process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE;
     const keyJson = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
@@ -41,8 +45,10 @@ export class GoogleDriveClient {
 
   /** Find file ID by name within a folder, returns null if not found */
   private async findFile(name: string, folderId: string): Promise<string | null> {
+    const safeName = this.escapeQueryLiteral(name);
+    const safeFolderId = this.escapeQueryLiteral(folderId);
     const res = await this.drive.files.list({
-      q: `name='${name}' and '${folderId}' in parents and trashed=false`,
+      q: `name='${safeName}' and '${safeFolderId}' in parents and trashed=false`,
       fields: "files(id)",
       pageSize: 1,
     });
