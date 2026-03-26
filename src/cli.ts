@@ -145,11 +145,11 @@ Ejemplos:
   if (flags.has("--all")) {
     const configured = Object.entries(banks).filter(([id]) => {
       const prefix = id.toUpperCase();
-      return process.env[`${prefix}_RUT`] && process.env[`${prefix}_PASS`];
+      return process.env[`${prefix}_RUT`] && (process.env[`${prefix}_PASS`] || process.env[`${prefix}_PASSWORD`]);
     });
 
     if (configured.length === 0) {
-      console.error("Error: No hay bancos configurados. Agrega variables <BANCO>_RUT y <BANCO>_PASS.");
+      console.error("Error: No hay bancos configurados. Agrega variables <BANCO>_RUT y <BANCO>_PASS (o <BANCO>_PASSWORD).");
       process.exit(1);
     }
 
@@ -159,7 +159,7 @@ Ejemplos:
     for (const [id, bank] of configured) {
       const prefix = id.toUpperCase();
       const rut = process.env[`${prefix}_RUT`]!;
-      const password = process.env[`${prefix}_PASS`]!;
+      const password = (process.env[`${prefix}_PASS`] || process.env[`${prefix}_PASSWORD`])!;
 
       if (isTTY) {
         spinner.start(`${bank.name}...`);
@@ -247,13 +247,13 @@ Ejemplos:
 
   const prefix = bankId.toUpperCase();
   const rut = process.env[`${prefix}_RUT`];
-  const password = process.env[`${prefix}_PASS`];
+  const password = process.env[`${prefix}_PASS`] || process.env[`${prefix}_PASSWORD`];
 
   if (!rut || !password) {
     console.error(
-      `Error: Se requieren las variables ${prefix}_RUT y ${prefix}_PASS\n` +
+      `Error: Se requieren las variables ${prefix}_RUT y ${prefix}_PASS (o ${prefix}_PASSWORD)\n` +
         `Ejemplo: ${prefix}_RUT=12345678-9 ${prefix}_PASS=miclave open-banking-chile --bank ${bankId}\n` +
-        `O copia .env.example a .env y rellena tus datos.`
+        `O usa: doppler run -- open-banking-chile --bank ${bankId}`
     );
     process.exit(1);
   }

@@ -97,6 +97,12 @@ export interface ScraperOptions extends BankCredentials {
   /** Callback de progreso para mostrar estado al usuario */
   onProgress?: (step: string) => void;
   /**
+   * Callback para obtener un código 2FA cuando el banco lo solicite.
+   * Debe retornar el código como string (ej: "123456").
+   * Si no se provee, el scraper intentará leer de stdin (TTY) si está disponible.
+   */
+  onTwoFactorCode?: () => Promise<string>;
+  /**
    * Override all Chrome launch args (replaces DEFAULT_ARGS).
    * Pass chromium.args from @sparticuz/chromium when running on Vercel/Lambda.
    */

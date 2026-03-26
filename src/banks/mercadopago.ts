@@ -5,6 +5,7 @@ import { closePopups, delay, parseChileanAmount, normalizeDate, deduplicateMovem
 import { runScraper } from "../infrastructure/scraper-runner.js";
 import type { BrowserSession } from "../infrastructure/browser.js";
 import { detectLoginError } from "../actions/login.js";
+import { loadCookies, saveCookies } from "../infrastructure/cookies.js";
 
 // ─── MercadoPago-specific constants ──────────────────────────────
 
@@ -20,7 +21,23 @@ async function mercadopagoLogin(
   password: string,
   debugLog: string[],
   doSave: (page: Page, name: string) => Promise<void>,
+  onTwoFactorCode?: () => Promise<string>,
 ): Promise<{ success: boolean; error?: string }> {
+  // Try to restore a saved session — if cookies are valid, skip the full login flow
+  debugLog.push("0. Loading saved cookies (if any)...");
+  const hadCookies = await loadCookies(page, "mercadopago");
+  if (hadCookies) {
+    debugLog.push("  Cookies loaded — checking if session is still valid...");
+    await page.goto(ACTIVITIES_URL, { waitUntil: "networkidle2", timeout: 30000 });
+    await delay(2000);
+    const urlAfterCookies = page.url();
+    if (!urlAfterCookies.includes("/login") && !urlAfterCookies.includes("/lgz/") && !urlAfterCookies.includes("mercadolibre.com/jms")) {
+      debugLog.push("  Session valid! Skipping login.");
+      return { success: true };
+    }
+    debugLog.push("  Session expired — proceeding with full login.");
+  }
+
   debugLog.push("1. Navigating to MercadoLibre login...");
   await page.goto(LOGIN_URL, { waitUntil: "networkidle2", timeout: 60000 });
   await delay(4000);
@@ -78,7 +95,27 @@ async function mercadopagoLogin(
   await delay(4000);
   await doSave(page, "02-after-identifier");
 
-  // Password field (shown after identifier step)
+  // MercadoLibre may show a verification method picker ("Elige un método de verificación")
+  // before the password field. Use Puppeteer's native click (not el.click() inside evaluate)
+  // so React synthetic event handlers fire correctly on Andes components.
+  debugLog.push("3b. Checking for verification method picker...");
+  let pickerClicked = false;
+  const candidateEls = await page.$$("a, button, li, [role='button'], [role='option'], [role='listitem']");
+  for (const el of candidateEls) {
+    const text = await el.evaluate(e => (e as HTMLElement).innerText?.trim().toLowerCase() || "");
+    if (text === "contraseña" || text.startsWith("contraseña")) {
+      await el.click();
+      pickerClicked = true;
+      debugLog.push("  Method picker found — clicked Contraseña (Puppeteer native click)");
+      break;
+    }
+  }
+  if (pickerClicked) {
+    await delay(3000);
+    await doSave(page, "02b-after-method-pick");
+  }
+
+  // Password field (shown after identifier step or after method selection)
   debugLog.push("4. Filling password...");
   const passEl = await page.$('#password, input[name="password"], input[type="password"]');
   if (!passEl) {
@@ -109,15 +146,122 @@ async function mercadopagoLogin(
   await delay(3000);
   await doSave(page, "03-post-login");
 
+  // MercadoLibre may show a 2FA device-recognition challenge:
+  // "Usa un segundo método de verificación para confirmar que la cuenta te pertenece"
+  const needs2FA = await page.evaluate(() => {
+    const body = document.body?.innerText || "";
+    return body.includes("segundo método de verificación") || body.includes("verificar que eres tú");
+  });
+
+  if (needs2FA) {
+    debugLog.push("6. 2FA required — clicking Continuar...");
+    const continueClicked = await page.evaluate(() => {
+      const btns = Array.from(document.querySelectorAll("button, a"));
+      for (const btn of btns) {
+        const text = (btn as HTMLElement).innerText?.trim().toLowerCase() || "";
+        if (text === "continuar" || text === "continue") { (btn as HTMLElement).click(); return true; }
+      }
+      return false;
+    });
+    if (continueClicked) {
+      await delay(3000);
+      await doSave(page, "04-2fa-method-picker");
+
+      // Prefer email as the 2FA method — least friction for automated flows
+      const emailMethodClicked = await (async () => {
+        const els = await page.$$("a, button, li, [role='button'], [role='option'], [role='listitem']");
+        for (const el of els) {
+          const text = await el.evaluate(e => (e as HTMLElement).innerText?.trim().toLowerCase() || "");
+          if (text.startsWith("e-mail") || text.startsWith("email") || text.startsWith("correo")) {
+            await el.click();
+            return true;
+          }
+        }
+        return false;
+      })();
+
+      if (emailMethodClicked) {
+        debugLog.push("  Email 2FA selected — waiting for code...");
+        await delay(3000);
+        await doSave(page, "04b-2fa-code-input");
+
+        // Retrieve the 2FA code (via callback or interactive TTY prompt)
+        let code = "";
+        if (onTwoFactorCode) {
+          code = await onTwoFactorCode();
+        } else if (process.stdin.isTTY) {
+          code = await new Promise<string>((resolve) => {
+            process.stderr.write("\n🔐 MercadoPago: ingresa el código 2FA enviado a tu email: ");
+            process.stdin.once("data", (d) => resolve(d.toString().trim()));
+          });
+        }
+
+        if (code) {
+          const codeInput = await page.$('input[type="text"], input[type="number"], input[name*="code"], input[name*="otp"], input[placeholder*="código" i]');
+          if (codeInput) {
+            await codeInput.click({ clickCount: 3 });
+            await codeInput.type(code, { delay: 70 });
+            await delay(500);
+            // Submit the code
+            await page.evaluate(() => {
+              const btns = Array.from(document.querySelectorAll("button[type='submit'], button"));
+              for (const btn of btns) {
+                const text = (btn as HTMLElement).innerText?.trim().toLowerCase() || "";
+                if (text.includes("confirmar") || text.includes("verificar") || text === "continuar") {
+                  (btn as HTMLElement).click(); return;
+                }
+              }
+              (document.querySelector('button[type="submit"]') as HTMLButtonElement | null)?.click();
+            });
+            try { await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 30000 }); } catch { await delay(5000); }
+            await delay(2000);
+            await doSave(page, "05-post-2fa");
+          }
+        }
+      } else {
+        // Non-automatable 2FA (QR code, facial recognition).
+        // In headful mode: wait up to 2 min for the user to complete it manually.
+        // The browser window is visible — the user scans the QR with the MercadoLibre app.
+        const isHeadful = !!(process.env.MERCADOPAGO_HEADFUL || (page as unknown as { _target?: unknown })._target);
+        if (process.stderr.isTTY) {
+          process.stderr.write(
+            "\n🔐 MercadoPago requiere verificación QR o facial.\n" +
+            "   Completa la verificación en la ventana del navegador (si usaste --headful).\n" +
+            "   Esperando hasta 2 minutos...\n"
+          );
+        }
+        debugLog.push("  Waiting up to 2min for manual 2FA (QR/facial)...");
+        try {
+          // waitForNavigation is safer here than waitForFunction — avoids "context destroyed" errors
+          await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 120000 });
+          await delay(2000);
+          await doSave(page, "05-post-manual-2fa");
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          // "Execution context was destroyed" means a navigation happened — treat as success
+          if (msg.includes("context was destroyed") || msg.includes("detached")) {
+            await delay(2000);
+            await doSave(page, "05-post-manual-2fa");
+          } else {
+            await doSave(page, "04-2fa-timeout");
+            return { success: false, error: "Tiempo de espera agotado para 2FA. Corre con --headful para completar QR manualmente la primera vez." };
+          }
+        }
+      }
+    }
+  }
+
   const loginError = await detectLoginError(page);
   if (loginError) return { success: false, error: `Error del banco: ${loginError}` };
 
   const url = page.url();
   if (url.includes("/login") || url.includes("/lgz/") || url.includes("mercadolibre.com/jms")) {
-    return { success: false, error: "Login no completado — URL sigue en login de ML." };
+    return { success: false, error: "Login no completado — requiere 2FA manual." };
   }
 
-  debugLog.push("6. Login OK!");
+  // Save session cookies so subsequent runs skip the login/2FA flow
+  await saveCookies(page, "mercadopago");
+  debugLog.push("6. Login OK! Session cookies saved.");
   return { success: true };
 }
 
@@ -212,7 +356,7 @@ async function scrapeMercadopago(session: BrowserSession, options: ScraperOption
   const progress = onProgress || (() => {});
 
   progress("Abriendo MercadoPago...");
-  const loginResult = await mercadopagoLogin(page, identifier, password, debugLog, doSave);
+  const loginResult = await mercadopagoLogin(page, identifier, password, debugLog, doSave, options.onTwoFactorCode);
   if (!loginResult.success) {
     const ss = await page.screenshot({ encoding: "base64" });
     return { success: false, bank, movements: [], error: loginResult.error, screenshot: ss as string, debug: debugLog.join("\n") };

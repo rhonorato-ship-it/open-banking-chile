@@ -98,11 +98,48 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
         );
         launchArgs.push("--headless=shell"); // explicit, no quoting issues
 
+        // Load stored browser cookies (if any) — avoids 2FA on repeat runs
+        const { data: credWithCookies } = await supabase
+          .from("bank_credentials")
+          .select("encrypted_cookies, cookies_iv")
+          .eq("user_id", userId)
+          .eq("bank_id", bankId)
+          .single();
+
+        let storedCookiesJson: string | undefined;
+        if (credWithCookies?.encrypted_cookies && credWithCookies?.cookies_iv) {
+          try {
+            storedCookiesJson = await decrypt(credWithCookies.encrypted_cookies, credWithCookies.cookies_iv);
+          } catch { /* non-fatal */ }
+        }
+
+        // 2FA code exchange: SSE signals the frontend, which POSTs the code to a Supabase row.
+        // The onTwoFactorCode callback polls for up to 90s (matching typical bank code TTL).
+        const onTwoFactorCode = async (): Promise<string> => {
+          send({ phase: 2, requires_2fa: true, label: "Verificación requerida", message: "El banco solicita un código de verificación. Ingresa el código que recibiste." });
+          const deadline = Date.now() + 90_000;
+          while (Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, 2000));
+            const { data: row } = await supabase
+              .from("pending_2fa")
+              .select("code")
+              .eq("user_id", userId)
+              .eq("bank_id", bankId)
+              .single();
+            if (row?.code) {
+              await supabase.from("pending_2fa").delete().eq("user_id", userId).eq("bank_id", bankId);
+              return row.code as string;
+            }
+          }
+          return "";
+        };
+
         const result = await bank.scrape({
           rut,
           password,
           chromePath,
           launchArgs,
+          onTwoFactorCode,
           onProgress: (msg: string) => {
             const phase = stringToPhase(msg);
             const labels: Record<Phase, string> = {
@@ -115,6 +152,19 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
             send({ phase, label: labels[phase], message: msg });
           },
         });
+
+        // Persist session cookies so the next sync skips 2FA
+        if (result.success && result.sessionCookies) {
+          try {
+            const { encrypt } = await import("@/lib/credentials");
+            const { ciphertext, iv } = await encrypt(result.sessionCookies);
+            await supabase
+              .from("bank_credentials")
+              .update({ encrypted_cookies: ciphertext, cookies_iv: iv })
+              .eq("user_id", userId)
+              .eq("bank_id", bankId);
+          } catch { /* non-fatal */ }
+        }
 
         if (!result.success) {
           send({ phase: 2, error: true, message: result.error ?? "Error desconocido al scrapear el banco." });

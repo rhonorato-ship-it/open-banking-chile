@@ -5,6 +5,7 @@ import { closePopups, delay, parseChileanAmount, normalizeDate, deduplicateMovem
 import { runScraper } from "../infrastructure/scraper-runner.js";
 import type { BrowserSession } from "../infrastructure/browser.js";
 import { detectLoginError } from "../actions/login.js";
+import { loadCookies, saveCookies } from "../infrastructure/cookies.js";
 
 // ─── Racional-specific constants ─────────────────────────────────
 
@@ -18,7 +19,21 @@ async function racionalLogin(
   password: string,
   debugLog: string[],
   doSave: (page: Page, name: string) => Promise<void>,
+  onTwoFactorCode?: () => Promise<string>,
 ): Promise<{ success: boolean; error?: string }> {
+  // Try to restore saved session first
+  debugLog.push("0. Loading saved cookies...");
+  const hadCookies = await loadCookies(page, "racional");
+  if (hadCookies) {
+    await page.goto("https://app.racional.cl/", { waitUntil: "networkidle2", timeout: 30000 });
+    await delay(2000);
+    if (!page.url().includes("/login")) {
+      debugLog.push("  Session valid — skipping login.");
+      return { success: true };
+    }
+    debugLog.push("  Session expired — proceeding with full login.");
+  }
+
   debugLog.push("1. Navigating to Racional...");
   await page.goto(LOGIN_URL, { waitUntil: "networkidle2", timeout: 30000 });
   await delay(3000);
@@ -94,6 +109,54 @@ async function racionalLogin(
   await delay(2000);
   await doSave(page, "03-post-login");
 
+  // Detect email 2FA dialog ("Verifica tu Correo" / "código de 6 dígitos")
+  const needs2FA = await page.evaluate(() => {
+    const body = document.body?.innerText || "";
+    return body.includes("Verifica tu Correo") || body.includes("código de 6 dígitos") || body.includes("Verificar Código");
+  });
+
+  if (needs2FA) {
+    debugLog.push("5. Email 2FA required — waiting for code...");
+    await doSave(page, "03b-2fa-email");
+
+    let code = "";
+    if (onTwoFactorCode) {
+      code = await onTwoFactorCode();
+    } else if (process.stdin.isTTY) {
+      code = await new Promise<string>((resolve) => {
+        process.stderr.write("\n🔐 Racional: ingresa el código de 6 dígitos enviado a tu correo: ");
+        process.stdin.once("data", (d) => resolve(d.toString().trim()));
+      });
+    }
+
+    if (!code) {
+      return { success: false, error: "Se requiere código 2FA de email (Racional). Proporciona onTwoFactorCode o usa TTY." };
+    }
+
+    const codeInput = await page.$('input[placeholder*="123456"], input[type="text"], input[type="number"]');
+    if (codeInput) {
+      await codeInput.click({ clickCount: 3 });
+      await codeInput.type(code, { delay: 70 });
+      await delay(300);
+    }
+
+    // Click "Verificar Código"
+    await page.evaluate(() => {
+      const btns = Array.from(document.querySelectorAll("button"));
+      for (const btn of btns) {
+        const text = (btn as HTMLElement).innerText?.trim().toLowerCase() || "";
+        if (text.includes("verificar") || text.includes("confirmar")) {
+          (btn as HTMLElement).click();
+          return;
+        }
+      }
+    });
+
+    try { await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 20000 }); } catch { await delay(5000); }
+    await delay(2000);
+    await doSave(page, "04-post-2fa");
+  }
+
   const loginError = await detectLoginError(page);
   if (loginError) return { success: false, error: `Error del banco: ${loginError}` };
 
@@ -101,7 +164,8 @@ async function racionalLogin(
     return { success: false, error: "Login no completado — URL sigue en /login." };
   }
 
-  debugLog.push("5. Login OK!");
+  await saveCookies(page, "racional");
+  debugLog.push("5. Login OK! Session cookies saved.");
   return { success: true };
 }
 
@@ -187,7 +251,7 @@ async function scrapeRacional(session: BrowserSession, options: ScraperOptions):
   const progress = onProgress || (() => {});
 
   progress("Abriendo Racional...");
-  const loginResult = await racionalLogin(page, email, password, debugLog, doSave);
+  const loginResult = await racionalLogin(page, email, password, debugLog, doSave, options.onTwoFactorCode);
   if (!loginResult.success) {
     const ss = await page.screenshot({ encoding: "base64" });
     return { success: false, bank, movements: [], error: loginResult.error, screenshot: ss as string, debug: debugLog.join("\n") };
