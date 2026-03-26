@@ -5,6 +5,13 @@
 ### What this project does
 Open source scraping framework for Chilean banks. Extracts account movements and balances as JSON using Puppeteer (headless Chrome). Includes a multi-user web dashboard deployed on Vercel with Google OAuth.
 
+### Live deployment
+- **Production URL**: https://open-banking-chile.vercel.app
+- **Vercel project**: `open-banking-chile` (org: `rhonorato-ship-its-projects`)
+- **Vercel project ID**: `prj_ovBTOzwEpedmlf6JILFlKtbf6hBN`
+- **Deploy command**: run `vercel --prod` from repo root (not from `web/` — root dir is configured as `web` in Vercel settings)
+- **npm package**: `open-banking-chile` (latest: v2.1.1, publisher: `rhonorato`)
+
 ### Supported banks (10)
 - Banco de Chile (`bchile`)
 - BCI (`bci`)
@@ -44,16 +51,16 @@ src/
 
 web/                       — Next.js 15 multi-user dashboard (App Router)
   app/
-    dashboard/             — Bank list, sync buttons
-    banks/                 — Add / edit / remove bank credentials
-    movements/             — Transaction history with filters
+    dashboard/             — Balance hero, bank cards with skeleton loaders, sync buttons, toast notifications
+    banks/                 — Add / edit / remove bank credentials (self-contained BankRow, inline delete confirm)
+    movements/             — Transaction history: text search, sortable columns, pagination (50/page), monthly chart
     login/                 — Google OAuth sign-in
     api/
       banks/               — CRUD for encrypted bank credentials
-      movements/           — Query movements with filters
+      movements/           — Query movements with filters (bankId, from, to); limit 500
       scrape/[bankId]/     — SSE endpoint: runs scraper, streams progress phases
   components/
-    ScrapeProgress.tsx     — Full-screen Fintoc-style phase animation
+    ScrapeProgress.tsx     — Full-screen phase animation; retry re-initialises SSE (no page reload)
   lib/
     auth.ts                — Auth.js v5 (Google OAuth, JWT, email whitelist)
     db.ts                  — Drizzle ORM + postgres driver
@@ -89,19 +96,27 @@ cd web && npm install
 source .env && node dist/cli.js --bank falabella --pretty
 ```
 
-### Web dashboard (requires Doppler)
+### Web dashboard (local dev, requires Doppler)
 ```bash
-cd web
-doppler run --project open-banking-chile --config dev -- npm run dev
+# From repo root
+doppler run --project open-banking-chile --config dev -- npm run dev --prefix web
 # Open http://localhost:3434
 ```
 
-Required env vars (managed via Doppler project `open-banking-chile`):
-- `DATABASE_URL` — Postgres connection string (Supabase or any standard Postgres)
+### Web dashboard (production deploy)
+```bash
+# Always run from repo root — Vercel root dir is configured as "web"
+vercel --prod
+```
+
+Required env vars (managed via Doppler project `open-banking-chile`, config `dev` for local / `prd` for production):
+- `DATABASE_URL` — Postgres connection string (Supabase)
 - `AUTH_GOOGLE_ID` / `AUTH_GOOGLE_SECRET` — Google OAuth credentials
 - `AUTH_SECRET` — Auth.js session secret (base64, 32 bytes)
 - `CREDENTIALS_SECRET` — AES-256 key for bank credentials (hex, 64 chars = 32 bytes)
 - `AUTH_WHITELIST_EMAILS` — Comma-separated list of allowed emails (optional)
+
+> Doppler syncs env vars to Vercel automatically for the production config. Do not edit Vercel env vars manually.
 
 ---
 
