@@ -5,7 +5,10 @@ import bice from "./banks/bice.js";
 import citi from "./banks/citi.js";
 import edwards from "./banks/edwards.js";
 import falabella from "./banks/falabella.js";
+import fintual from "./banks/fintual.js";
 import itau from "./banks/itau.js";
+import mercadopago from "./banks/mercadopago.js";
+import racional from "./banks/racional.js";
 import santander from "./banks/santander.js";
 import scotiabank from "./banks/scotiabank.js";
 import type { BankScraper } from "./types.js";
@@ -19,7 +22,10 @@ export const banks: Record<string, BankScraper> = {
   citi,
   edwards,
   falabella,
+  fintual,
   itau,
+  mercadopago,
+  racional,
   santander,
   scotiabank,
 };
@@ -61,6 +67,9 @@ export { default as bice } from "./banks/bice.js";
 export { default as citi } from "./banks/citi.js";
 export { default as edwards } from "./banks/edwards.js";
 export { default as falabella } from "./banks/falabella.js";
+export { default as fintual } from "./banks/fintual.js";
 export { default as itau } from "./banks/itau.js";
+export { default as mercadopago } from "./banks/mercadopago.js";
+export { default as racional } from "./banks/racional.js";
 export { default as santander } from "./banks/santander.js";
 export { default as scotiabank } from "./banks/scotiabank.js";
