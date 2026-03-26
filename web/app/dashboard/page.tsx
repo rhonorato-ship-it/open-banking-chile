@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { signOut } from "next-auth/react";
 import Link from "next/link";
 import ScrapeProgress from "@/components/ScrapeProgress";
@@ -25,6 +25,14 @@ export default function DashboardPage() {
   const [banks, setBanks] = useState<BankStatus[]>([]);
   const [scraping, setScraping] = useState<{ id: string; name: string } | null>(null);
   const [loading, setLoading] = useState(true);
+  const [toast, setToast] = useState<string | null>(null);
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  function showToast(msg: string) {
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    setToast(msg);
+    toastTimer.current = setTimeout(() => setToast(null), 2500);
+  }
 
   async function loadBanks() {
     const res = await fetch("/api/banks");
@@ -63,7 +71,17 @@ export default function DashboardPage() {
       <main className="max-w-5xl mx-auto px-6 py-10 space-y-12">
 
         {/* ── Balance Hero ── */}
-        {!loading && connected.length > 0 && (
+        {loading ? (
+          <section className="animate-pulse">
+            <div className="h-3 w-24 bg-white/[0.06] rounded-full mb-4" />
+            <div className="h-12 w-56 bg-white/[0.06] rounded-xl mb-6" />
+            <div className="flex gap-2">
+              {[...Array(2)].map((_, i) => (
+                <div key={i} className="h-12 w-36 bg-white/[0.04] rounded-2xl" />
+              ))}
+            </div>
+          </section>
+        ) : connected.length > 0 && (
           <section>
             <p className="text-xs text-white/30 uppercase tracking-[0.15em] mb-3">Balance total</p>
             <div className="flex flex-wrap items-end gap-3 mb-6">
@@ -76,8 +94,6 @@ export default function DashboardPage() {
                 </span>
               )}
             </div>
-
-            {/* Per-bank chips */}
             <div className="flex flex-wrap gap-2">
               {connected.map((b) => (
                 <div key={b.id} className="flex items-center gap-3 px-4 py-2.5 rounded-2xl bg-white/[0.04] border border-white/[0.07]">
@@ -99,6 +115,25 @@ export default function DashboardPage() {
           {!loading && connected.length === 0 && available.length === 0 && (
             <div className="text-center py-20">
               <p className="text-white/20 text-sm">No hay bancos disponibles.</p>
+            </div>
+          )}
+
+          {/* Skeleton cards */}
+          {loading && (
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+              {[...Array(3)].map((_, i) => (
+                <div key={i} className="p-5 rounded-2xl border border-white/[0.08] bg-white/[0.03] animate-pulse">
+                  <div className="flex items-center gap-3 mb-4">
+                    <div className="w-9 h-9 rounded-xl bg-white/[0.07]" />
+                    <div className="flex-1">
+                      <div className="h-3 w-20 bg-white/[0.07] rounded-full mb-2" />
+                      <div className="h-2.5 w-14 bg-white/[0.04] rounded-full" />
+                    </div>
+                  </div>
+                  <div className="h-7 w-32 bg-white/[0.07] rounded-lg mb-4" />
+                  <div className="h-8 w-full bg-white/[0.04] rounded-xl" />
+                </div>
+              ))}
             </div>
           )}
 
@@ -147,7 +182,7 @@ export default function DashboardPage() {
           )}
 
           {/* ── Available Banks ── */}
-          {available.length > 0 && (
+          {!loading && available.length > 0 && (
             <>
               <p className="text-xs text-white/20 uppercase tracking-[0.15em] mb-3">Bancos disponibles</p>
               <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-2">
@@ -177,9 +212,17 @@ export default function DashboardPage() {
         <ScrapeProgress
           bankId={scraping.id}
           bankName={scraping.name}
-          onDone={() => { setScraping(null); loadBanks(); }}
+          onDone={() => { setScraping(null); loadBanks(); showToast(`${scraping.name} sincronizado`); }}
           onError={() => { setScraping(null); loadBanks(); }}
         />
+      )}
+
+      {/* Toast */}
+      {toast && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 bg-white/10 backdrop-blur-md border border-white/20 rounded-full px-5 py-2.5 text-sm font-medium text-white shadow-2xl pointer-events-none">
+          <div className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+          {toast}
+        </div>
       )}
     </div>
   );

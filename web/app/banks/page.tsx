@@ -1,7 +1,6 @@
 "use client";
 
-import { Suspense } from "react";
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 
@@ -22,12 +21,6 @@ function BanksPageContent() {
   const preselect = searchParams.get("add");
 
   const [banks, setBanks] = useState<BankStatus[]>([]);
-  const [editing, setEditing] = useState<string | null>(preselect);
-  const [rut, setRut] = useState("");
-  const [password, setPassword] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [deleting, setDeleting] = useState<string | null>(null);
-  const [error, setError] = useState("");
 
   async function loadBanks() {
     const res = await fetch("/api/banks");
@@ -36,35 +29,26 @@ function BanksPageContent() {
 
   useEffect(() => { loadBanks(); }, []);
 
-  async function save(bankId: string) {
-    if (!rut || !password) { setError("Completa RUT y contraseña"); return; }
-    setSaving(true);
-    setError("");
+  async function save(bankId: string, rut: string, password: string): Promise<boolean> {
     const res = await fetch("/api/banks", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ bankId, rut, password }),
     });
-    setSaving(false);
     if (res.ok) {
-      setEditing(null);
-      setRut("");
-      setPassword("");
       await loadBanks();
       if (preselect) router.push("/dashboard");
-    } else {
-      setError("Error al guardar — intenta de nuevo");
+      return true;
     }
+    return false;
   }
 
   async function remove(bankId: string) {
-    setDeleting(bankId);
     await fetch("/api/banks", {
       method: "DELETE",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ bankId }),
     });
-    setDeleting(null);
     await loadBanks();
   }
 
@@ -91,55 +75,23 @@ function BanksPageContent() {
           <p className="text-white/35 text-sm mt-1">Credenciales encriptadas con AES-256.</p>
         </div>
 
-        {/* Connected */}
         {connected.length > 0 && (
           <div className="mb-8">
             <p className="text-xs text-white/25 uppercase tracking-[0.15em] mb-3">Conectadas</p>
             <div className="flex flex-col gap-2">
               {connected.map((bank) => (
-                <BankRow
-                  key={bank.id}
-                  bank={bank}
-                  editing={editing}
-                  rut={rut}
-                  password={password}
-                  saving={saving}
-                  deleting={deleting}
-                  error={error}
-                  setEditing={setEditing}
-                  setRut={setRut}
-                  setPassword={setPassword}
-                  setError={setError}
-                  onSave={save}
-                  onRemove={remove}
-                />
+                <BankRow key={bank.id} bank={bank} autoOpen={false} onSave={save} onRemove={remove} />
               ))}
             </div>
           </div>
         )}
 
-        {/* Available */}
         {available.length > 0 && (
           <div>
             <p className="text-xs text-white/25 uppercase tracking-[0.15em] mb-3">Disponibles</p>
             <div className="flex flex-col gap-2">
               {available.map((bank) => (
-                <BankRow
-                  key={bank.id}
-                  bank={bank}
-                  editing={editing}
-                  rut={rut}
-                  password={password}
-                  saving={saving}
-                  deleting={deleting}
-                  error={error}
-                  setEditing={setEditing}
-                  setRut={setRut}
-                  setPassword={setPassword}
-                  setError={setError}
-                  onSave={save}
-                  onRemove={remove}
-                />
+                <BankRow key={bank.id} bank={bank} autoOpen={bank.id === preselect} onSave={save} onRemove={remove} />
               ))}
             </div>
           </div>
@@ -150,24 +102,42 @@ function BanksPageContent() {
 }
 
 function BankRow({
-  bank, editing, rut, password, saving, deleting, error,
-  setEditing, setRut, setPassword, setError, onSave, onRemove,
+  bank, autoOpen, onSave, onRemove,
 }: {
   bank: BankStatus;
-  editing: string | null;
-  rut: string;
-  password: string;
-  saving: boolean;
-  deleting: string | null;
-  error: string;
-  setEditing: (v: string | null) => void;
-  setRut: (v: string) => void;
-  setPassword: (v: string) => void;
-  setError: (v: string) => void;
-  onSave: (id: string) => void;
-  onRemove: (id: string) => void;
+  autoOpen: boolean;
+  onSave: (bankId: string, rut: string, password: string) => Promise<boolean>;
+  onRemove: (bankId: string) => void;
 }) {
-  const isEditing = editing === bank.id;
+  const [open, setOpen] = useState(autoOpen);
+  const [rut, setRut] = useState("");
+  const [password, setPassword] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [error, setError] = useState("");
+
+  async function handleSave() {
+    if (!rut || !password) { setError("Completa RUT y contraseña"); return; }
+    setSaving(true);
+    setError("");
+    const ok = await onSave(bank.id, rut, password);
+    setSaving(false);
+    if (ok) {
+      setOpen(false);
+      setRut("");
+      setPassword("");
+    } else {
+      setError("Error al guardar — intenta de nuevo");
+    }
+  }
+
+  async function handleRemove() {
+    setDeleting(true);
+    await onRemove(bank.id);
+    setDeleting(false);
+    setConfirmDelete(false);
+  }
 
   return (
     <div className={`rounded-2xl border overflow-hidden transition-colors ${bank.connected ? "border-white/[0.08] bg-white/[0.03]" : "border-white/[0.04] bg-white/[0.015]"}`}>
@@ -184,29 +154,45 @@ function BankRow({
           )}
         </div>
         {bank.connected && <div className="w-1.5 h-1.5 rounded-full bg-emerald-500/80 shrink-0" />}
-        <div className="flex gap-2 shrink-0">
-          <button
-            onClick={() => {
-              setEditing(isEditing ? null : bank.id);
-              setRut(""); setPassword(""); setError("");
-            }}
-            className={`text-xs px-3 py-1.5 rounded-lg border transition-colors ${bank.connected ? "border-white/10 text-white/50 hover:border-white/25 hover:text-white" : "border-[#0ea5e9]/30 text-[#0ea5e9]/70 hover:border-[#0ea5e9]/60 hover:text-[#0ea5e9]"}`}
-          >
-            {bank.connected ? "Editar" : "Conectar"}
-          </button>
-          {bank.connected && (
+
+        {confirmDelete ? (
+          <div className="flex items-center gap-2 shrink-0">
+            <span className="text-xs text-white/40">¿Eliminar?</span>
             <button
-              onClick={() => onRemove(bank.id)}
-              disabled={deleting === bank.id}
-              className="text-xs px-3 py-1.5 rounded-lg border border-red-500/15 text-red-400/50 hover:text-red-400 hover:border-red-500/35 transition-colors disabled:opacity-40"
+              onClick={handleRemove}
+              disabled={deleting}
+              className="text-xs px-3 py-1.5 rounded-lg bg-red-500/15 border border-red-500/30 text-red-400 hover:bg-red-500/25 transition-colors disabled:opacity-40"
             >
-              {deleting === bank.id ? "…" : "Eliminar"}
+              {deleting ? "…" : "Sí"}
             </button>
-          )}
-        </div>
+            <button
+              onClick={() => setConfirmDelete(false)}
+              className="text-xs px-3 py-1.5 rounded-lg border border-white/[0.08] text-white/40 hover:text-white transition-colors"
+            >
+              No
+            </button>
+          </div>
+        ) : (
+          <div className="flex gap-2 shrink-0">
+            <button
+              onClick={() => { setOpen(!open); setRut(""); setPassword(""); setError(""); }}
+              className={`text-xs px-3 py-1.5 rounded-lg border transition-colors ${bank.connected ? "border-white/10 text-white/50 hover:border-white/25 hover:text-white" : "border-[#0ea5e9]/30 text-[#0ea5e9]/70 hover:border-[#0ea5e9]/60 hover:text-[#0ea5e9]"}`}
+            >
+              {bank.connected ? "Editar" : "Conectar"}
+            </button>
+            {bank.connected && (
+              <button
+                onClick={() => setConfirmDelete(true)}
+                className="text-xs px-3 py-1.5 rounded-lg border border-red-500/15 text-red-400/50 hover:text-red-400 hover:border-red-500/35 transition-colors"
+              >
+                Eliminar
+              </button>
+            )}
+          </div>
+        )}
       </div>
 
-      {isEditing && (
+      {open && (
         <div className="border-t border-white/[0.05] px-4 py-4 flex flex-col gap-3">
           <input
             type="text"
@@ -220,20 +206,20 @@ function BankRow({
             placeholder="Contraseña"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && onSave(bank.id)}
+            onKeyDown={(e) => e.key === "Enter" && handleSave()}
             className="w-full bg-white/[0.04] border border-white/[0.08] rounded-xl px-3 py-2.5 text-sm placeholder-white/20 focus:outline-none focus:border-[#0ea5e9]/50 transition-colors"
           />
           {error && <p className="text-xs text-red-400">{error}</p>}
           <div className="flex gap-2">
             <button
-              onClick={() => onSave(bank.id)}
+              onClick={handleSave}
               disabled={saving}
               className="flex-1 py-2 rounded-xl bg-[#0ea5e9] text-black text-xs font-bold hover:bg-[#38bdf8] disabled:opacity-40 transition-colors"
             >
               {saving ? "Guardando…" : "Guardar"}
             </button>
             <button
-              onClick={() => setEditing(null)}
+              onClick={() => setOpen(false)}
               className="px-4 py-2 rounded-xl border border-white/[0.07] text-xs text-white/35 hover:text-white transition-colors"
             >
               Cancelar

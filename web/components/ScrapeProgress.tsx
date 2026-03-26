@@ -19,12 +19,12 @@ interface Props {
   onError: (msg: string) => void;
 }
 
-const PHASES: { id: Phase; label: string; sub: string }[] = [
-  { id: 1, label: "Iniciando conexión", sub: "Abriendo sesión segura" },
-  { id: 2, label: "Autenticando", sub: "Verificando credenciales" },
-  { id: 3, label: "Extrayendo movimientos", sub: "Leyendo tu historial" },
-  { id: 4, label: "Procesando datos", sub: "Guardando y deduplicando" },
-  { id: 5, label: "Completado", sub: "" },
+const PHASES: { id: Phase; label: string }[] = [
+  { id: 1, label: "Iniciando conexión" },
+  { id: 2, label: "Autenticando" },
+  { id: 3, label: "Extrayendo movimientos" },
+  { id: 4, label: "Procesando datos" },
+  { id: 5, label: "Completado" },
 ];
 
 export default function ScrapeProgress({ bankId, bankName, onDone, onError }: Props) {
@@ -32,9 +32,16 @@ export default function ScrapeProgress({ bankId, bankName, onDone, onError }: Pr
   const [currentMessage, setCurrentMessage] = useState("");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [done, setDone] = useState(false);
+  const [retryCount, setRetryCount] = useState(0);
   const esRef = useRef<EventSource | null>(null);
 
   useEffect(() => {
+    // Reset state on retry
+    setCurrentPhase(1);
+    setCurrentMessage("");
+    setErrorMsg(null);
+    setDone(false);
+
     const es = new EventSource(`/api/scrape/${bankId}`);
     esRef.current = es;
 
@@ -59,17 +66,12 @@ export default function ScrapeProgress({ bankId, bankName, onDone, onError }: Pr
     };
 
     es.onerror = () => {
-      if (!done && !errorMsg) {
-        setErrorMsg("Conexión interrumpida — intenta de nuevo");
-      }
+      setErrorMsg("Conexión interrumpida — intenta de nuevo");
       es.close();
     };
 
     return () => es.close();
-  }, [bankId]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const completedPhases = done ? 5 : currentPhase - 1;
-  const progressPct = Math.min(((completedPhases) / 4) * 100, 100);
+  }, [bankId, retryCount]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
@@ -111,11 +113,8 @@ export default function ScrapeProgress({ bankId, bankName, onDone, onError }: Pr
 
             return (
               <div key={phase.id} className="flex gap-4 items-start">
-                {/* Node + connector */}
                 <div className="flex flex-col items-center" style={{ width: 28, flexShrink: 0 }}>
-                  <PhaseNode
-                    state={isError ? "error" : isCompleted ? "done" : isActive ? "active" : "pending"}
-                  />
+                  <PhaseNode state={isError ? "error" : isCompleted ? "done" : isActive ? "active" : "pending"} />
                   {i < PHASES.length - 1 && (
                     <div className="w-px flex-1 my-1" style={{ minHeight: 28 }}>
                       <div
@@ -126,7 +125,6 @@ export default function ScrapeProgress({ bankId, bankName, onDone, onError }: Pr
                   )}
                 </div>
 
-                {/* Label */}
                 <div className="pb-7 pt-0.5">
                   <p
                     className="text-sm font-semibold transition-colors duration-300"
@@ -149,14 +147,22 @@ export default function ScrapeProgress({ bankId, bankName, onDone, onError }: Pr
           })}
         </div>
 
-        {/* Retry button on error */}
+        {/* Actions on error */}
         {errorMsg && (
-          <button
-            onClick={() => window.location.reload()}
-            className="mt-2 w-full py-2.5 rounded-full border border-white/10 text-sm font-medium hover:bg-white/5 transition-colors"
-          >
-            Reintentar
-          </button>
+          <div className="flex gap-2 mt-2">
+            <button
+              onClick={() => setRetryCount((c) => c + 1)}
+              className="flex-1 py-2.5 rounded-full bg-[#0ea5e9] text-black text-sm font-bold hover:bg-[#38bdf8] transition-colors"
+            >
+              Reintentar
+            </button>
+            <button
+              onClick={() => onError(errorMsg)}
+              className="px-5 py-2.5 rounded-full border border-white/10 text-sm text-white/40 hover:text-white transition-colors"
+            >
+              Cerrar
+            </button>
+          </div>
         )}
       </div>
 
@@ -187,7 +193,6 @@ function PhaseNode({ state }: { state: "pending" | "active" | "done" | "error" }
       </div>
     );
   }
-
   if (state === "error") {
     return (
       <div className="w-7 h-7 rounded-full bg-red-500/20 border-2 border-red-500 flex items-center justify-center flex-shrink-0">
@@ -195,14 +200,12 @@ function PhaseNode({ state }: { state: "pending" | "active" | "done" | "error" }
       </div>
     );
   }
-
   if (state === "active") {
     return (
       <div
         className="w-7 h-7 rounded-full border-2 border-[#0ea5e9] flex items-center justify-center flex-shrink-0 relative"
         style={{ animation: "ring-pulse 1.5s ease-in-out infinite" }}
       >
-        {/* Spinning arc */}
         <div
           className="absolute inset-0.5 rounded-full border-2 border-transparent border-t-[#0ea5e9]"
           style={{ animation: "spin-arc 0.8s linear infinite" }}
@@ -211,9 +214,5 @@ function PhaseNode({ state }: { state: "pending" | "active" | "done" | "error" }
       </div>
     );
   }
-
-  // pending
-  return (
-    <div className="w-7 h-7 rounded-full border-2 border-white/15 flex-shrink-0" />
-  );
+  return <div className="w-7 h-7 rounded-full border-2 border-white/15 flex-shrink-0" />;
 }
