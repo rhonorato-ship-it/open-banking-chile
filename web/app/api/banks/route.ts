@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { supabase } from "@/lib/db";
 import { encrypt } from "@/lib/credentials";
+import { normalizeRut } from "@/lib/rut";
 import { listBanks } from "open-banking-chile";
 
 function isValidIsoDate(value: string): boolean {
@@ -90,9 +91,13 @@ export async function POST(req: Request) {
   }
 
   const normalizedBankId = bankId.trim();
-  const normalizedRut = rut.trim();
-  if (!normalizedBankId || !normalizedRut || !password) {
+  if (!normalizedBankId || !password) {
     return NextResponse.json({ error: "Missing or invalid fields" }, { status: 400 });
+  }
+
+  const normalizedRut = normalizeRut(rut);
+  if (!normalizedRut) {
+    return NextResponse.json({ error: "RUT inválido" }, { status: 400 });
   }
 
   const allBanks = listBanks();

@@ -1,6 +1,7 @@
 "use client";
 
 import { Suspense, useEffect, useState } from "react";
+import { isValidRut, normalizeRut } from "@/lib/rut";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 
@@ -119,9 +120,11 @@ function BankRow({
 
   async function handleSave() {
     if (!rut || !password) { setError("Completa RUT y contraseña"); return; }
+    if (!isValidRut(rut)) { setError("RUT inválido — ej: 12345678-9"); return; }
     setSaving(true);
     setError("");
-    const ok = await onSave(bank.id, rut, password);
+    const normalized = normalizeRut(rut)!;
+    const ok = await onSave(bank.id, normalized, password);
     setSaving(false);
     if (ok) {
       setOpen(false);
@@ -194,13 +197,27 @@ function BankRow({
 
       {open && (
         <div className="border-t border-white/[0.05] px-4 py-4 flex flex-col gap-3">
-          <input
-            type="text"
-            placeholder="RUT (ej: 12345678-9)"
-            value={rut}
-            onChange={(e) => setRut(e.target.value)}
-            className="w-full bg-white/[0.04] border border-white/[0.08] rounded-xl px-3 py-2.5 text-sm placeholder-white/20 focus:outline-none focus:border-[#0ea5e9]/50 transition-colors"
-          />
+          <div>
+            <input
+              type="text"
+              placeholder="RUT (ej: 12345678-9)"
+              value={rut}
+              onChange={(e) => { setRut(e.target.value); setError(""); }}
+              className={`w-full bg-white/[0.04] border rounded-xl px-3 py-2.5 text-sm placeholder-white/20 focus:outline-none transition-colors ${
+                rut && !isValidRut(rut)
+                  ? "border-red-500/40 focus:border-red-500/60"
+                  : rut && isValidRut(rut)
+                  ? "border-emerald-500/40 focus:border-emerald-500/60"
+                  : "border-white/[0.08] focus:border-[#0ea5e9]/50"
+              }`}
+            />
+            {rut && isValidRut(rut) && (
+              <p className="text-[11px] text-emerald-400/70 mt-1 px-1">{normalizeRut(rut)}</p>
+            )}
+            {rut && !isValidRut(rut) && (
+              <p className="text-[11px] text-red-400/70 mt-1 px-1">Formato: 12345678-9 o 12.345.678-9</p>
+            )}
+          </div>
           <input
             type="password"
             placeholder="Contraseña"
