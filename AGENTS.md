@@ -110,13 +110,15 @@ vercel --prod
 ```
 
 Required env vars (managed via Doppler project `open-banking-chile`, config `dev` for local / `prd` for production):
-- `DATABASE_URL` — Postgres connection string (Supabase)
+- `DATABASE_URL` — Postgres connection string (Supabase session pooler, port 5432)
+- `AUTH_URL` — Canonical app URL (`http://localhost:3434` for dev, `https://open-banking-chile.vercel.app` for prd)
 - `AUTH_GOOGLE_ID` / `AUTH_GOOGLE_SECRET` — Google OAuth credentials
 - `AUTH_SECRET` — Auth.js session secret (base64, 32 bytes)
 - `CREDENTIALS_SECRET` — AES-256 key for bank credentials (hex, 64 chars = 32 bytes)
-- `AUTH_WHITELIST_EMAILS` — Comma-separated list of allowed emails (optional)
 
-> Doppler syncs env vars to Vercel automatically for the production config. Do not edit Vercel env vars manually.
+**Access policy**: any Google account can sign in — there is no email whitelist. Access control is purely "authenticated with Google OAuth". Do not add `AUTH_WHITELIST_EMAILS` back.
+
+> Doppler syncs env vars to Vercel. Do not edit Vercel env vars manually — always update Doppler prd config instead.
 
 ---
 
@@ -161,3 +163,4 @@ Do not skip steps 2–3. Do not implement without inspecting the scraped HTML fi
 - No credentials transmitted to external servers beyond the bank's own website
 - Screenshots may contain sensitive data — handle with care
 - Web dashboard uses JWT-only sessions (no server-side session store)
+- Authentication: any Google account can sign in — no email whitelist is implemented or desired
