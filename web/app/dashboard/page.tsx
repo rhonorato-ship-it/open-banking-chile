@@ -58,6 +58,7 @@ export default function DashboardPage() {
         </div>
         <div className="flex items-center gap-5">
           <Link href="/movements" className="text-sm text-white/40 hover:text-white/80 transition-colors">Movimientos</Link>
+          <Link href="/analytics" className="text-sm text-white/40 hover:text-white/80 transition-colors">Analítica</Link>
           <Link href="/banks" className="text-sm text-white/40 hover:text-white/80 transition-colors">Cuentas</Link>
           <button
             onClick={() => signOut({ callbackUrl: "/login" })}

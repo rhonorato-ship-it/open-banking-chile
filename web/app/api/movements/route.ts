@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { supabase } from "@/lib/db";
 import { isValidIsoDate } from "@/lib/utils";
+import { inferCategory } from "@/lib/categories";
+import { detectInternalTransferIds } from "@/lib/transfers";
 
 export async function GET(req: Request) {
   const session = await auth();
@@ -33,16 +35,27 @@ export async function GET(req: Request) {
   const { data: rows, error } = await query;
   if (error) return NextResponse.json({ error: "Failed to fetch movements" }, { status: 500 });
 
-  // Map snake_case DB columns to camelCase for the frontend
+  const movements = (rows ?? []).map((r) => ({
+    id: r.id,
+    bank_id: r.bank_id,
+    date: r.date,
+    description: r.description,
+    amount: Number(r.amount),
+  }));
+
+  const transferIds = detectInternalTransferIds(movements);
+
   return NextResponse.json(
-    (rows ?? []).map((r) => ({
-      id: r.id,
-      bankId: r.bank_id,
-      date: r.date,
-      description: r.description,
-      amount: r.amount,
-      balance: r.balance,
-      source: r.source,
+    movements.map((m, i) => ({
+      id: m.id,
+      bankId: m.bank_id,
+      date: m.date,
+      description: m.description,
+      amount: rows![i].amount,
+      balance: rows![i].balance,
+      source: rows![i].source,
+      category: inferCategory(m.description),
+      isInternalTransfer: transferIds.has(m.id),
     })),
   );
 }

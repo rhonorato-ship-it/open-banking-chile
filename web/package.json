@@ -16,7 +16,8 @@
     "open-banking-chile": "file:..",
     "puppeteer-core": "^24.0.0",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "recharts": "^3.8.0"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.1.3",

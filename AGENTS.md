@@ -49,25 +49,30 @@ src/
     falabella.ts, bchile.ts, bci.ts, bestado.ts, bice.ts,
     edwards.ts, itau.ts, santander.ts, scotiabank.ts, citi.ts
 
-web/                       — Next.js 16 multi-user dashboard (App Router), deployed on Vercel
+web/                       — Next.js 15 multi-user dashboard (App Router), deployed on Vercel
   app/
     dashboard/             — Balance hero, bank cards with skeleton loaders, sync buttons, toast notifications
     banks/                 — Add / edit / remove bank credentials (self-contained BankRow, inline delete confirm)
     movements/             — Transaction history: text search, sortable columns, pagination (50/page), monthly chart
+    analytics/             — Monthly income vs spend chart (recharts), category breakdown bar list
     login/                 — Google OAuth sign-in
     api/
       banks/               — CRUD for encrypted bank credentials
-      movements/           — Query movements with filters (bankId, from, to); limit 500
+      movements/           — Query movements with filters (bankId, from, to); enriched with category + isInternalTransfer
+      analytics/           — Pre-aggregated time-series and category breakdown (last 12 months, transfers excluded)
       scrape/[bankId]/     — SSE endpoint: runs scraper, streams progress phases
   components/
     ScrapeProgress.tsx     — Full-screen phase animation; retry re-initialises SSE (no page reload)
   lib/
-    auth.ts                — Auth.js v5 (Google OAuth, JWT)
+    auth.ts                — Auth.js v5 (Google OAuth, JWT) + Supabase user upsert on sign-in
+    auth.config.ts         — Edge-compatible auth config (used by middleware)
     db.ts                  — Supabase HTTP client (@supabase/supabase-js, PostgREST — no TCP connection)
     credentials.ts         — AES-256-GCM encrypt/decrypt for stored credentials
     hash.ts                — SHA-256 deduplication hash for movements
     utils.ts               — Shared utilities (isValidIsoDate, etc.)
-  middleware.ts            — Route protection (redirect to /login if unauthenticated; rename to proxy.ts pending)
+    categories.ts          — Regex-based category inference from movement description (15 categories)
+    transfers.ts           — Cross-bank internal transfer detection (debit/credit pair matching)
+  middleware.ts            — Route protection (redirect to /login if unauthenticated)
 ```
 
 ---
@@ -108,19 +113,43 @@ doppler run --project open-banking-chile --config dev -- npm run dev --prefix we
 vercel --prod
 ```
 
-Required env vars (managed via Doppler project `open-banking-chile`, config `dev` for local / `prd` for production):
-- `SUPABASE_URL` — `https://wcyxlyitcbmeczihaohq.supabase.co` — Supabase project URL for the HTTP client
-- `SUPABASE_ANON_KEY` — Supabase anon JWT — used server-side (RLS is disabled, anon has full table access)
-- `AUTH_URL` — Canonical app URL (`http://localhost:3434` for dev, `https://open-banking-chile.vercel.app` for prd)
-- `AUTH_GOOGLE_ID` / `AUTH_GOOGLE_SECRET` — Google OAuth credentials (Google Cloud project: **`open-banking-chile`**)
-- `AUTH_SECRET` — Auth.js session secret (base64, 32 bytes)
-- `CREDENTIALS_SECRET` — AES-256 key for bank credentials (hex, 64 chars = 32 bytes)
+### Secret management
 
-**Database**: [Supabase](https://supabase.com) project **`open-banking`**. Client uses `@supabase/supabase-js` (PostgREST HTTP API, not TCP). Required because Supabase's TCP pooler doesn't work from Vercel serverless functions. `DATABASE_URL` is no longer used.
+All secrets live in [Doppler](https://doppler.com) project **`open-banking-chile`**:
+- Config **`dev`** — injected locally via `doppler run --project open-banking-chile --config dev --`
+- Config **`prd`** — synced to Vercel automatically via the Doppler → Vercel integration
 
-**Access policy**: any Google account can sign in — no email whitelist. Do not add `AUTH_WHITELIST_EMAILS` back.
+**Exception**: `SUPABASE_URL` and `SUPABASE_ANON_KEY` are also set directly in the Vercel dashboard (project settings → environment variables) so they are available at build time without Doppler.
 
-**Secret management**: all secrets are in [Doppler](https://doppler.com) project **`open-banking-chile`** (configs: `dev` for local, `prd` for production). Exception: `SUPABASE_URL` and `SUPABASE_ANON_KEY` are also set directly in Vercel environment variables (Vercel dashboard → project settings → environment variables) so they're available during build without Doppler. All other secrets go to Doppler prd only.
+### Environment variables
+
+| Variable | Config | Value / notes |
+|---|---|---|
+| `SUPABASE_URL` | dev + prd | `https://wcyxlyitcbmeczihaohq.supabase.co` |
+| `SUPABASE_ANON_KEY` | dev + prd | Supabase anon JWT — find in Supabase dashboard → project **`open-banking`** → Settings → API |
+| `AUTH_URL` | dev | `http://localhost:3434` |
+| `AUTH_URL` | prd | `https://open-banking-chile.vercel.app` |
+| `AUTH_GOOGLE_ID` | dev + prd | Google OAuth client ID — Google Cloud project **`open-banking-chile`** |
+| `AUTH_GOOGLE_SECRET` | dev + prd | Google OAuth client secret — same project |
+| `AUTH_SECRET` | dev + prd | Auth.js session secret — generate: `openssl rand -base64 32` |
+| `CREDENTIALS_SECRET` | dev + prd | AES-256 key for bank credentials — generate: `openssl rand -hex 32` (64 hex chars) |
+
+### Google OAuth (Google Cloud project: `open-banking-chile`)
+
+Authorized redirect URIs — both must be present in Google Cloud Console → APIs & Services → Credentials → OAuth 2.0 Client:
+
+```
+http://localhost:3434/api/auth/callback/google     ← local dev
+https://open-banking-chile.vercel.app/api/auth/callback/google  ← production
+```
+
+### Supabase (project: `open-banking`)
+
+- **URL**: `https://wcyxlyitcbmeczihaohq.supabase.co`
+- **Client**: `@supabase/supabase-js` (PostgREST HTTP API — required because Supabase's TCP pooler doesn't work from Vercel serverless). `DATABASE_URL` is not used.
+- **RLS**: disabled — the anon key has full table access server-side. Tables: `users`, `bank_credentials`, `movements`.
+
+**Access policy**: any Google account can sign in — no email whitelist. Do not add `AUTH_WHITELIST_EMAILS`.
 
 ---
 
