@@ -105,15 +105,22 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
 
         send({ phase: 1, label: "Iniciando conexión", message: "Abriendo sesión segura" });
 
-        const chromePath = await chromium.executablePath();
-        // @sparticuz/chromium bundles chrome-headless-shell. Its args include
-        // SwiftShader GPU emulation flags required in Lambda-style environments.
-        // Filter out the --headless flag — browser.ts sets headless: false when
-        // launchArgs is present so the flag embedded in the args takes effect.
-        const launchArgs = chromium.args.filter(
-          (a: string) => !a.startsWith("--headless"),
-        );
-        launchArgs.push("--headless=shell"); // explicit, no quoting issues
+        // API-mode scrapers (e.g. Fintual) use fetch() — skip Chromium initialization
+        const needsBrowser = bank.mode !== "api";
+
+        let chromePath: string | undefined;
+        let launchArgs: string[] | undefined;
+        if (needsBrowser) {
+          chromePath = await chromium.executablePath();
+          // @sparticuz/chromium bundles chrome-headless-shell. Its args include
+          // SwiftShader GPU emulation flags required in Lambda-style environments.
+          // Filter out the --headless flag — browser.ts sets headless: false when
+          // launchArgs is present so the flag embedded in the args takes effect.
+          launchArgs = chromium.args.filter(
+            (a: string) => !a.startsWith("--headless"),
+          );
+          launchArgs.push("--headless=shell"); // explicit, no quoting issues
+        }
 
         // Load stored browser cookies (if any) — avoids 2FA on repeat runs
         const storedCookiesJson: string | undefined = sessionCookies ?? undefined;
@@ -142,8 +149,8 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
         const result = await bank.scrape({
           rut,
           password,
-          chromePath,
-          launchArgs,
+          ...(chromePath ? { chromePath } : {}),
+          ...(launchArgs ? { launchArgs } : {}),
           onTwoFactorCode,
           onProgress: (msg: string) => {
             const phase = stringToPhase(msg);

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { config } from "dotenv";
 import { banks, listBanks, getBank } from "./index.js";
-import { Spinner } from "./utils.js";
+import { Spinner, defaultChromeProfilePath } from "./utils.js";
 import type { BankMovement } from "./types.js";
 config();
 
@@ -63,6 +63,7 @@ Opciones:
   --list              Listar bancos disponibles
   --screenshots       Guardar screenshots en ./screenshots/
   --headful           Abrir Chrome visible (para debugging)
+  --profile           Usar perfil de Chrome del usuario (cookies, sesiones, contraseñas)
   --pretty            Formatear JSON con indentación
   --movements         Solo imprimir movimientos (sin metadata)
   --owner <T|A|B>     Filtro Titular/Adicional para TC (default: B = todos)
@@ -138,6 +139,18 @@ Ejemplos:
   const owner =
     ownerVal === "T" || ownerVal === "A" || ownerVal === "B" ? ownerVal : undefined;
 
+  // --profile: use the user's real Chrome profile (cookies, sessions, saved passwords)
+  let userDataDir: string | undefined;
+  if (flags.has("--profile")) {
+    const profilePath = defaultChromeProfilePath();
+    if (!profilePath) {
+      console.error("Error: No se encontró el perfil de Chrome. Verifica que Google Chrome esté instalado.");
+      process.exit(1);
+    }
+    userDataDir = profilePath;
+    console.error(`Usando perfil de Chrome: ${profilePath}`);
+  }
+
   const isTTY = process.stderr.isTTY;
   const spinner = new Spinner();
 
@@ -172,8 +185,9 @@ Ejemplos:
         password,
         chromePath: process.env.CHROME_PATH,
         saveScreenshots: flags.has("--screenshots"),
-        headful: flags.has("--headful"),
+        headful: flags.has("--headful") || !!userDataDir,
         ...(owner && { owner }),
+        ...(userDataDir && { userDataDir }),
         onProgress: isTTY ? (step) => spinner.update(`${bank.name}: ${step}`) : undefined,
       });
 
@@ -276,8 +290,9 @@ Ejemplos:
     password,
     chromePath: process.env.CHROME_PATH,
     saveScreenshots: flags.has("--screenshots"),
-    headful: flags.has("--headful"),
+    headful: flags.has("--headful") || !!userDataDir,
     ...(owner && { owner }),
+    ...(userDataDir && { userDataDir }),
     onProgress: isTTY ? (step) => spinner.update(step) : undefined,
   });
 

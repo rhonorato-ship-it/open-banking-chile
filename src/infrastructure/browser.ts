@@ -14,6 +14,12 @@ export interface BrowserOptions {
    * When provided, the headless flag must be included in these args.
    */
   launchArgs?: string[];
+  /**
+   * Path to a Chrome user data directory.
+   * Opens Chrome with the user's real profile (cookies, sessions, extensions).
+   * Cannot be used with launchArgs (Vercel/Lambda).
+   */
+  userDataDir?: string;
 }
 
 export interface BrowserSession {
@@ -62,7 +68,7 @@ export async function launchBrowser(
   options: BrowserOptions,
   saveScreenshots: boolean,
 ): Promise<BrowserSession> {
-  const { chromePath, headful, forceHeadful, extraArgs, viewport, launchArgs } = options;
+  const { chromePath, headful, forceHeadful, extraArgs, viewport, launchArgs, userDataDir } = options;
   const debugLog: string[] = [];
 
   // Some banks (e.g. BancoEstado) block headless browsers via TLS fingerprinting
@@ -97,6 +103,7 @@ export async function launchBrowser(
     executablePath,
     headless: launchArgs ? false : headlessMode,
     args: launchArgs ?? [...DEFAULT_ARGS, ...(isLambda ? LAMBDA_ARGS : []), ...(extraArgs || [])],
+    ...(userDataDir && !launchArgs ? { userDataDir } : {}),
   });
 
   const page = await browser.newPage();

@@ -12,7 +12,7 @@ Open source scraping framework for Chilean banks. Extracts account movements and
 - **Deploy command**: run `vercel --prod` from repo root (not from `web/` — root dir is configured as `web` in Vercel settings)
 - **npm package**: `open-banking-chile` (latest: v2.1.2, publisher: `rhonorato`)
 
-### Supported banks (10)
+### Supported banks (13)
 - Banco de Chile (`bchile`)
 - BCI (`bci`)
 - BancoEstado (`bestado`)
@@ -20,9 +20,39 @@ Open source scraping framework for Chilean banks. Extracts account movements and
 - Citibank (`citi`)
 - Banco Edwards (`edwards`)
 - Banco Falabella (`falabella`)
+- Fintual (`fintual`) — **API mode** (no browser)
 - Itaú (`itau`)
+- MercadoPago (`mercadopago`)
+- Racional (`racional`)
 - Santander (`santander`)
 - Scotiabank (`scotiabank`)
+
+---
+
+## Scraper strategy (API-first)
+
+When adding or fixing a scraper, follow this priority order:
+
+1. **API first** — If the service has a REST/GraphQL API, use `fetch()` via `runApiScraper()` from `src/infrastructure/api-runner.ts`. No browser, no Puppeteer, no Chromium. Set `mode: "api"` on the `BankScraper`. Example: Fintual uses `POST /api/access_tokens` + `GET /api/goals`.
+
+2. **Browser with user's Chrome profile** — If a browser is needed (no known API, complex JS rendering), prefer the user's system Chrome with `userDataDir` for local/CLI usage. This leverages existing cookies, sessions, and saved passwords. Use `--profile` flag in CLI.
+
+3. **Headless Chromium** — Last resort, used on Vercel/Lambda via `@sparticuz/chromium`. Only for traditional banks with no API alternative.
+
+**When to open a browser window:**
+- The service has no usable API
+- Authentication requires 2FA, CAPTCHA, or OAuth that can't be done via API
+- The scraper should automate everything — minimize manual user interaction
+
+**When NOT to open a browser:**
+- The service has a REST API (even if undocumented — check DevTools Network tab)
+- Auth is email+password with a token response
+- Data is available as JSON from API endpoints
+
+**Key files:**
+- `src/infrastructure/api-runner.ts` — Browser-free runner for API scrapers
+- `src/infrastructure/scraper-runner.ts` — Browser-based runner for traditional scrapers
+- `src/infrastructure/browser.ts` — Puppeteer launch with `userDataDir` support
 
 ---
 
@@ -35,8 +65,9 @@ src/
   utils.ts                 — Shared utilities (formatRut, findChrome, parseChileanAmount, normalizeDate, etc.)
   cli.ts                   — CLI entry point (--bank, --list, --pretty, --movements)
   infrastructure/
-    browser.ts             — Centralized browser launch, session management, anti-detection
-    scraper-runner.ts      — Execution pipeline: validate → launch → scrape → logout → cleanup
+    browser.ts             — Centralized browser launch, session management, anti-detection, userDataDir
+    scraper-runner.ts      — Browser-based execution pipeline: validate → launch → scrape → logout → cleanup
+    api-runner.ts          — API-based execution pipeline: validate → fetch → return (no browser)
   actions/
     login.ts               — Generic login (RUT formats, password, submit, error detection)
     navigation.ts          — DOM navigation (click by text, sidebars, banner dismissal)
@@ -47,7 +78,8 @@ src/
     two-factor.ts          — 2FA detection and wait (configurable keywords/timeout)
   banks/
     falabella.ts, bchile.ts, bci.ts, bestado.ts, bice.ts,
-    edwards.ts, itau.ts, santander.ts, scotiabank.ts, citi.ts
+    edwards.ts, itau.ts, santander.ts, scotiabank.ts, citi.ts,
+    fintual.ts (API mode), mercadopago.ts, racional.ts
 
 web/                       — Next.js 15 multi-user dashboard (App Router), deployed on Vercel
   app/
@@ -104,7 +136,11 @@ cd web && npm install
 
 ### CLI
 ```bash
+# Standard headless mode
 source .env && node dist/cli.js --bank falabella --pretty
+
+# Use your Chrome profile (cookies, sessions — great for 2FA-heavy banks)
+source .env && node dist/cli.js --bank mercadopago --profile
 ```
 
 ### Web dashboard (local dev, requires Doppler)
@@ -174,8 +210,10 @@ The `/api/drive` POST endpoint exports all user movements as a multi-sheet XLSX 
 
 ## Adding a new bank
 
-1. Create `src/banks/<bank-id>.ts` implementing `BankScraper`
-2. Use `runScraper()` from infrastructure and compose actions from `src/actions/`
+1. **Check for an API first** — inspect the service's Network tab in DevTools for REST/GraphQL endpoints
+2. Create `src/banks/<bank-id>.ts` implementing `BankScraper`
+   - If API available: use `runApiScraper()` from `api-runner.ts`, set `mode: "api"`
+   - If browser needed: use `runScraper()` from `scraper-runner.ts`, compose actions from `src/actions/`
 3. Register in `src/index.ts`
 4. Add env vars to `.env.example`
 5. Add bank name to `BANK_NAMES` map in `web/app/movements/page.tsx`

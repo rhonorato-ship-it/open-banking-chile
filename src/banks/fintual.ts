@@ -1,232 +1,153 @@
-import type { Page } from "puppeteer-core";
 import type { BankMovement, BankScraper, ScrapeResult, ScraperOptions } from "../types.js";
 import { MOVEMENT_SOURCE } from "../types.js";
-import { closePopups, delay, parseChileanAmount, normalizeDate, deduplicateMovements } from "../utils.js";
-import { runScraper } from "../infrastructure/scraper-runner.js";
-import type { BrowserSession } from "../infrastructure/browser.js";
-import { detectLoginError } from "../actions/login.js";
+import { runApiScraper } from "../infrastructure/api-runner.js";
 
-// ─── Fintual-specific constants ───────────────────────────────────
+// ─── Fintual API constants ───────────────────────────────────
+//
+// Fintual exposes a public REST API (https://fintual.cl/api-docs).
+// Auth: POST /api/access_tokens with { user: { email, password } }
+// Goals: GET /api/goals with X-User-Email + X-User-Token headers
+//
+// No browser needed — this scraper uses fetch() exclusively.
 
-const LOGIN_URL = "https://fintual.cl/f/sign-in/";
-const DASHBOARD_URL = "https://fintual.cl/f/";
+const API_BASE = "https://fintual.cl/api";
 
-// ─── Helpers ─────────────────────────────────────────────────────
+// ─── API types ───────────────────────────────────────────────
 
-async function fintualLogin(
-  page: Page,
+interface FintualGoal {
+  id: string;
+  type: string;
+  attributes: {
+    name: string;
+    /** Net Asset Value — current portfolio value in CLP */
+    nav: number;
+  };
+}
+
+interface FintualTokenResponse {
+  data: {
+    id: string;
+    type: string;
+    attributes: {
+      token: string;
+      email: string;
+    };
+  };
+}
+
+interface FintualGoalsResponse {
+  data: FintualGoal[];
+}
+
+// ─── Helpers ─────────────────────────────────────────────────
+
+async function fintualAuth(
   email: string,
   password: string,
   debugLog: string[],
-  doSave: (page: Page, name: string) => Promise<void>,
-): Promise<{ success: boolean; error?: string }> {
-  debugLog.push("1. Navigating to Fintual sign-in...");
-  await page.goto(LOGIN_URL, { waitUntil: "networkidle2", timeout: 30000 });
-  await delay(3000);
-  await doSave(page, "01-login-form");
+): Promise<{ token: string; email: string } | { error: string }> {
+  debugLog.push("1. Authenticating via Fintual API...");
 
-  // Email field — Fintual uses label "Correo electrónico"
-  debugLog.push("2. Filling email...");
-  const emailSelectors = [
-    'input[type="email"]',
-    'input[name="email"]',
-    'input[id*="email"]',
-    'input[placeholder*="correo" i]',
-    'input[placeholder*="email" i]',
-  ];
-
-  let emailFilled = false;
-  for (const sel of emailSelectors) {
-    const el = await page.$(sel);
-    if (el) {
-      await el.click({ clickCount: 3 });
-      await el.type(email, { delay: 60 });
-      debugLog.push(`  Email field: ${sel}`);
-      emailFilled = true;
-      break;
-    }
-  }
-  if (!emailFilled) {
-    return { success: false, error: "No se encontró campo de correo electrónico." };
-  }
-  await delay(500);
-
-  // Password field — Fintual uses label "Contraseña"
-  debugLog.push("3. Filling password...");
-  const passEl = await page.$('input[type="password"]');
-  if (!passEl) {
-    return { success: false, error: "No se encontró campo de contraseña." };
-  }
-  await passEl.click();
-  await passEl.type(password, { delay: 60 });
-  await delay(500);
-
-  // Submit — Fintual uses button "Entrar"
-  debugLog.push("4. Clicking Entrar...");
-  const submitted = await page.evaluate(() => {
-    const btns = Array.from(document.querySelectorAll("button, input[type='submit']"));
-    for (const btn of btns) {
-      const text = (btn as HTMLElement).innerText?.trim().toLowerCase() || "";
-      if (text === "entrar" || text === "ingresar" || text === "iniciar sesión") {
-        (btn as HTMLElement).click();
-        return true;
-      }
-    }
-    const submitBtn = document.querySelector('button[type="submit"]') as HTMLButtonElement | null;
-    if (submitBtn && !submitBtn.disabled) { submitBtn.click(); return true; }
-    return false;
+  const res = await fetch(`${API_BASE}/access_tokens`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user: { email, password } }),
   });
-  if (!submitted) await page.keyboard.press("Enter");
 
-  try { await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 25000 }); } catch { await delay(5000); }
-  await delay(2000);
-  await doSave(page, "03-post-login");
-
-  const loginError = await detectLoginError(page);
-  if (loginError) return { success: false, error: `Error del banco: ${loginError}` };
-
-  const url = page.url();
-  if (url.includes("/sign-in") || url.includes("/login")) {
-    return { success: false, error: "Login no completado — URL sigue en sign-in/login." };
+  if (res.status === 401) {
+    return { error: "Credenciales incorrectas (email o contraseña inválida)." };
+  }
+  if (res.status === 422) {
+    return { error: "Faltan credenciales (email y contraseña son requeridos)." };
+  }
+  if (!res.ok) {
+    return { error: `Error de autenticación (HTTP ${res.status}).` };
   }
 
-  debugLog.push("5. Login OK!");
-  return { success: true };
+  const body = (await res.json()) as FintualTokenResponse;
+  const token = body.data.attributes.token;
+  const authedEmail = body.data.attributes.email;
+  debugLog.push(`  Auth OK — token received for ${authedEmail}`);
+  return { token, email: authedEmail };
 }
 
-async function extractFintualMovements(page: Page, debugLog: string[]): Promise<BankMovement[]> {
-  // Navigate to movements section
-  const navClicked = await page.evaluate(() => {
-    const targets = ["movimientos", "historial", "actividad", "transacciones", "aportes"];
-    for (const el of Array.from(document.querySelectorAll("a, button, [role='tab'], [role='link']"))) {
-      const text = (el as HTMLElement).innerText?.trim().toLowerCase() || "";
-      const href = (el as HTMLAnchorElement).href || "";
-      if (targets.some(t => text.includes(t) || href.includes(t)) && text.length < 60) {
-        (el as HTMLElement).click();
-        return text || href;
-      }
-    }
-    return null;
+async function fetchGoals(
+  email: string,
+  token: string,
+  debugLog: string[],
+): Promise<FintualGoal[]> {
+  debugLog.push("2. Fetching goals...");
+
+  const res = await fetch(`${API_BASE}/goals`, {
+    headers: {
+      "X-User-Email": email,
+      "X-User-Token": token,
+    },
   });
-  if (navClicked) {
-    debugLog.push(`  Navigation: "${navClicked}"`);
-    await delay(3000);
+
+  if (!res.ok) {
+    throw new Error(`Error al obtener objetivos (HTTP ${res.status}).`);
   }
 
-  const raw = await page.evaluate(() => {
-    const results: Array<{ date: string; description: string; amount: string; balance: string }> = [];
-
-    // Strategy 1: Tables
-    for (const table of Array.from(document.querySelectorAll("table"))) {
-      const rows = Array.from(table.querySelectorAll("tr"));
-      for (const row of rows) {
-        const cells = Array.from(row.querySelectorAll("td"));
-        if (cells.length < 2) continue;
-        const texts = cells.map(c => (c as HTMLElement).innerText?.trim() || "");
-        const dateMatch = texts.find(t => /\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}/.test(t) || /\d{4}-\d{2}-\d{2}/.test(t));
-        const amountMatch = texts.find(t => /[+\-]?\$?[\d.,]+/.test(t) && t !== dateMatch && t.length > 0);
-        if (dateMatch && amountMatch) {
-          const desc = texts.find(t => t !== dateMatch && t !== amountMatch && t.length > 2) || "";
-          results.push({ date: dateMatch, description: desc, amount: amountMatch, balance: "" });
-        }
-      }
-    }
-
-    // Strategy 2: React list items / cards (Fintual is Next.js React)
-    if (results.length === 0) {
-      const cards = document.querySelectorAll(
-        '[class*="movement"], [class*="transaction"], [class*="aporte"], [class*="rescate"], li, article'
-      );
-      for (const card of Array.from(cards)) {
-        const text = (card as HTMLElement).innerText || "";
-        const dateMatch = text.match(/\d{1,2}\s+(?:ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)[a-z]*\.?\s*\d{2,4}|(\d{4}-\d{2}-\d{2})|(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/i);
-        const amountMatch = text.match(/[+\-]?\$\s*[\d.,]+/);
-        if (dateMatch && amountMatch) {
-          const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
-          const desc = lines.find(l => l !== dateMatch[0] && !l.match(/^\$/) && l.length > 2) || "";
-          results.push({ date: dateMatch[0], description: desc, amount: amountMatch[0], balance: "" });
-        }
-      }
-    }
-
-    return results;
-  });
-
-  return raw
-    .map(r => {
-      const amount = parseChileanAmount(r.amount);
-      if (amount === 0) return null;
-      return {
-        date: normalizeDate(r.date),
-        description: r.description,
-        amount,
-        balance: 0,
-        source: MOVEMENT_SOURCE.account,
-      } as BankMovement;
-    })
-    .filter(Boolean) as BankMovement[];
+  const body = (await res.json()) as FintualGoalsResponse;
+  debugLog.push(`  Found ${body.data.length} goal(s)`);
+  return body.data;
 }
 
-// ─── Main scrape function ─────────────────────────────────────────
+// ─── Main scrape function ────────────────────────────────────
 
-async function scrapeFintual(session: BrowserSession, options: ScraperOptions): Promise<ScrapeResult> {
-  const { rut: email, password, saveScreenshots: doScreenshots, onProgress } = options;
-  const { page, debugLog, screenshot: doSave } = session;
+async function scrapeFintual(options: ScraperOptions, debugLog: string[]): Promise<ScrapeResult> {
+  const { rut: email, password, onProgress } = options;
   const bank = "fintual";
   const progress = onProgress || (() => {});
 
-  progress("Abriendo Fintual...");
-  const loginResult = await fintualLogin(page, email, password, debugLog, doSave);
-  if (!loginResult.success) {
-    const ss = await page.screenshot({ encoding: "base64" });
-    return { success: false, bank, movements: [], error: loginResult.error, screenshot: ss as string, debug: debugLog.join("\n") };
+  progress("Conectando con Fintual API...");
+  const authResult = await fintualAuth(email, password, debugLog);
+  if ("error" in authResult) {
+    return { success: false, bank, movements: [], error: authResult.error, debug: debugLog.join("\n") };
   }
 
   progress("Sesión iniciada correctamente");
-  await closePopups(page);
-  await delay(2000);
+  const goals = await fetchGoals(authResult.email, authResult.token, debugLog);
 
-  progress("Extrayendo movimientos...");
-  debugLog.push("6. Extracting movements...");
-  const movements = await extractFintualMovements(page, debugLog);
+  progress("Procesando datos...");
+  const today = new Date();
+  const dd = String(today.getDate()).padStart(2, "0");
+  const mm = String(today.getMonth() + 1).padStart(2, "0");
+  const yyyy = today.getFullYear();
+  const dateStr = `${dd}-${mm}-${yyyy}`;
 
-  // Pagination / load more
-  for (let i = 0; i < 10; i++) {
-    const hasMore = await page.evaluate(() => {
-      for (const btn of Array.from(document.querySelectorAll("button, a"))) {
-        const text = (btn as HTMLElement).innerText?.trim().toLowerCase();
-        const el = btn as HTMLButtonElement;
-        if ((text === "ver más" || text === "cargar más" || text?.includes("más movimientos")) && !el.disabled) {
-          el.click();
-          return true;
-        }
-      }
-      return false;
-    });
-    if (!hasMore) break;
-    await delay(2500);
-    const more = await extractFintualMovements(page, debugLog);
-    if (more.length === 0) break;
-    movements.push(...more);
-  }
+  // Each goal is a portfolio position — convert to movements for the dashboard
+  const movements: BankMovement[] = goals.map((goal) => ({
+    date: dateStr,
+    description: goal.attributes.name,
+    amount: goal.attributes.nav,
+    balance: goal.attributes.nav,
+    source: MOVEMENT_SOURCE.account,
+  }));
 
-  const deduplicated = deduplicateMovements(movements);
-  debugLog.push(`  Total: ${deduplicated.length} unique movements`);
-  progress(`Listo — ${deduplicated.length} movimientos totales`);
+  const totalBalance = goals.reduce((sum, g) => sum + g.attributes.nav, 0);
 
-  await doSave(page, "04-final");
-  const ss = doScreenshots ? await page.screenshot({ encoding: "base64" }) as string : undefined;
+  debugLog.push(`  Total: ${movements.length} goal(s), balance: $${totalBalance.toLocaleString("es-CL")}`);
+  progress(`Listo — ${movements.length} objetivo(s), saldo total: $${totalBalance.toLocaleString("es-CL")}`);
 
-  return { success: true, bank, movements: deduplicated, screenshot: ss, debug: debugLog.join("\n") };
+  return {
+    success: true,
+    bank,
+    movements,
+    balance: totalBalance,
+    debug: debugLog.join("\n"),
+  };
 }
 
-// ─── Export ───────────────────────────────────────────────────────
+// ─── Export ──────────────────────────────────────────────────
 
 const fintual: BankScraper = {
   id: "fintual",
   name: "Fintual",
-  url: DASHBOARD_URL,
-  scrape: (options) => runScraper("fintual", options, {}, scrapeFintual),
+  url: "https://fintual.cl",
+  mode: "api",
+  scrape: (options) => runApiScraper("fintual", options, scrapeFintual),
 };
 
 export default fintual;

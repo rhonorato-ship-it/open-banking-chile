@@ -187,6 +187,29 @@ export function deduplicateMovements(movements: BankMovement[]): BankMovement[] 
   });
 }
 
+// ─── Chrome profile ──────────────────────────────────────────
+
+/** Returns the default Chrome user data directory for the current OS, or null if not found. */
+export function defaultChromeProfilePath(): string | null {
+  const home = process.env.HOME || process.env.USERPROFILE || "";
+  if (!home) return null;
+
+  const candidates =
+    process.platform === "darwin"
+      ? [`${home}/Library/Application Support/Google/Chrome`]
+      : [`${home}/.config/google-chrome`]; // Linux
+
+  for (const dir of candidates) {
+    try {
+      const fs = require("fs");
+      if (fs.existsSync(dir)) return dir;
+    } catch {
+      // fs not available
+    }
+  }
+  return null;
+}
+
 // ─── Spinner ──────────────────────────────────────────────────
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];

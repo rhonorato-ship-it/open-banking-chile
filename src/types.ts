@@ -109,6 +109,12 @@ export interface ScraperOptions extends BankCredentials {
    * Pass chromium.args from @sparticuz/chromium when running on Vercel/Lambda.
    */
   launchArgs?: string[];
+  /**
+   * Path to a Chrome user data directory (profile).
+   * When set, Chrome opens with the user's real profile (cookies, sessions, saved passwords).
+   * Useful for skipping login when the user already has an active session.
+   */
+  userDataDir?: string;
 }
 
 /** Interfaz que debe implementar cada banco */
@@ -119,6 +125,11 @@ export interface BankScraper {
   name: string;
   /** URL del portal web del banco */
   url: string;
+  /**
+   * Scraper mode: "api" uses direct HTTP calls (no browser), "browser" uses Puppeteer.
+   * Default: "browser" (backward compatible).
+   */
+  mode?: "api" | "browser";
   /** Ejecutar el scraping */
   scrape(options: ScraperOptions): Promise<ScrapeResult>;
 }
