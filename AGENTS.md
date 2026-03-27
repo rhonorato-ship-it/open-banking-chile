@@ -10,7 +10,7 @@ Open source scraping framework for Chilean banks. Extracts account movements and
 - **Vercel project**: `open-banking-chile` (org: `rhonorato-ship-its-projects`)
 - **Vercel project ID**: `prj_ovBTOzwEpedmlf6JILFlKtbf6hBN`
 - **Deploy command**: run `vercel --prod` from repo root (not from `web/` — root dir is configured as `web` in Vercel settings)
-- **npm package**: `open-banking-chile` (latest: v2.1.1, publisher: `rhonorato`)
+- **npm package**: `open-banking-chile` (latest: v2.1.2, publisher: `rhonorato`)
 
 ### Supported banks (10)
 - Banco de Chile (`bchile`)
@@ -49,7 +49,7 @@ src/
     falabella.ts, bchile.ts, bci.ts, bestado.ts, bice.ts,
     edwards.ts, itau.ts, santander.ts, scotiabank.ts, citi.ts
 
-web/                       — Next.js 15 multi-user dashboard (App Router)
+web/                       — Next.js 16 multi-user dashboard (App Router), deployed on Vercel
   app/
     dashboard/             — Balance hero, bank cards with skeleton loaders, sync buttons, toast notifications
     banks/                 — Add / edit / remove bank credentials (self-contained BankRow, inline delete confirm)
@@ -62,13 +62,12 @@ web/                       — Next.js 15 multi-user dashboard (App Router)
   components/
     ScrapeProgress.tsx     — Full-screen phase animation; retry re-initialises SSE (no page reload)
   lib/
-    auth.ts                — Auth.js v5 (Google OAuth, JWT, email whitelist)
-    db.ts                  — Drizzle ORM + postgres driver
-    schema.ts              — users, bank_credentials, movements tables
+    auth.ts                — Auth.js v5 (Google OAuth, JWT)
+    db.ts                  — Supabase HTTP client (@supabase/supabase-js, PostgREST — no TCP connection)
     credentials.ts         — AES-256-GCM encrypt/decrypt for stored credentials
     hash.ts                — SHA-256 deduplication hash for movements
-  middleware.ts            — Route protection (redirect to /login if unauthenticated)
-  drizzle.config.ts        — Drizzle Kit config (reads DATABASE_URL)
+    utils.ts               — Shared utilities (isValidIsoDate, etc.)
+  middleware.ts            — Route protection (redirect to /login if unauthenticated; rename to proxy.ts pending)
 ```
 
 ---
@@ -117,11 +116,11 @@ Required env vars (managed via Doppler project `open-banking-chile`, config `dev
 - `AUTH_SECRET` — Auth.js session secret (base64, 32 bytes)
 - `CREDENTIALS_SECRET` — AES-256 key for bank credentials (hex, 64 chars = 32 bytes)
 
-**Database client**: uses `@supabase/supabase-js` (PostgREST HTTP API, not a TCP postgres connection). This was necessary because Supabase's Supavisor TCP pooler credentials couldn't be used from Vercel. The HTTP client works from any serverless environment. `DATABASE_URL` is no longer used.
+**Database**: [Supabase](https://supabase.com) project **`open-banking`**. Client uses `@supabase/supabase-js` (PostgREST HTTP API, not TCP). Required because Supabase's TCP pooler doesn't work from Vercel serverless functions. `DATABASE_URL` is no longer used.
 
-**Access policy**: any Google account can sign in — there is no email whitelist. Access control is purely "authenticated with Google OAuth". Do not add `AUTH_WHITELIST_EMAILS` back.
+**Access policy**: any Google account can sign in — no email whitelist. Do not add `AUTH_WHITELIST_EMAILS` back.
 
-> **Note**: `SUPABASE_URL` and `SUPABASE_ANON_KEY` are set directly in Vercel (not via Doppler). Doppler still manages the other vars. Always add new secrets to Doppler prd config, but these two Supabase vars live in Vercel only.
+**Secret management**: all secrets are in [Doppler](https://doppler.com) project **`open-banking-chile`** (configs: `dev` for local, `prd` for production). Exception: `SUPABASE_URL` and `SUPABASE_ANON_KEY` are also set directly in Vercel environment variables (Vercel dashboard → project settings → environment variables) so they're available during build without Doppler. All other secrets go to Doppler prd only.
 
 ---
 
