@@ -9,21 +9,25 @@ import Link from "next/link";
 const EMAIL_BANKS = new Set(["fintual", "racional"]);
 // Banks where the "rut" field is an open identifier (email / RUT / phone)
 const IDENTIFIER_BANKS = new Set(["mercadopago"]);
+// Banks where the "rut" field is an alphanumeric username (not a Chilean RUT)
+const USERNAME_BANKS = new Set(["citi"]);
 
 function rutFieldLabel(bankId: string): string {
   if (EMAIL_BANKS.has(bankId)) return "Email";
   if (IDENTIFIER_BANKS.has(bankId)) return "Email / RUT / Teléfono";
+  if (USERNAME_BANKS.has(bankId)) return "Usuario";
   return "RUT";
 }
 
 function rutFieldPlaceholder(bankId: string): string {
   if (EMAIL_BANKS.has(bankId)) return "tu@email.com";
   if (IDENTIFIER_BANKS.has(bankId)) return "Email, RUT o teléfono";
+  if (USERNAME_BANKS.has(bankId)) return "Nombre de usuario";
   return "RUT (ej: 12345678-9)";
 }
 
 function useRutValidation(bankId: string): boolean {
-  return !EMAIL_BANKS.has(bankId) && !IDENTIFIER_BANKS.has(bankId);
+  return !EMAIL_BANKS.has(bankId) && !IDENTIFIER_BANKS.has(bankId) && !USERNAME_BANKS.has(bankId);
 }
 
 interface BankStatus {
