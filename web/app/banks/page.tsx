@@ -5,6 +5,27 @@ import { isValidRut, normalizeRut } from "@/lib/rut";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 
+// Banks where the "rut" field is an email address
+const EMAIL_BANKS = new Set(["fintual", "racional"]);
+// Banks where the "rut" field is an open identifier (email / RUT / phone)
+const IDENTIFIER_BANKS = new Set(["mercadopago"]);
+
+function rutFieldLabel(bankId: string): string {
+  if (EMAIL_BANKS.has(bankId)) return "Email";
+  if (IDENTIFIER_BANKS.has(bankId)) return "Email / RUT / Teléfono";
+  return "RUT";
+}
+
+function rutFieldPlaceholder(bankId: string): string {
+  if (EMAIL_BANKS.has(bankId)) return "tu@email.com";
+  if (IDENTIFIER_BANKS.has(bankId)) return "Email, RUT o teléfono";
+  return "RUT (ej: 12345678-9)";
+}
+
+function useRutValidation(bankId: string): boolean {
+  return !EMAIL_BANKS.has(bankId) && !IDENTIFIER_BANKS.has(bankId);
+}
+
 interface BankStatus {
   id: string;
   name: string;
@@ -119,12 +140,15 @@ function BankRow({
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [error, setError] = useState("");
 
+  const validateRut = useRutValidation(bank.id);
+  const label = rutFieldLabel(bank.id);
+
   async function handleSave() {
-    if (!rut || !password) { setError("Completa RUT y contraseña"); return; }
-    if (!isValidRut(rut)) { setError("RUT inválido — ej: 12345678-9"); return; }
+    if (!rut || !password) { setError(`Completa ${label.toLowerCase()} y contraseña`); return; }
+    if (validateRut && !isValidRut(rut)) { setError("RUT inválido — ej: 12345678-9"); return; }
     setSaving(true);
     setError("");
-    const normalized = normalizeRut(rut)!;
+    const normalized = validateRut ? normalizeRut(rut)! : rut.trim();
     const ok = await onSave(bank.id, normalized, password);
     setSaving(false);
     if (ok) {
@@ -200,22 +224,22 @@ function BankRow({
         <div className="border-t border-white/[0.05] px-4 py-4 flex flex-col gap-3">
           <div>
             <input
-              type="text"
-              placeholder="RUT (ej: 12345678-9)"
+              type={EMAIL_BANKS.has(bank.id) ? "email" : "text"}
+              placeholder={rutFieldPlaceholder(bank.id)}
               value={rut}
               onChange={(e) => { setRut(e.target.value); setError(""); }}
               className={`w-full bg-white/[0.04] border rounded-xl px-3 py-2.5 text-sm placeholder-white/20 focus:outline-none transition-colors ${
-                rut && !isValidRut(rut)
+                validateRut && rut && !isValidRut(rut)
                   ? "border-red-500/40 focus:border-red-500/60"
-                  : rut && isValidRut(rut)
+                  : validateRut && rut && isValidRut(rut)
                   ? "border-emerald-500/40 focus:border-emerald-500/60"
                   : "border-white/[0.08] focus:border-[#0ea5e9]/50"
               }`}
             />
-            {rut && isValidRut(rut) && (
+            {validateRut && rut && isValidRut(rut) && (
               <p className="text-[11px] text-emerald-400/70 mt-1 px-1">{normalizeRut(rut)}</p>
             )}
-            {rut && !isValidRut(rut) && (
+            {validateRut && rut && !isValidRut(rut) && (
               <p className="text-[11px] text-red-400/70 mt-1 px-1">Formato: 12345678-9 o 12.345.678-9</p>
             )}
           </div>

@@ -92,7 +92,8 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Missing or invalid fields" }, { status: 400 });
   }
 
-  const normalizedRut = normalizeRut(rut);
+  const EMAIL_BANKS = new Set(["fintual", "racional", "mercadopago"]);
+  const normalizedRut = EMAIL_BANKS.has(normalizedBankId) ? rut.trim() : normalizeRut(rut);
   if (!normalizedRut) {
     return NextResponse.json({ error: "RUT inválido" }, { status: 400 });
   }

@@ -14,7 +14,7 @@ if (!clientId || !clientSecret) {
   process.exit(1);
 }
 
-const PORT = 3434; // change to any port already in your Google Cloud Console redirect URIs
+const PORT = 3435;
 const REDIRECT_URI = `http://localhost:${PORT}`;
 
 const oauth2 = new google.auth.OAuth2(clientId, clientSecret, REDIRECT_URI);
