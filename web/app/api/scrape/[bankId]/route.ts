@@ -65,14 +65,15 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
         }
 
         // Fetch and decrypt credentials — always scoped to this user
-        const { data: cred } = await supabase
+        const { data: cred, error: credError } = await supabase
           .from("bank_credentials")
-          .select("encrypted_rut, rut_iv, encrypted_password, password_iv, encrypted_cookies, cookies_iv")
+          .select("encrypted_rut, rut_iv, encrypted_password, password_iv")
           .eq("user_id", userId)
           .eq("bank_id", bankId)
           .single();
 
-        if (!cred) {
+        if (credError || !cred) {
+          console.error("[scrape] credential lookup failed:", credError, "userId:", userId, "bankId:", bankId);
           await supabase
             .from("bank_credentials")
             .update({ is_syncing: false })
@@ -81,6 +82,22 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
           send({ phase: 1, error: true, message: "No se encontraron credenciales para este banco." });
           controller.close();
           return;
+        }
+
+        // Session cookies are optional (column may not exist yet)
+        let sessionCookies: string | null = null;
+        try {
+          const { data: cookieRow } = await supabase
+            .from("bank_credentials")
+            .select("encrypted_cookies, cookies_iv")
+            .eq("user_id", userId)
+            .eq("bank_id", bankId)
+            .single();
+          if (cookieRow?.encrypted_cookies && cookieRow?.cookies_iv) {
+            sessionCookies = await decrypt(cookieRow.encrypted_cookies, cookieRow.cookies_iv);
+          }
+        } catch {
+          // cookies columns may not exist — not critical
         }
 
         const rut = await decrypt(cred.encrypted_rut, cred.rut_iv);
@@ -99,12 +116,7 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
         launchArgs.push("--headless=shell"); // explicit, no quoting issues
 
         // Load stored browser cookies (if any) — avoids 2FA on repeat runs
-        let storedCookiesJson: string | undefined;
-        if (cred.encrypted_cookies && cred.cookies_iv) {
-          try {
-            storedCookiesJson = await decrypt(cred.encrypted_cookies, cred.cookies_iv);
-          } catch { /* non-fatal */ }
-        }
+        const storedCookiesJson: string | undefined = sessionCookies ?? undefined;
 
         // 2FA code exchange: SSE signals the frontend, which POSTs the code to a Supabase row.
         // The onTwoFactorCode callback polls for up to 90s (matching typical bank code TTL).
