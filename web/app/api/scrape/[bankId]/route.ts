@@ -4,7 +4,7 @@ export const maxDuration = 300;
 import chromium from "@sparticuz/chromium";
 import { auth } from "@/lib/auth";
 import { supabase } from "@/lib/db";
-import { decrypt } from "@/lib/credentials";
+import { decrypt, encrypt } from "@/lib/credentials";
 import { movementHash } from "@/lib/hash";
 import { getBank } from "open-banking-chile";
 
@@ -67,7 +67,7 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
         // Fetch and decrypt credentials — always scoped to this user
         const { data: cred } = await supabase
           .from("bank_credentials")
-          .select("encrypted_rut, rut_iv, encrypted_password, password_iv")
+          .select("encrypted_rut, rut_iv, encrypted_password, password_iv, encrypted_cookies, cookies_iv")
           .eq("user_id", userId)
           .eq("bank_id", bankId)
           .single();
@@ -99,17 +99,10 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
         launchArgs.push("--headless=shell"); // explicit, no quoting issues
 
         // Load stored browser cookies (if any) — avoids 2FA on repeat runs
-        const { data: credWithCookies } = await supabase
-          .from("bank_credentials")
-          .select("encrypted_cookies, cookies_iv")
-          .eq("user_id", userId)
-          .eq("bank_id", bankId)
-          .single();
-
         let storedCookiesJson: string | undefined;
-        if (credWithCookies?.encrypted_cookies && credWithCookies?.cookies_iv) {
+        if (cred.encrypted_cookies && cred.cookies_iv) {
           try {
-            storedCookiesJson = await decrypt(credWithCookies.encrypted_cookies, credWithCookies.cookies_iv);
+            storedCookiesJson = await decrypt(cred.encrypted_cookies, cred.cookies_iv);
           } catch { /* non-fatal */ }
         }
 
@@ -156,7 +149,6 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
         // Persist session cookies so the next sync skips 2FA
         if (result.success && result.sessionCookies) {
           try {
-            const { encrypt } = await import("@/lib/credentials");
             const { ciphertext, iv } = await encrypt(result.sessionCookies);
             await supabase
               .from("bank_credentials")

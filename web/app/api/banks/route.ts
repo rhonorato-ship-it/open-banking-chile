@@ -3,11 +3,8 @@ import { auth } from "@/lib/auth";
 import { supabase } from "@/lib/db";
 import { encrypt } from "@/lib/credentials";
 import { normalizeRut } from "@/lib/rut";
+import { isValidIsoDate } from "@/lib/utils";
 import { listBanks } from "open-banking-chile";
-
-function isValidIsoDate(value: string): boolean {
-  return /^\d{4}-\d{2}-\d{2}$/.test(value);
-}
 
 export async function GET() {
   const session = await auth();
