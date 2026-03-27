@@ -54,12 +54,15 @@ web/                       — Next.js 15 multi-user dashboard (App Router), dep
     dashboard/             — Balance hero, bank cards with skeleton loaders, sync buttons, toast notifications
     banks/                 — Add / edit / remove bank credentials (self-contained BankRow, inline delete confirm)
     movements/             — Transaction history: text search, sortable columns, pagination (50/page), monthly chart
-    analytics/             — Monthly income vs spend chart (recharts), category breakdown bar list
+    analytics/             — Filter bar, summary totals, time-series chart, bank comparison, category breakdown, spending heatmap
     login/                 — Google OAuth sign-in
     api/
       banks/               — CRUD for encrypted bank credentials
       movements/           — Query movements with filters (bankId, from, to); enriched with category + isInternalTransfer
-      analytics/           — Pre-aggregated time-series and category breakdown (last 12 months, transfers excluded)
+      analytics/           — Pre-aggregated time-series, category breakdown, bank comparison, heatmap (filters: bankId, from, to)
+      dashboard-summary/   — Current-month spend/income/net, transfer count, top-5 categories, last-6-month series
+      coach/               — Rule-based financial recommendations (top category, savings pressure, transfer ratio)
+      drive/               — POST: export all movements as XLSX to Google Drive; returns { url, name }
       scrape/[bankId]/     — SSE endpoint: runs scraper, streams progress phases
   components/
     ScrapeProgress.tsx     — Full-screen phase animation; retry re-initialises SSE (no page reload)
@@ -72,6 +75,10 @@ web/                       — Next.js 15 multi-user dashboard (App Router), dep
     utils.ts               — Shared utilities (isValidIsoDate, etc.)
     categories.ts          — Regex-based category inference from movement description (15 categories)
     transfers.ts           — Cross-bank internal transfer detection (debit/credit pair matching)
+    coach.ts               — Rule-based coach recommendations (getCoachRecommendations)
+    drive/
+      export.ts            — buildMovementsXlsx(): multi-sheet XLSX from movements array
+      google-drive.ts      — uploadToDrive(): Google Drive upload via OAuth2 (GDRIVE_* env vars)
   middleware.ts            — Route protection (redirect to /login if unauthenticated)
 ```
 
@@ -133,6 +140,10 @@ All secrets live in [Doppler](https://doppler.com) project **`open-banking-chile
 | `AUTH_GOOGLE_SECRET` | dev + prd | Google OAuth client secret — same project |
 | `AUTH_SECRET` | dev + prd | Auth.js session secret — generate: `openssl rand -base64 32` |
 | `CREDENTIALS_SECRET` | dev + prd | AES-256 key for bank credentials — generate: `openssl rand -hex 32` (64 hex chars) |
+| `GDRIVE_CLIENT_ID` | dev + prd | Google OAuth2 client ID for Drive (Google Cloud project **`open-banking-chile`**) |
+| `GDRIVE_CLIENT_SECRET` | dev + prd | Google OAuth2 client secret for Drive |
+| `GDRIVE_REFRESH_TOKEN` | dev + prd | OAuth2 refresh token — generated via `node scripts/google-drive-auth.mjs` in open-finance-tool |
+| `GOOGLE_DRIVE_FOLDER_ID` | dev + prd | Target Drive folder ID (from the folder's URL) |
 
 ### Google OAuth (Google Cloud project: `open-banking-chile`)
 
@@ -150,6 +161,14 @@ https://open-banking-chile.vercel.app/api/auth/callback/google  ← production
 - **RLS**: disabled — the anon key has full table access server-side. Tables: `users`, `bank_credentials`, `movements`.
 
 **Access policy**: any Google account can sign in — no email whitelist. Do not add `AUTH_WHITELIST_EMAILS`.
+
+### Google Drive export
+
+The `/api/drive` POST endpoint exports all user movements as a multi-sheet XLSX file to a shared Google Drive folder. Uses OAuth2 (not a service account). Each export overwrites the previous file with the same date-based name.
+
+- `GDRIVE_*` env vars must be set in both Doppler `dev` and `prd` configs
+- The Drive OAuth2 credentials use a separate Google Cloud client (Desktop app type) from the sign-in OAuth client
+- `isDriveConfigured()` returns `false` if any of the four required env vars are missing — the endpoint returns 503 gracefully
 
 ---
 

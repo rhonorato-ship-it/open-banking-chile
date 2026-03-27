@@ -41,6 +41,8 @@ function MovementsPageContent() {
   const [sortField, setSortField] = useState<SortField>("date");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
   const [page, setPage] = useState(0);
+  const [driveState, setDriveState] = useState<"idle" | "loading" | "done" | "error">("idle");
+  const [driveUrl, setDriveUrl] = useState<string | null>(null);
 
   async function load() {
     setLoading(true);
@@ -92,6 +94,20 @@ function MovementsPageContent() {
       .sort(([a], [b]) => a.localeCompare(b))
       .slice(-6);
   }, [movements]);
+
+  async function exportToDrive() {
+    setDriveState("loading");
+    setDriveUrl(null);
+    try {
+      const res = await fetch("/api/drive", { method: "POST" });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      setDriveUrl(data.url);
+      setDriveState("done");
+    } catch {
+      setDriveState("error");
+    }
+  }
 
   function toggleSort(field: SortField) {
     if (sortField === field) setSortDir((d) => (d === "asc" ? "desc" : "asc"));
@@ -145,6 +161,17 @@ function MovementsPageContent() {
               className="bg-white/[0.04] border border-white/[0.08] rounded-xl px-3 py-2 text-sm text-white/60 focus:outline-none focus:border-[#0ea5e9]/50 transition-colors" />
             <input type="date" value={to} onChange={(e) => setTo(e.target.value)}
               className="bg-white/[0.04] border border-white/[0.08] rounded-xl px-3 py-2 text-sm text-white/60 focus:outline-none focus:border-[#0ea5e9]/50 transition-colors" />
+            {driveState === "done" && driveUrl ? (
+              <a href={driveUrl} target="_blank" rel="noopener noreferrer"
+                className="bg-emerald-500/10 border border-emerald-500/20 rounded-xl px-3 py-2 text-sm text-emerald-400 hover:bg-emerald-500/20 transition-colors whitespace-nowrap">
+                Ver archivo ↗
+              </a>
+            ) : (
+              <button onClick={exportToDrive} disabled={driveState === "loading"}
+                className="bg-white/[0.04] border border-white/[0.08] rounded-xl px-3 py-2 text-sm text-white/60 hover:text-white/80 hover:bg-white/[0.07] transition-colors disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap">
+                {driveState === "loading" ? "Exportando…" : driveState === "error" ? "Error — reintentar" : "Exportar a Drive"}
+              </button>
+            )}
           </div>
         </div>
 

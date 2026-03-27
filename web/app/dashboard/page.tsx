@@ -15,6 +15,33 @@ interface BankStatus {
   change30d: number | null;
 }
 
+interface DashboardSummary {
+  monthlySpend: number;
+  monthlyIncome: number;
+  monthlyNet: number;
+  transferCount: number;
+  categoryBreakdown: Array<{ category: string; amount: number }>;
+  monthlySeries: Array<{ month: string; spend: number; income: number }>;
+}
+
+interface CoachRec {
+  id: string;
+  title: string;
+  rationale: string;
+  action: string;
+  estimatedImpactClp: number;
+}
+
+const CATEGORY_NAMES: Record<string, string> = {
+  income: "Ingresos", housing: "Vivienda", groceries: "Supermercado",
+  eating_out: "Restaurantes", transport: "Transporte", health: "Salud",
+  entertainment: "Entretenimiento", utilities: "Servicios", education: "Educación",
+  shopping: "Shopping", savings_investment: "Inversiones", insurance: "Seguros",
+  transfer: "Transferencias", cash: "Efectivo", other: "Otros",
+};
+
+const MONTHS_ES = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"];
+
 const fmt = (n: number) =>
   new Intl.NumberFormat("es-CL", { style: "currency", currency: "CLP", maximumFractionDigits: 0 }).format(n);
 
@@ -23,6 +50,8 @@ const fmtDate = (s: string) =>
 
 export default function DashboardPage() {
   const [banks, setBanks] = useState<BankStatus[]>([]);
+  const [summary, setSummary] = useState<DashboardSummary | null>(null);
+  const [coach, setCoach] = useState<CoachRec[]>([]);
   const [scraping, setScraping] = useState<{ id: string; name: string } | null>(null);
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState<string | null>(null);
@@ -40,13 +69,35 @@ export default function DashboardPage() {
     setLoading(false);
   }
 
-  useEffect(() => { loadBanks(); }, []);
+  async function loadSummary() {
+    const res = await fetch("/api/dashboard-summary");
+    if (res.ok) setSummary(await res.json());
+  }
+
+  async function loadCoach() {
+    const res = await fetch("/api/coach");
+    if (res.ok) {
+      const { recommendations } = await res.json();
+      setCoach(recommendations ?? []);
+    }
+  }
+
+  useEffect(() => {
+    loadBanks();
+    loadSummary();
+    loadCoach();
+  }, []);
 
   const connected = banks.filter((b) => b.connected);
   const available = banks.filter((b) => !b.connected);
   const totalBalance = connected.reduce((s, b) => s + (b.balance ?? 0), 0);
   const totalChange = connected.reduce((s, b) => s + (b.change30d ?? 0), 0);
   const hasBalance = connected.some((b) => b.balance !== null);
+
+  const maxSeries = summary
+    ? Math.max(...summary.monthlySeries.flatMap((m) => [m.income, m.spend]), 1)
+    : 1;
+  const maxCategory = summary?.categoryBreakdown[0]?.amount ?? 1;
 
   return (
     <div className="min-h-screen bg-[#08080f] text-white">
@@ -69,7 +120,7 @@ export default function DashboardPage() {
         </div>
       </nav>
 
-      <main className="max-w-5xl mx-auto px-6 py-10 space-y-12">
+      <main className="max-w-5xl mx-auto px-6 py-10 space-y-10">
 
         {/* ── Balance Hero ── */}
         {loading ? (
@@ -109,6 +160,147 @@ export default function DashboardPage() {
               ))}
             </div>
           </section>
+        )}
+
+        {/* ── Monthly Summary Cards ── */}
+        {loading || !summary ? (
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 animate-pulse">
+            {[...Array(4)].map((_, i) => (
+              <div key={i} className="p-4 rounded-2xl border border-white/[0.07] bg-white/[0.03]">
+                <div className="h-2.5 w-16 bg-white/[0.06] rounded-full mb-3" />
+                <div className="h-6 w-24 bg-white/[0.06] rounded-lg" />
+              </div>
+            ))}
+          </div>
+        ) : summary.monthlySpend > 0 || summary.monthlyIncome > 0 ? (
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <div className="p-4 rounded-2xl border border-white/[0.07] bg-white/[0.03]">
+              <p className="text-xs text-white/30 mb-1">Gasto mensual</p>
+              <p className="text-lg font-bold font-mono text-red-400">{fmt(summary.monthlySpend)}</p>
+            </div>
+            <div className="p-4 rounded-2xl border border-white/[0.07] bg-white/[0.03]">
+              <p className="text-xs text-white/30 mb-1">Ingreso mensual</p>
+              <p className="text-lg font-bold font-mono text-emerald-400">{fmt(summary.monthlyIncome)}</p>
+            </div>
+            <div className="p-4 rounded-2xl border border-white/[0.07] bg-white/[0.03]">
+              <p className="text-xs text-white/30 mb-1">Balance neto</p>
+              <p className={`text-lg font-bold font-mono ${summary.monthlyNet >= 0 ? "text-[#0ea5e9]" : "text-red-400"}`}>
+                {fmt(summary.monthlyNet)}
+              </p>
+            </div>
+            <div className="p-4 rounded-2xl border border-white/[0.07] bg-white/[0.03]">
+              <p className="text-xs text-white/30 mb-1">Traspasos internos</p>
+              <p className="text-lg font-bold font-mono text-white/50">{summary.transferCount}</p>
+            </div>
+          </div>
+        ) : null}
+
+        {/* ── Mini Chart + Categories ── */}
+        {summary && (summary.monthlySeries.length >= 2 || summary.categoryBreakdown.length > 0) && (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+
+            {/* Monthly mini-chart */}
+            {summary.monthlySeries.length >= 2 && (
+              <div className="p-5 rounded-2xl border border-white/[0.07] bg-white/[0.03]">
+                <p className="text-xs text-white/25 uppercase tracking-[0.15em] mb-5">Últimos 6 meses</p>
+                <div className="flex items-end gap-2" style={{ height: 72 }}>
+                  {summary.monthlySeries.map((m) => {
+                    const incH = Math.max(3, (m.income / maxSeries) * 72);
+                    const spH = Math.max(3, (m.spend / maxSeries) * 72);
+                    const label = MONTHS_ES[parseInt(m.month.slice(5, 7), 10) - 1] + " '" + m.month.slice(2, 4);
+                    return (
+                      <div key={m.month} className="flex-1 flex flex-col items-center justify-end gap-0.5">
+                        <div className="w-full flex items-end justify-center gap-0.5" style={{ height: 72 }}>
+                          <div
+                            className="flex-1 rounded-sm bg-emerald-400/35 hover:bg-emerald-400/55 transition-colors"
+                            style={{ height: incH }}
+                            title={`Ingresos: ${fmt(m.income)}`}
+                          />
+                          <div
+                            className="flex-1 rounded-sm bg-red-400/35 hover:bg-red-400/55 transition-colors"
+                            style={{ height: spH }}
+                            title={`Egresos: ${fmt(m.spend)}`}
+                          />
+                        </div>
+                        <span className="text-[9px] text-white/20 mt-1.5 whitespace-nowrap">{label}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="flex gap-4 mt-4">
+                  <div className="flex items-center gap-1.5">
+                    <div className="w-2 h-2 rounded-sm bg-emerald-400/50" />
+                    <span className="text-[10px] text-white/25">Ingresos</span>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <div className="w-2 h-2 rounded-sm bg-red-400/50" />
+                    <span className="text-[10px] text-white/25">Egresos</span>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Top categories */}
+            {summary.categoryBreakdown.length > 0 && (
+              <div className="p-5 rounded-2xl border border-white/[0.07] bg-white/[0.03]">
+                <p className="text-xs text-white/25 uppercase tracking-[0.15em] mb-5">Gastos este mes</p>
+                <div className="space-y-3">
+                  {summary.categoryBreakdown.map((c) => (
+                    <div key={c.category} className="flex items-center gap-3">
+                      <span className="text-sm text-white/50 w-28 shrink-0 truncate">
+                        {CATEGORY_NAMES[c.category] ?? c.category}
+                      </span>
+                      <div className="flex-1 h-1 bg-white/[0.06] rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-[#0ea5e9]/40 rounded-full"
+                          style={{ width: `${(c.amount / maxCategory) * 100}%` }}
+                        />
+                      </div>
+                      <span className="text-xs font-mono text-white/35 w-24 text-right shrink-0">
+                        {fmt(c.amount)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                <Link href="/analytics" className="mt-4 block text-xs text-[#0ea5e9]/60 hover:text-[#0ea5e9] transition-colors text-right">
+                  Ver analítica completa →
+                </Link>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── Coach recommendations ── */}
+        {coach.length > 0 && (
+          <div className="p-5 rounded-2xl border border-white/[0.07] bg-white/[0.03]">
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <p className="text-xs text-white/25 uppercase tracking-[0.15em]">Coach</p>
+                <p className="text-xs text-white/20 mt-0.5">Recomendaciones del mes</p>
+              </div>
+            </div>
+            <div className="space-y-3">
+              {coach.slice(0, 2).map((rec) => (
+                <div key={rec.id} className="flex gap-3 p-3 rounded-xl bg-white/[0.03] border border-white/[0.05]">
+                  <div className="w-7 h-7 rounded-lg bg-[#0ea5e9]/10 border border-[#0ea5e9]/20 flex items-center justify-center shrink-0 mt-0.5">
+                    <span className="text-[#0ea5e9] text-sm">→</span>
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium text-white/80 leading-snug">{rec.title}</p>
+                    <p className="text-xs text-white/35 mt-0.5 leading-snug">{rec.action}</p>
+                  </div>
+                  {rec.estimatedImpactClp > 0 && (
+                    <div className="shrink-0 text-right">
+                      <p className="text-[10px] text-white/25">ahorro est.</p>
+                      <p className="text-xs font-mono text-emerald-400/70">
+                        {new Intl.NumberFormat("es-CL", { style: "currency", currency: "CLP", maximumFractionDigits: 0 }).format(rec.estimatedImpactClp)}
+                      </p>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
         )}
 
         {/* ── Connected Banks ── */}
@@ -213,7 +405,7 @@ export default function DashboardPage() {
         <ScrapeProgress
           bankId={scraping.id}
           bankName={scraping.name}
-          onDone={() => { setScraping(null); loadBanks(); showToast(`${scraping.name} sincronizado`); }}
+          onDone={() => { setScraping(null); loadBanks(); loadSummary(); loadCoach(); showToast(`${scraping.name} sincronizado`); }}
           onError={() => { setScraping(null); loadBanks(); }}
         />
       )}
