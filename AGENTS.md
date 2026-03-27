@@ -112,7 +112,7 @@ Required env vars (managed via Doppler project `open-banking-chile`, config `dev
 - `SUPABASE_URL` — `https://wcyxlyitcbmeczihaohq.supabase.co` — Supabase project URL for the HTTP client
 - `SUPABASE_ANON_KEY` — Supabase anon JWT — used server-side (RLS is disabled, anon has full table access)
 - `AUTH_URL` — Canonical app URL (`http://localhost:3434` for dev, `https://open-banking-chile.vercel.app` for prd)
-- `AUTH_GOOGLE_ID` / `AUTH_GOOGLE_SECRET` — Google OAuth credentials
+- `AUTH_GOOGLE_ID` / `AUTH_GOOGLE_SECRET` — Google OAuth credentials (Google Cloud project: **`open-banking-chile`**)
 - `AUTH_SECRET` — Auth.js session secret (base64, 32 bytes)
 - `CREDENTIALS_SECRET` — AES-256 key for bank credentials (hex, 64 chars = 32 bytes)
 
