@@ -18,13 +18,16 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
             .single();
 
           const id = existing?.id ?? user.id ?? account.providerAccountId;
+          console.log("[auth] jwt signin — existing:", existing?.id, "resolved id:", id);
 
           const { error } = await supabase.from("users").upsert(
             { id, email: user.email, name: user.name ?? null, image: user.image ?? null },
             { onConflict: "id" },
           );
           if (error) console.error("[auth] user upsert failed:", error);
-          else token.userId = id;
+          // Always set userId — don't gate on upsert success (upsert can fail for
+          // non-identity reasons like name/image update conflicts)
+          token.userId = id;
         } catch (e) {
           console.error("[auth] jwt exception:", e);
         }
