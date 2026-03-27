@@ -74,6 +74,8 @@ export interface ScrapeResult {
   screenshot?: string;
   /** Log de debug con pasos del scraper */
   debug?: string;
+  /** Session cookies serialized as JSON string for reuse between syncs */
+  sessionCookies?: string;
 }
 
 /** Credenciales de autenticación */
