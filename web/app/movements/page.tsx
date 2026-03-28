@@ -3,6 +3,7 @@
 import { Suspense, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import Link from "next/link";
+import Navigation from "@/components/Navigation";
 
 interface Movement {
   id: string;
@@ -82,7 +83,6 @@ function MovementsPageContent() {
   const income = filtered.filter((m) => parseFloat(m.amount) > 0).reduce((s, m) => s + parseFloat(m.amount), 0);
   const expenses = filtered.filter((m) => parseFloat(m.amount) < 0).reduce((s, m) => s + parseFloat(m.amount), 0);
 
-  // Monthly data for chart — always derived from full (unfiltered) movements
   const monthlyData = useMemo(() => {
     const map: Record<string, { income: number; expenses: number }> = {};
     for (const m of movements) {
@@ -117,29 +117,18 @@ function MovementsPageContent() {
   }
 
   const SortIndicator = ({ field }: { field: SortField }) =>
-    sortField === field ? <span className="ml-1 text-[#0ea5e9]">{sortDir === "desc" ? "↓" : "↑"}</span> : null;
+    sortField === field ? <span className="ml-1 text-teal-600">{sortDir === "desc" ? "↓" : "↑"}</span> : null;
 
   return (
-    <div className="min-h-screen bg-[#08080f] text-white">
-      <nav className="border-b border-white/[0.06] px-6 h-14 flex items-center justify-between sticky top-0 bg-[#08080f]/90 backdrop-blur-sm z-10">
-        <Link href="/dashboard" className="flex items-center gap-2.5">
-          <div className="w-5 h-5 rounded-full bg-[#0ea5e9]" />
-          <span className="font-semibold text-sm tracking-tight">Open Banking Chile</span>
-        </Link>
-        <div className="flex items-center gap-5">
-          <Link href="/analytics" className="text-sm text-white/40 hover:text-white/80 transition-colors">Analítica</Link>
-          <Link href="/banks" className="text-sm text-white/40 hover:text-white/80 transition-colors">Cuentas</Link>
-          <Link href="/dashboard" className="text-sm text-white/40 hover:text-white/80 transition-colors">Dashboard</Link>
-        </div>
-      </nav>
+    <div className="min-h-screen">
+      <Navigation />
 
       <main className="max-w-5xl mx-auto px-6 py-10">
         {/* Header + filters */}
         <div className="mb-8 flex flex-col sm:flex-row sm:items-end gap-4 justify-between">
           <div>
-            <Link href="/dashboard" className="text-xs text-white/25 hover:text-white/60 mb-2 block transition-colors">← Volver</Link>
-            <h1 className="text-2xl font-bold">Movimientos</h1>
-            <p className="text-white/30 text-sm mt-1">
+            <h1 className="text-2xl font-bold text-slate-900">Movimientos</h1>
+            <p className="text-slate-400 text-sm mt-1">
               {loading ? "Cargando…" : search ? `${filtered.length} de ${movements.length} registros` : `${movements.length} registros`}
             </p>
           </div>
@@ -149,28 +138,28 @@ function MovementsPageContent() {
               placeholder="Buscar descripción…"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              className="bg-white/[0.04] border border-white/[0.08] rounded-xl px-3 py-2 text-sm text-white/80 placeholder-white/20 focus:outline-none focus:border-[#0ea5e9]/50 transition-colors w-44"
+              className="bg-white border border-slate-200 rounded-xl px-3 py-2 text-sm text-slate-700 placeholder-slate-300 focus:outline-none focus:border-teal-400 transition-colors w-44"
             />
             <select
               value={bankFilter}
               onChange={(e) => setBankFilter(e.target.value)}
-              className="bg-white/[0.04] border border-white/[0.08] rounded-xl px-3 py-2 text-sm text-white/60 focus:outline-none focus:border-[#0ea5e9]/50 transition-colors"
+              className="bg-white border border-slate-200 rounded-xl px-3 py-2 text-sm text-slate-500 focus:outline-none focus:border-teal-400 transition-colors"
             >
               <option value="">Todos los bancos</option>
               {banks.map((b) => <option key={b} value={b}>{BANK_NAMES[b] ?? b}</option>)}
             </select>
             <input type="date" value={from} onChange={(e) => setFrom(e.target.value)}
-              className="bg-white/[0.04] border border-white/[0.08] rounded-xl px-3 py-2 text-sm text-white/60 focus:outline-none focus:border-[#0ea5e9]/50 transition-colors" />
+              className="bg-white border border-slate-200 rounded-xl px-3 py-2 text-sm text-slate-500 focus:outline-none focus:border-teal-400 transition-colors" />
             <input type="date" value={to} onChange={(e) => setTo(e.target.value)}
-              className="bg-white/[0.04] border border-white/[0.08] rounded-xl px-3 py-2 text-sm text-white/60 focus:outline-none focus:border-[#0ea5e9]/50 transition-colors" />
+              className="bg-white border border-slate-200 rounded-xl px-3 py-2 text-sm text-slate-500 focus:outline-none focus:border-teal-400 transition-colors" />
             {driveState === "done" && driveUrl ? (
               <a href={driveUrl} target="_blank" rel="noopener noreferrer"
-                className="bg-emerald-500/10 border border-emerald-500/20 rounded-xl px-3 py-2 text-sm text-emerald-400 hover:bg-emerald-500/20 transition-colors whitespace-nowrap">
+                className="bg-emerald-50 border border-emerald-200 rounded-xl px-3 py-2 text-sm text-emerald-600 hover:bg-emerald-100 transition-colors whitespace-nowrap">
                 Ver archivo ↗
               </a>
             ) : (
               <button onClick={exportToDrive} disabled={driveState === "loading"}
-                className="bg-white/[0.04] border border-white/[0.08] rounded-xl px-3 py-2 text-sm text-white/60 hover:text-white/80 hover:bg-white/[0.07] transition-colors disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap">
+                className="bg-white border border-slate-200 rounded-xl px-3 py-2 text-sm text-slate-500 hover:text-slate-700 hover:border-slate-300 transition-colors disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap">
                 {driveState === "loading" ? "Exportando…" : driveState === "error" ? "Error — reintentar" : "Exportar a Drive"}
               </button>
             )}
@@ -181,46 +170,46 @@ function MovementsPageContent() {
         {loading ? (
           <div className="grid grid-cols-3 gap-3 mb-8 animate-pulse">
             {[...Array(3)].map((_, i) => (
-              <div key={i} className="p-4 rounded-2xl border border-white/[0.07] bg-white/[0.03]">
-                <div className="h-2.5 w-16 bg-white/[0.06] rounded-full mb-3" />
-                <div className="h-6 w-24 bg-white/[0.06] rounded-lg" />
+              <div key={i} className="p-4 rounded-2xl border border-slate-200 bg-white">
+                <div className="h-2.5 w-16 bg-slate-200 rounded-full mb-3" />
+                <div className="h-6 w-24 bg-slate-100 rounded-lg" />
               </div>
             ))}
           </div>
         ) : movements.length > 0 && (
           <div className="grid grid-cols-3 gap-3 mb-8">
-            <div className="p-4 rounded-2xl border border-white/[0.07] bg-white/[0.03]">
-              <p className="text-xs text-white/30 mb-1">Movimientos</p>
-              <p className="text-xl font-bold font-mono">{filtered.length}</p>
+            <div className="p-4 rounded-2xl border border-slate-200 bg-white">
+              <p className="text-xs text-slate-400 mb-1">Movimientos</p>
+              <p className="text-xl font-bold font-[family-name:var(--font-geist-mono)]">{filtered.length}</p>
             </div>
-            <div className="p-4 rounded-2xl border border-white/[0.07] bg-white/[0.03]">
-              <p className="text-xs text-white/30 mb-1">Egresos</p>
-              <p className="text-xl font-bold font-mono text-red-400">{fmt(expenses)}</p>
+            <div className="p-4 rounded-2xl border border-slate-200 bg-white">
+              <p className="text-xs text-slate-400 mb-1">Egresos</p>
+              <p className="text-xl font-bold font-[family-name:var(--font-geist-mono)] text-rose-600">{fmt(expenses)}</p>
             </div>
-            <div className="p-4 rounded-2xl border border-white/[0.07] bg-white/[0.03]">
-              <p className="text-xs text-white/30 mb-1">Ingresos</p>
-              <p className="text-xl font-bold font-mono text-emerald-400">{fmt(income)}</p>
+            <div className="p-4 rounded-2xl border border-slate-200 bg-white">
+              <p className="text-xs text-slate-400 mb-1">Ingresos</p>
+              <p className="text-xl font-bold font-[family-name:var(--font-geist-mono)] text-emerald-600">{fmt(income)}</p>
             </div>
           </div>
         )}
 
         {/* Monthly chart */}
         {!loading && monthlyData.length >= 2 && (
-          <div className="mb-8 p-5 rounded-2xl border border-white/[0.07] bg-white/[0.03]">
-            <p className="text-xs text-white/25 uppercase tracking-[0.15em] mb-5">Últimos 6 meses</p>
+          <div className="mb-8 p-5 rounded-2xl border border-slate-200 bg-white">
+            <p className="text-xs text-slate-400 uppercase tracking-[0.15em] mb-5">Últimos 6 meses</p>
             <MonthlyChart data={monthlyData} />
           </div>
         )}
 
         {/* Table skeleton */}
         {loading && (
-          <div className="rounded-2xl border border-white/[0.07] overflow-hidden animate-pulse">
+          <div className="rounded-2xl border border-slate-200 bg-white overflow-hidden animate-pulse">
             {[...Array(8)].map((_, i) => (
-              <div key={i} className="flex gap-4 px-4 py-3.5 border-b border-white/[0.03]">
-                <div className="h-3 w-16 bg-white/[0.06] rounded-full" />
-                <div className="h-3 w-14 bg-white/[0.04] rounded-full hidden sm:block" />
-                <div className="h-3 flex-1 bg-white/[0.06] rounded-full" />
-                <div className="h-3 w-20 bg-white/[0.06] rounded-full ml-auto" />
+              <div key={i} className="flex gap-4 px-4 py-3.5 border-b border-slate-100">
+                <div className="h-3 w-16 bg-slate-100 rounded-full" />
+                <div className="h-3 w-14 bg-slate-100 rounded-full hidden sm:block" />
+                <div className="h-3 flex-1 bg-slate-100 rounded-full" />
+                <div className="h-3 w-20 bg-slate-100 rounded-full ml-auto" />
               </div>
             ))}
           </div>
@@ -229,8 +218,8 @@ function MovementsPageContent() {
         {/* Empty states */}
         {!loading && movements.length === 0 && (
           <div className="text-center py-20">
-            <p className="text-white/20 text-sm">No hay movimientos.</p>
-            <Link href="/dashboard" className="text-[#0ea5e9] text-sm hover:underline mt-2 inline-block">
+            <p className="text-slate-400 text-sm">No hay movimientos.</p>
+            <Link href="/dashboard" className="text-teal-600 text-sm hover:underline mt-2 inline-block">
               Sincroniza un banco.
             </Link>
           </div>
@@ -238,8 +227,8 @@ function MovementsPageContent() {
 
         {!loading && movements.length > 0 && filtered.length === 0 && (
           <div className="text-center py-16">
-            <p className="text-white/20 text-sm">Sin resultados para &ldquo;{search}&rdquo;</p>
-            <button onClick={() => setSearch("")} className="text-[#0ea5e9] text-sm hover:underline mt-2 block mx-auto">
+            <p className="text-slate-400 text-sm">Sin resultados para &ldquo;{search}&rdquo;</p>
+            <button onClick={() => setSearch("")} className="text-teal-600 text-sm hover:underline mt-2 block mx-auto">
               Limpiar búsqueda
             </button>
           </div>
@@ -248,12 +237,12 @@ function MovementsPageContent() {
         {/* Table */}
         {!loading && filtered.length > 0 && (
           <>
-            <div className="rounded-2xl border border-white/[0.07] overflow-hidden">
+            <div className="rounded-2xl border border-slate-200 bg-white overflow-hidden">
               <table className="w-full text-sm">
                 <thead>
-                  <tr className="border-b border-white/[0.05] text-white/25 text-xs uppercase tracking-wider">
+                  <tr className="border-b border-slate-100 text-slate-400 text-xs uppercase tracking-wider">
                     <th
-                      className="text-left px-4 py-3 font-medium cursor-pointer hover:text-white/50 transition-colors select-none"
+                      className="text-left px-4 py-3 font-medium cursor-pointer hover:text-slate-600 transition-colors select-none"
                       onClick={() => toggleSort("date")}
                     >
                       Fecha<SortIndicator field="date" />
@@ -261,7 +250,7 @@ function MovementsPageContent() {
                     <th className="text-left px-4 py-3 font-medium hidden sm:table-cell">Banco</th>
                     <th className="text-left px-4 py-3 font-medium">Descripción</th>
                     <th
-                      className="text-right px-4 py-3 font-medium cursor-pointer hover:text-white/50 transition-colors select-none"
+                      className="text-right px-4 py-3 font-medium cursor-pointer hover:text-slate-600 transition-colors select-none"
                       onClick={() => toggleSort("amount")}
                     >
                       Monto<SortIndicator field="amount" />
@@ -273,18 +262,18 @@ function MovementsPageContent() {
                   {paginated.map((m) => {
                     const amount = parseFloat(m.amount);
                     return (
-                      <tr key={m.id} className="border-b border-white/[0.03] hover:bg-white/[0.02] transition-colors">
-                        <td className="px-4 py-3 text-white/40 whitespace-nowrap text-xs">{m.date}</td>
+                      <tr key={m.id} className="border-b border-slate-50 hover:bg-slate-50/50 transition-colors">
+                        <td className="px-4 py-3 text-slate-400 whitespace-nowrap text-xs">{m.date}</td>
                         <td className="px-4 py-3 hidden sm:table-cell">
-                          <span className="text-[11px] bg-white/[0.05] px-2 py-0.5 rounded-full text-white/35">
+                          <span className="text-[11px] bg-slate-100 px-2 py-0.5 rounded-full text-slate-400">
                             {BANK_NAMES[m.bankId] ?? m.bankId}
                           </span>
                         </td>
-                        <td className="px-4 py-3 text-white/70 max-w-xs truncate">{m.description}</td>
-                        <td className={`px-4 py-3 text-right font-mono font-semibold whitespace-nowrap text-sm ${amount < 0 ? "text-red-400" : "text-emerald-400"}`}>
+                        <td className="px-4 py-3 text-slate-600 max-w-xs truncate">{m.description}</td>
+                        <td className={`px-4 py-3 text-right font-[family-name:var(--font-geist-mono)] font-semibold whitespace-nowrap text-sm ${amount < 0 ? "text-rose-600" : "text-emerald-600"}`}>
                           {fmt(amount)}
                         </td>
-                        <td className="px-4 py-3 text-right font-mono text-white/25 text-xs whitespace-nowrap hidden md:table-cell">
+                        <td className="px-4 py-3 text-right font-[family-name:var(--font-geist-mono)] text-slate-300 text-xs whitespace-nowrap hidden md:table-cell">
                           {m.balance ? fmt(parseFloat(m.balance)) : "—"}
                         </td>
                       </tr>
@@ -297,21 +286,21 @@ function MovementsPageContent() {
             {/* Pagination */}
             {totalPages > 1 && (
               <div className="flex items-center justify-between mt-4 px-1">
-                <p className="text-xs text-white/25">
+                <p className="text-xs text-slate-400">
                   {page * PAGE_SIZE + 1}–{Math.min((page + 1) * PAGE_SIZE, filtered.length)} de {filtered.length}
                 </p>
                 <div className="flex gap-2">
                   <button
                     onClick={() => setPage((p) => Math.max(0, p - 1))}
                     disabled={page === 0}
-                    className="px-3 py-1.5 rounded-lg border border-white/[0.07] text-xs text-white/40 hover:text-white hover:border-white/20 disabled:opacity-30 transition-colors"
+                    className="px-3 py-1.5 rounded-lg border border-slate-200 text-xs text-slate-400 hover:text-slate-700 hover:border-slate-300 disabled:opacity-30 transition-colors"
                   >
                     ← Anterior
                   </button>
                   <button
                     onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}
                     disabled={page === totalPages - 1}
-                    className="px-3 py-1.5 rounded-lg border border-white/[0.07] text-xs text-white/40 hover:text-white hover:border-white/20 disabled:opacity-30 transition-colors"
+                    className="px-3 py-1.5 rounded-lg border border-slate-200 text-xs text-slate-400 hover:text-slate-700 hover:border-slate-300 disabled:opacity-30 transition-colors"
                   >
                     Siguiente →
                   </button>
@@ -324,8 +313,6 @@ function MovementsPageContent() {
     </div>
   );
 }
-
-// ── Monthly chart (CSS bars, no dependencies) ──────────────────
 
 function MonthlyChart({ data }: { data: [string, { income: number; expenses: number }][] }) {
   const maxVal = Math.max(...data.flatMap(([, v]) => [v.income, v.expenses]), 1);
@@ -342,29 +329,29 @@ function MonthlyChart({ data }: { data: [string, { income: number; expenses: num
             <div key={month} className="flex-1 flex flex-col items-center justify-end gap-0.5">
               <div className="w-full flex items-end justify-center gap-0.5" style={{ height: 80 }}>
                 <div
-                  className="flex-1 rounded-sm bg-emerald-400/35 hover:bg-emerald-400/55 transition-colors cursor-default"
-                  style={{ height: incomeH }}
+                  className="flex-1 rounded-sm bg-emerald-400 hover:bg-emerald-500 transition-colors cursor-default"
+                  style={{ height: incomeH, opacity: 0.6 }}
                   title={`Ingresos: ${fmt(v.income)}`}
                 />
                 <div
-                  className="flex-1 rounded-sm bg-red-400/35 hover:bg-red-400/55 transition-colors cursor-default"
-                  style={{ height: expH }}
+                  className="flex-1 rounded-sm bg-rose-400 hover:bg-rose-500 transition-colors cursor-default"
+                  style={{ height: expH, opacity: 0.6 }}
                   title={`Egresos: ${fmt(v.expenses)}`}
                 />
               </div>
-              <span className="text-[9px] text-white/20 mt-2 whitespace-nowrap">{label}</span>
+              <span className="text-[9px] text-slate-300 mt-2 whitespace-nowrap">{label}</span>
             </div>
           );
         })}
       </div>
       <div className="flex gap-4 mt-4">
         <div className="flex items-center gap-1.5">
-          <div className="w-2 h-2 rounded-sm bg-emerald-400/50" />
-          <span className="text-[10px] text-white/25">Ingresos</span>
+          <div className="w-2 h-2 rounded-sm bg-emerald-400" />
+          <span className="text-[10px] text-slate-400">Ingresos</span>
         </div>
         <div className="flex items-center gap-1.5">
-          <div className="w-2 h-2 rounded-sm bg-red-400/50" />
-          <span className="text-[10px] text-white/25">Egresos</span>
+          <div className="w-2 h-2 rounded-sm bg-rose-400" />
+          <span className="text-[10px] text-slate-400">Egresos</span>
         </div>
       </div>
     </div>

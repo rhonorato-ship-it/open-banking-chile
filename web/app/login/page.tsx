@@ -4,39 +4,37 @@ import { signIn } from "next-auth/react";
 
 export default function LoginPage() {
   return (
-    <div className="min-h-screen flex items-center justify-center relative overflow-hidden">
-      {/* Background glow */}
+    <div className="min-h-screen flex items-center justify-center relative overflow-hidden bg-[#f5f8f8]">
       <div
         className="absolute inset-0 pointer-events-none"
         style={{
-          background: "radial-gradient(ellipse 60% 50% at 50% 60%, rgba(14,165,233,0.12) 0%, transparent 70%)",
+          background: "radial-gradient(ellipse 60% 50% at 50% 60%, rgba(15,118,110,0.08) 0%, transparent 70%)",
         }}
       />
 
       <div className="relative z-10 flex flex-col items-center gap-8 px-6 text-center">
-        {/* Wordmark */}
         <div className="flex items-center gap-2">
-          <div className="w-8 h-8 rounded-full bg-[#0ea5e9] opacity-90" />
-          <span className="text-xl font-bold tracking-tight">Open Banking Chile</span>
+          <div className="w-8 h-8 rounded-full bg-teal-700" />
+          <span className="text-xl font-bold tracking-tight text-slate-900">Open Banking Chile</span>
         </div>
 
         <div className="space-y-2">
-          <h1 className="text-4xl font-bold tracking-tight">Tus movimientos,</h1>
-          <h1 className="text-4xl font-bold tracking-tight text-[#0ea5e9]">en un solo lugar.</h1>
-          <p className="text-white/50 text-sm mt-3">
+          <h1 className="text-4xl font-bold tracking-tight text-slate-900">Tus movimientos,</h1>
+          <h1 className="text-4xl font-bold tracking-tight text-teal-700">en un solo lugar.</h1>
+          <p className="text-slate-400 text-sm mt-3">
             Conecta tus cuentas bancarias y sincroniza tu historial automáticamente.
           </p>
         </div>
 
         <button
           onClick={() => signIn("google", { callbackUrl: "/dashboard" })}
-          className="flex items-center gap-3 bg-white text-black font-semibold px-6 py-3 rounded-full hover:bg-white/90 transition-colors text-sm"
+          className="flex items-center gap-3 bg-slate-900 text-white font-semibold px-6 py-3 rounded-full hover:bg-slate-800 transition-colors text-sm shadow-sm"
         >
           <GoogleIcon />
           Continuar con Google
         </button>
 
-        <p className="text-white/20 text-xs max-w-xs">
+        <p className="text-slate-300 text-xs max-w-xs">
           Tus credenciales bancarias se almacenan encriptadas con AES-256 y nunca son accesibles por terceros.
         </p>
       </div>

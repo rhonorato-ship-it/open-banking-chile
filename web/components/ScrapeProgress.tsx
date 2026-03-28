@@ -30,7 +30,6 @@ const PHASES: { id: Phase; label: string }[] = [
   { id: 5, label: "Completado" },
 ];
 
-/** If no SSE message arrives within this window, assume the connection is dead. */
 const INACTIVITY_TIMEOUT_MS = 45_000;
 
 export default function ScrapeProgress({ bankId, bankName, agentic = false, onDone, onError }: Props) {
@@ -49,11 +48,9 @@ export default function ScrapeProgress({ bankId, bankName, agentic = false, onDo
   const inactivityTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const needs2FARef = useRef(false);
 
-  /** Reset the inactivity timer. Called on every SSE message. */
   const resetInactivityTimer = useCallback(() => {
     if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
     inactivityTimerRef.current = setTimeout(() => {
-      // No message received for INACTIVITY_TIMEOUT_MS — connection is dead
       if (esRef.current) {
         esRef.current.close();
         esRef.current = null;
@@ -63,7 +60,6 @@ export default function ScrapeProgress({ bankId, bankName, agentic = false, onDo
   }, []);
 
   useEffect(() => {
-    // Reset state on retry
     setCurrentPhase(1);
     setCurrentMessage("");
     setErrorMsg(null);
@@ -77,17 +73,12 @@ export default function ScrapeProgress({ bankId, bankName, agentic = false, onDo
 
     const es = new EventSource(`/api/scrape/${bankId}${agentic ? '?mode=agentic' : ''}`);
     esRef.current = es;
-
-    // Start the inactivity timer
     resetInactivityTimer();
 
     es.onmessage = (e) => {
-      // Every message (including keepalives) proves the connection is alive
       resetInactivityTimer();
 
       const data = JSON.parse(e.data) as PhaseEvent & { keepalive?: boolean };
-
-      // Server keepalive — just reset the timer, nothing else to do
       if (data.keepalive) return;
 
       if (data.error) {
@@ -106,39 +97,33 @@ export default function ScrapeProgress({ bankId, bankName, agentic = false, onDo
         if (data.message) setCurrentMessage(data.message);
 
         if (data.agentic === true) {
-          // Agentic mode: server is searching Gmail for the code
           setAgenticSearching(true);
           setAgenticFound(false);
           setNeeds2FA(false);
-          // Extend timeout — agentic polling can take a while
           if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
           inactivityTimerRef.current = setTimeout(() => {
             es.close();
             setErrorMsg("Tiempo de espera agotado buscando código en Gmail.");
           }, 120_000);
         } else {
-          // Manual mode (or agentic fallback to manual)
           setAgenticSearching(false);
           setNeeds2FA(true);
-          // Extend timeout during 2FA (user needs time to get the code)
           if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
           inactivityTimerRef.current = setTimeout(() => {
             es.close();
             setErrorMsg("Tiempo de espera agotado para el código 2FA.");
-          }, 120_000); // 2 minutes for 2FA
+          }, 120_000);
           setTimeout(() => codeInputRef.current?.focus(), 100);
         }
         return;
       }
 
-      // Agentic: code found message — brief success flash
       if (data.message === "Código encontrado — verificando...") {
         setAgenticSearching(false);
         setAgenticFound(true);
         setTimeout(() => setAgenticFound(false), 2000);
       }
 
-      // If we were waiting for 2FA and moved past phase 2, clear the input
       if (needs2FARef.current && data.phase > 2) {
         setNeeds2FA(false);
         setAgenticSearching(false);
@@ -179,7 +164,6 @@ export default function ScrapeProgress({ bankId, bankName, agentic = false, onDo
       });
       setNeeds2FA(false);
       setCurrentMessage("Código enviado — verificando...");
-      // Restart normal inactivity timer
       resetInactivityTimer();
     } catch {
       setErrorMsg("Error al enviar código");
@@ -191,16 +175,16 @@ export default function ScrapeProgress({ bankId, bankName, agentic = false, onDo
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       {/* Backdrop */}
-      <div className="absolute inset-0 bg-[#050505]/95 backdrop-blur-sm" />
+      <div className="absolute inset-0 bg-slate-900/40 backdrop-blur-sm" />
 
       {/* Pulsing glow */}
       <div
         className="absolute pointer-events-none"
         style={{
-          width: 600,
-          height: 600,
+          width: 500,
+          height: 500,
           borderRadius: "50%",
-          background: "radial-gradient(circle, rgba(14,165,233,0.13) 0%, transparent 70%)",
+          background: "radial-gradient(circle, rgba(15,118,110,0.08) 0%, transparent 70%)",
           animation: "pulse-glow 3s ease-in-out infinite",
           top: "50%",
           left: "50%",
@@ -208,14 +192,14 @@ export default function ScrapeProgress({ bankId, bankName, agentic = false, onDo
         }}
       />
 
-      <div className="relative z-10 w-full max-w-sm mx-4">
+      <div className="relative z-10 w-full max-w-sm mx-4 bg-white rounded-3xl border border-slate-200 shadow-xl p-8">
         {/* Bank header */}
         <div className="text-center mb-10">
-          <div className="w-12 h-12 rounded-2xl bg-white/10 border border-white/10 flex items-center justify-center mx-auto mb-3">
-            <span className="text-xl font-bold">{bankName[0]}</span>
+          <div className="w-12 h-12 rounded-2xl bg-teal-50 border border-teal-200 flex items-center justify-center mx-auto mb-3">
+            <span className="text-xl font-bold text-teal-700">{bankName[0]}</span>
           </div>
-          <h2 className="text-2xl font-bold tracking-tight">{bankName}</h2>
-          <p className="text-white/40 text-sm mt-1">Sincronizando movimientos</p>
+          <h2 className="text-2xl font-bold tracking-tight text-slate-900">{bankName}</h2>
+          <p className="text-slate-400 text-sm mt-1">Sincronizando movimientos</p>
         </div>
 
         {/* Phase list */}
@@ -234,7 +218,7 @@ export default function ScrapeProgress({ bankId, bankName, agentic = false, onDo
                     <div className="w-px flex-1 my-1" style={{ minHeight: 28 }}>
                       <div
                         className="w-full h-full rounded-full transition-colors duration-500"
-                        style={{ background: isCompleted ? "#0ea5e9" : "rgba(255,255,255,0.1)" }}
+                        style={{ background: isCompleted ? "#0f766e" : "#e2e8f0" }}
                       />
                     </div>
                   )}
@@ -243,18 +227,18 @@ export default function ScrapeProgress({ bankId, bankName, agentic = false, onDo
                 <div className="pb-7 pt-0.5">
                   <p
                     className="text-sm font-semibold transition-colors duration-300"
-                    style={{ color: isPending ? "rgba(255,255,255,0.3)" : isError ? "#ef4444" : "white" }}
+                    style={{ color: isPending ? "#cbd5e1" : isError ? "#e11d48" : "#0f172a" }}
                   >
                     {phase.label}
                   </p>
                   {isActive && currentMessage && (
-                    <p className="text-xs text-[#0ea5e9] mt-0.5">{currentMessage}</p>
+                    <p className="text-xs text-teal-600 mt-0.5">{currentMessage}</p>
                   )}
                   {isError && (
-                    <p className="text-xs text-red-400 mt-0.5">{errorMsg}</p>
+                    <p className="text-xs text-rose-500 mt-0.5">{errorMsg}</p>
                   )}
                   {isCompleted && phase.id === 5 && (
-                    <p className="text-xs text-[#0ea5e9] mt-0.5">{currentMessage}</p>
+                    <p className="text-xs text-teal-600 mt-0.5">{currentMessage}</p>
                   )}
                 </div>
               </div>
@@ -264,9 +248,9 @@ export default function ScrapeProgress({ bankId, bankName, agentic = false, onDo
 
         {/* Agentic 2FA: searching Gmail */}
         {agenticSearching && !errorMsg && (
-          <div className="mt-4 mb-2 flex items-center gap-3 px-4 py-3 rounded-xl bg-white/[0.04] border border-[#0ea5e9]/20">
+          <div className="mt-4 mb-2 flex items-center gap-3 px-4 py-3 rounded-xl bg-teal-50 border border-teal-200">
             <svg
-              className="w-5 h-5 text-[#0ea5e9] shrink-0"
+              className="w-5 h-5 text-teal-600 shrink-0"
               viewBox="0 0 24 24"
               fill="none"
               style={{ animation: "agentic-pulse 1.5s ease-in-out infinite" }}
@@ -274,25 +258,25 @@ export default function ScrapeProgress({ bankId, bankName, agentic = false, onDo
               <circle cx="11" cy="11" r="7" stroke="currentColor" strokeWidth="2" />
               <path d="M16 16l4.5 4.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
             </svg>
-            <span className="text-sm text-[#0ea5e9]">Buscando código en Gmail...</span>
+            <span className="text-sm text-teal-700">Buscando código en Gmail...</span>
           </div>
         )}
 
         {/* Agentic 2FA: code found flash */}
         {agenticFound && !errorMsg && (
-          <div className="mt-4 mb-2 flex items-center gap-3 px-4 py-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20">
-            <svg className="w-5 h-5 text-emerald-400 shrink-0" viewBox="0 0 24 24" fill="none">
+          <div className="mt-4 mb-2 flex items-center gap-3 px-4 py-3 rounded-xl bg-emerald-50 border border-emerald-200">
+            <svg className="w-5 h-5 text-emerald-600 shrink-0" viewBox="0 0 24 24" fill="none">
               <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="2" />
               <path d="M8 12l3 3 5-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
-            <span className="text-sm text-emerald-400">Código encontrado — verificando...</span>
+            <span className="text-sm text-emerald-600">Código encontrado — verificando...</span>
           </div>
         )}
 
         {/* 2FA code input (manual mode) */}
         {needs2FA && !errorMsg && (
           <div className="mt-4 mb-2">
-            <p className="text-sm text-white/60 mb-2">{currentMessage}</p>
+            <p className="text-sm text-slate-500 mb-2">{currentMessage}</p>
             <div className="flex gap-2">
               <input
                 ref={codeInputRef}
@@ -304,12 +288,12 @@ export default function ScrapeProgress({ bankId, bankName, agentic = false, onDo
                 value={twoFACode}
                 onChange={(e) => setTwoFACode(e.target.value.replace(/\D/g, ""))}
                 onKeyDown={(e) => e.key === "Enter" && submit2FACode()}
-                className="flex-1 px-4 py-2.5 rounded-xl bg-white/5 border border-white/15 text-white text-center text-lg tracking-[0.3em] font-mono placeholder:text-white/20 placeholder:tracking-normal placeholder:text-sm focus:outline-none focus:border-[#0ea5e9] focus:ring-1 focus:ring-[#0ea5e9]"
+                className="flex-1 px-4 py-2.5 rounded-xl bg-slate-50 border border-slate-200 text-slate-900 text-center text-lg tracking-[0.3em] font-[family-name:var(--font-geist-mono)] placeholder:text-slate-300 placeholder:tracking-normal placeholder:text-sm focus:outline-none focus:border-teal-400 focus:ring-1 focus:ring-teal-400"
               />
               <button
                 onClick={submit2FACode}
                 disabled={!twoFACode.trim() || submitting2FA}
-                className="px-5 py-2.5 rounded-xl bg-[#0ea5e9] text-black text-sm font-bold hover:bg-[#38bdf8] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                className="px-5 py-2.5 rounded-xl bg-teal-600 text-white text-sm font-bold hover:bg-teal-700 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 {submitting2FA ? "..." : "Enviar"}
               </button>
@@ -322,13 +306,13 @@ export default function ScrapeProgress({ bankId, bankName, agentic = false, onDo
           <div className="flex gap-2 mt-2">
             <button
               onClick={() => setRetryCount((c) => c + 1)}
-              className="flex-1 py-2.5 rounded-full bg-[#0ea5e9] text-black text-sm font-bold hover:bg-[#38bdf8] transition-colors"
+              className="flex-1 py-2.5 rounded-full bg-teal-600 text-white text-sm font-bold hover:bg-teal-700 transition-colors"
             >
               Reintentar
             </button>
             <button
               onClick={() => onError(errorMsg)}
-              className="px-5 py-2.5 rounded-full border border-white/10 text-sm text-white/40 hover:text-white transition-colors"
+              className="px-5 py-2.5 rounded-full border border-slate-200 text-sm text-slate-400 hover:text-slate-700 transition-colors"
             >
               Cerrar
             </button>
@@ -345,8 +329,8 @@ export default function ScrapeProgress({ bankId, bankName, agentic = false, onDo
           to { transform: rotate(360deg); }
         }
         @keyframes ring-pulse {
-          0%, 100% { box-shadow: 0 0 0 0 rgba(14,165,233,0.4); }
-          50% { box-shadow: 0 0 0 6px rgba(14,165,233,0); }
+          0%, 100% { box-shadow: 0 0 0 0 rgba(15,118,110,0.3); }
+          50% { box-shadow: 0 0 0 6px rgba(15,118,110,0); }
         }
         @keyframes agentic-pulse {
           0%, 100% { opacity: 0.6; transform: scale(1); }
@@ -360,7 +344,7 @@ export default function ScrapeProgress({ bankId, bankName, agentic = false, onDo
 function PhaseNode({ state }: { state: "pending" | "active" | "done" | "error" }) {
   if (state === "done") {
     return (
-      <div className="w-7 h-7 rounded-full bg-[#0ea5e9] flex items-center justify-center flex-shrink-0">
+      <div className="w-7 h-7 rounded-full bg-teal-700 flex items-center justify-center flex-shrink-0">
         <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
           <path d="M2 6l3 3 5-5" stroke="white" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
         </svg>
@@ -369,24 +353,24 @@ function PhaseNode({ state }: { state: "pending" | "active" | "done" | "error" }
   }
   if (state === "error") {
     return (
-      <div className="w-7 h-7 rounded-full bg-red-500/20 border-2 border-red-500 flex items-center justify-center flex-shrink-0">
-        <div className="w-1.5 h-1.5 rounded-full bg-red-400" />
+      <div className="w-7 h-7 rounded-full bg-rose-50 border-2 border-rose-500 flex items-center justify-center flex-shrink-0">
+        <div className="w-1.5 h-1.5 rounded-full bg-rose-500" />
       </div>
     );
   }
   if (state === "active") {
     return (
       <div
-        className="w-7 h-7 rounded-full border-2 border-[#0ea5e9] flex items-center justify-center flex-shrink-0 relative"
+        className="w-7 h-7 rounded-full border-2 border-teal-600 flex items-center justify-center flex-shrink-0 relative"
         style={{ animation: "ring-pulse 1.5s ease-in-out infinite" }}
       >
         <div
-          className="absolute inset-0.5 rounded-full border-2 border-transparent border-t-[#0ea5e9]"
+          className="absolute inset-0.5 rounded-full border-2 border-transparent border-t-teal-600"
           style={{ animation: "spin-arc 0.8s linear infinite" }}
         />
-        <div className="w-1.5 h-1.5 rounded-full bg-[#0ea5e9]" />
+        <div className="w-1.5 h-1.5 rounded-full bg-teal-600" />
       </div>
     );
   }
-  return <div className="w-7 h-7 rounded-full border-2 border-white/15 flex-shrink-0" />;
+  return <div className="w-7 h-7 rounded-full border-2 border-slate-200 flex-shrink-0" />;
 }
