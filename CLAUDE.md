@@ -98,14 +98,17 @@ cd web && npx tsc --noEmit           # Must succeed, 0 type errors
   5. Memory files: current, not stale
 - **Gate**: Repo architect reports 0 issues.
 
-### Phase 6: Deploy (when requested or after medium+ changes)
+### Phase 6: Deploy (ALWAYS after committed changes)
+**Goal**: Production must always reflect the latest committed code.
 - `vercel --prod` from repo root (NOT from web/)
+- Deploy after EVERY commit, not just medium+ changes
 - Verify on production URL: https://open-banking-chile.vercel.app
 - For API-mode scrapers: sync should complete in < 15 seconds
 - For browser-mode scrapers: sync should complete in < 120 seconds
 
 ### SDLC violations to watch for
 These are the most common shortcuts that cause regressions:
+- Committing without deploying → user sees stale production
 - Deploying without running QA → broken production
 - Updating code without updating AGENTS.md → stale API patterns
 - Adding a new bank without updating bank agent file → agent gives wrong advice

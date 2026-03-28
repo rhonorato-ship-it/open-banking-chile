@@ -9,7 +9,7 @@ Open source framework for extracting movements and balances from Chilean banks a
 - **Production URL**: https://open-banking-chile.vercel.app
 - **Vercel project**: `open-banking-chile` (org: `rhonorato-ship-its-projects`)
 - **Vercel project ID**: `prj_ovBTOzwEpedmlf6JILFlKtbf6hBN`
-- **Deploy command**: run `vercel --prod` from repo root (not from `web/` — root dir is configured as `web` in Vercel settings)
+- **Deploy command**: run `vercel --prod` from repo root (not from `web/` — root dir is configured as `web` in Vercel settings). **Always deploy after every commit.**
 - **npm package**: `open-banking-chile` (latest: v2.1.2, publisher: `rhonorato`)
 
 ### Supported institutions (15)
@@ -311,6 +311,7 @@ doppler run --project open-banking-chile --config dev -- npm run dev --prefix we
 ### Web dashboard (production deploy)
 ```bash
 # Always run from repo root — Vercel root dir is configured as "web"
+# MANDATORY: deploy after EVERY commit — production must always match latest code
 vercel --prod
 ```
 
