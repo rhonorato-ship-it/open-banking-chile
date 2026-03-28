@@ -49,6 +49,12 @@ PayTech:
 
 **Chromium is a last resort.** Every bank, investment platform, and financial service should be scraped via API or CLI whenever possible. Do NOT default to opening a browser.
 
+### Data requirements (ALL scrapers)
+- **First sync**: Fetch at least **24 months** of movement history. No date limits on initial scrape.
+- **Subsequent syncs**: Fetch new/changed movements since last sync. Dedup via SHA256 hash prevents duplicates.
+- **Balance**: Every scraper MUST return `balance` in `ScrapeResult` — the current account/portfolio balance. The dashboard derives balances from the latest movement with a non-null `balance` field.
+- **Fallback chain**: API-mode scrapers must have a browser fallback when blocked by bot protection (Cloudflare, Imperva). The route always provides `@sparticuz/chromium` as a fallback.
+
 ### Priority order (strict)
 
 1. **Direct API (`fetch()`)** — The default. Check DevTools Network tab, Swagger docs, or mobile app traffic for REST/GraphQL endpoints. Use `runApiScraper()` from `src/infrastructure/api-runner.ts`. Set `mode: "api"` on the `BankScraper`. Zero browser dependencies.

@@ -188,6 +188,8 @@ function docToObject(doc: FirestoreDocument): Record<string, unknown> {
   }
   // Include the document ID extracted from the document name path
   out._docId = doc.name.split("/").pop() || "";
+  // Include the full document path for unique identification
+  out._docPath = doc.name;
   return out;
 }
 
@@ -286,22 +288,55 @@ function toDate(raw: unknown): string {
   return normalizeDate(s);
 }
 
+// ─── Amount extraction helper ────────────────────────────────────
+
+/** Try multiple field names for amount extraction, returning the first non-zero value. */
+function extractAmount(obj: Record<string, unknown>, ...fields: string[]): number {
+  for (const field of fields) {
+    const val = Number(obj[field] || 0);
+    if (val !== 0) return val;
+  }
+  return 0;
+}
+
 // ─── Collection-specific mappers ─────────────────────────────────
 
 /** Map a deposits collection document to a BankMovement. */
-function mapDeposit(obj: Record<string, unknown>): BankMovement | null {
-  const date = toDate(obj.createdAt);
-  if (!date) return null;
+function mapDeposit(obj: Record<string, unknown>, debugLog: string[]): BankMovement | null {
+  const date = toDate(obj.createdAt || obj.date || obj.executionDate);
+  if (!date) {
+    debugLog.push(`    [deposit skip] no date - keys: ${Object.keys(obj).filter(k => !k.startsWith("_")).join(", ")}`);
+    return null;
+  }
 
-  const rawAmount = Number(obj.amount || 0);
-  if (rawAmount === 0) return null;
+  // Check all plausible amount fields — matches the withdrawal/contribution pattern
+  let rawAmount = 0;
 
+  // Try executedShareVariations first (array of share variation objects, same as withdrawals)
+  const variations = obj.executedShareVariations;
+  if (Array.isArray(variations) && variations.length > 0) {
+    for (const v of variations) {
+      const varObj = v as Record<string, unknown>;
+      rawAmount += Number(varObj.amount || varObj.clpAmount || varObj.value || 0);
+    }
+  }
+
+  if (rawAmount === 0) {
+    rawAmount = extractAmount(obj, "amount", "clpAmount", "totalAmount", "value", "shares", "total", "clpValue");
+  }
+
+  if (rawAmount === 0) {
+    debugLog.push(`    [deposit skip] zero amount - keys: ${Object.keys(obj).filter(k => !k.startsWith("_")).join(", ")}`);
+    return null;
+  }
+
+  const docId = String(obj._docId || "");
   const isBuy = obj.isBuy === true;
   const description = isBuy ? "Compra" : "Deposito";
 
   return {
     date,
-    description,
+    description: docId ? `${description} (${docId})` : description,
     amount: Math.abs(Math.round(rawAmount)),
     balance: 0,
     source: MOVEMENT_SOURCE.account,
@@ -309,10 +344,13 @@ function mapDeposit(obj: Record<string, unknown>): BankMovement | null {
 }
 
 /** Map a withdrawals collection document to a BankMovement. */
-function mapWithdrawal(obj: Record<string, unknown>): BankMovement | null {
+function mapWithdrawal(obj: Record<string, unknown>, debugLog: string[]): BankMovement | null {
   // withdrawals use executionDate as primary date field
-  const date = toDate(obj.executionDate || obj.createdAt);
-  if (!date) return null;
+  const date = toDate(obj.executionDate || obj.createdAt || obj.date);
+  if (!date) {
+    debugLog.push(`    [withdrawal skip] no date - keys: ${Object.keys(obj).filter(k => !k.startsWith("_")).join(", ")}`);
+    return null;
+  }
 
   // Withdrawals may store amount in executedShareVariations or as a direct amount
   let rawAmount = 0;
@@ -327,17 +365,21 @@ function mapWithdrawal(obj: Record<string, unknown>): BankMovement | null {
   }
 
   if (rawAmount === 0) {
-    rawAmount = Number(obj.amount || obj.clpAmount || obj.value || obj.totalAmount || 0);
+    rawAmount = extractAmount(obj, "amount", "clpAmount", "value", "totalAmount", "total", "clpValue", "shares");
   }
 
-  if (rawAmount === 0) return null;
+  if (rawAmount === 0) {
+    debugLog.push(`    [withdrawal skip] zero amount - keys: ${Object.keys(obj).filter(k => !k.startsWith("_")).join(", ")}`);
+    return null;
+  }
 
+  const docId = String(obj._docId || "");
   const isSell = obj.isSell === true;
   const description = isSell ? "Venta" : "Retiro";
 
   return {
     date,
-    description,
+    description: docId ? `${description} (${docId})` : description,
     amount: -Math.abs(Math.round(rawAmount)),
     balance: 0,
     source: MOVEMENT_SOURCE.account,
@@ -345,12 +387,18 @@ function mapWithdrawal(obj: Record<string, unknown>): BankMovement | null {
 }
 
 /** Map a contributions collection document to a BankMovement. */
-function mapContribution(obj: Record<string, unknown>): BankMovement | null {
+function mapContribution(obj: Record<string, unknown>, debugLog: string[]): BankMovement | null {
   const date = toDate(obj.createdAt || obj.date || obj.executionDate);
-  if (!date) return null;
+  if (!date) {
+    debugLog.push(`    [contribution skip] no date - keys: ${Object.keys(obj).filter(k => !k.startsWith("_")).join(", ")}`);
+    return null;
+  }
 
-  const rawAmount = Number(obj.amount || obj.clpAmount || obj.value || 0);
-  if (rawAmount === 0) return null;
+  const rawAmount = extractAmount(obj, "amount", "clpAmount", "value", "totalAmount", "total", "clpValue");
+  if (rawAmount === 0) {
+    debugLog.push(`    [contribution skip] zero amount - keys: ${Object.keys(obj).filter(k => !k.startsWith("_")).join(", ")}`);
+    return null;
+  }
 
   // Determine type: dividends are positive, commissions are negative
   const type = String(obj.type || obj.contributionType || obj.category || "").toLowerCase();
@@ -377,13 +425,42 @@ function mapContribution(obj: Record<string, unknown>): BankMovement | null {
     sign = rawAmount < 0 ? -1 : 1;
   }
 
+  const docId = String(obj._docId || "");
+
   return {
     date,
-    description,
+    description: docId ? `${description} (${docId})` : description,
     amount: sign * Math.abs(Math.round(rawAmount)),
     balance: 0,
     source: MOVEMENT_SOURCE.account,
   };
+}
+
+// ─── Deep value extraction from nested objects ───────────────────
+
+/**
+ * Search for a numeric value in an object by trying multiple field names,
+ * including nested paths like result.data.equity.
+ */
+function deepExtractNumber(obj: Record<string, unknown>, ...fields: string[]): number {
+  // Try top-level fields first
+  for (const field of fields) {
+    const val = Number(obj[field] || 0);
+    if (val !== 0) return val;
+  }
+  // Try one level deep: obj.data.field, obj.result.field, etc.
+  const nestedContainers = ["data", "result", "account", "summary", "portfolio", "response"];
+  for (const container of nestedContainers) {
+    const nested = obj[container];
+    if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+      const nestedObj = nested as Record<string, unknown>;
+      for (const field of fields) {
+        const val = Number(nestedObj[field] || 0);
+        if (val !== 0) return val;
+      }
+    }
+  }
+  return 0;
 }
 
 // ─── Main scrape function ────────────────────────────────────────
@@ -405,7 +482,7 @@ async function scrapeRacional(options: ScraperOptions, debugLog: string[]): Prom
   progress("Sesion iniciada correctamente");
   debugLog.push("2. Fetching data from Firestore top-level collections...");
 
-  // ── Step 2: Fetch goals (portfolio names) ──
+  // ── Step 2: Fetch goals (portfolio names + values for balance) ──
   const goals: RacionalGoal[] = [];
   try {
     const goalDocs = await firestoreQueryByUserId("goals", localId, idToken);
@@ -415,9 +492,17 @@ async function scrapeRacional(options: ScraperOptions, debugLog: string[]): Prom
       const name = String(obj.name || obj.title || obj.label || "Meta");
       const id = String(obj._docId || "");
       const portfolioId = obj.portfolioId ? String(obj.portfolioId) : undefined;
-      const value = Number(obj.value || obj.balance || obj.clpValue || obj.totalValue || 0);
+      // Try all plausible value fields for goal balance
+      const value = Number(
+        obj.clpValue || obj.currentValue || obj.value || obj.balance ||
+        obj.totalValue || obj.clpBalance || obj.currentBalance ||
+        obj.marketValue || obj.totalBalance || obj.equity || 0,
+      );
       goals.push({ id, name, portfolioId, value: Math.round(value) });
-      debugLog.push(`    Goal: "${name}" (id=${id}, portfolioId=${portfolioId || "none"})`);
+      debugLog.push(`    Goal: "${name}" (id=${id}, portfolioId=${portfolioId || "none"}, value=${Math.round(value)})`);
+      if (value === 0) {
+        debugLog.push(`      [goal warning] zero value - keys: ${Object.keys(obj).filter(k => !k.startsWith("_")).join(", ")}`);
+      }
     }
   } catch (e) {
     debugLog.push(`  goals query failed: ${e}`);
@@ -425,7 +510,7 @@ async function scrapeRacional(options: ScraperOptions, debugLog: string[]): Prom
 
   progress("Obteniendo movimientos...");
 
-  // ── Step 3: Fetch deposits (all history) ──
+  // ── Step 3: Fetch deposits (all history — no date limits) ──
   const allMovements: BankMovement[] = [];
 
   try {
@@ -433,7 +518,7 @@ async function scrapeRacional(options: ScraperOptions, debugLog: string[]): Prom
     debugLog.push(`  deposits: ${depositDocs.length} document(s)`);
     let depositCount = 0;
     for (const doc of depositDocs) {
-      const mv = mapDeposit(docToObject(doc));
+      const mv = mapDeposit(docToObject(doc), debugLog);
       if (mv) {
         allMovements.push(mv);
         depositCount++;
@@ -444,13 +529,13 @@ async function scrapeRacional(options: ScraperOptions, debugLog: string[]): Prom
     debugLog.push(`  deposits query failed: ${e}`);
   }
 
-  // ── Step 4: Fetch withdrawals (all history) ──
+  // ── Step 4: Fetch withdrawals (all history — no date limits) ──
   try {
     const withdrawalDocs = await firestoreQueryByUserId("withdrawals", localId, idToken);
     debugLog.push(`  withdrawals: ${withdrawalDocs.length} document(s)`);
     let withdrawalCount = 0;
     for (const doc of withdrawalDocs) {
-      const mv = mapWithdrawal(docToObject(doc));
+      const mv = mapWithdrawal(docToObject(doc), debugLog);
       if (mv) {
         allMovements.push(mv);
         withdrawalCount++;
@@ -461,13 +546,13 @@ async function scrapeRacional(options: ScraperOptions, debugLog: string[]): Prom
     debugLog.push(`  withdrawals query failed: ${e}`);
   }
 
-  // ── Step 5: Fetch contributions (dividends, commissions, etc.) ──
+  // ── Step 5: Fetch contributions (dividends, commissions, etc. — all history) ──
   try {
     const contribDocs = await firestoreQueryByUserId("contributions", localId, idToken);
     debugLog.push(`  contributions: ${contribDocs.length} document(s)`);
     let contribCount = 0;
     for (const doc of contribDocs) {
-      const mv = mapContribution(docToObject(doc));
+      const mv = mapContribution(docToObject(doc), debugLog);
       if (mv) {
         allMovements.push(mv);
         contribCount++;
@@ -483,28 +568,42 @@ async function scrapeRacional(options: ScraperOptions, debugLog: string[]): Prom
 
   try {
     debugLog.push("3. Calling DrivewealthAccountSummary...");
-    const summaryRes = await callCloudFunction("DrivewealthAccountSummary", {}, idToken);
+    // Pass userId so the cloud function knows which account to query
+    const summaryRes = await callCloudFunction("DrivewealthAccountSummary", { userId: localId }, idToken);
     if (summaryRes.ok && summaryRes.result) {
       const result = summaryRes.result as Record<string, unknown>;
-      // Extract cash balance or total equity from the summary
-      const equity = Number(
-        result.equity || result.totalEquity || result.accountBalance ||
-        result.cashBalance || result.cash || result.balance || result.total || 0,
+      debugLog.push(`  Cloud function response keys: ${Object.keys(result).join(", ")}`);
+
+      // Extract balance using deep path checking (result.data.equity, etc.)
+      const equity = deepExtractNumber(
+        result,
+        "equity", "totalEquity", "accountBalance",
+        "cashBalance", "cash", "balance", "total",
+        "clpEquity", "clpBalance", "clpTotal",
+        "totalValue", "marketValue", "netValue",
       );
+
       if (equity > 0) {
         balance = Math.round(equity);
         debugLog.push(`  Account summary balance: $${balance.toLocaleString("es-CL")}`);
       } else {
-        debugLog.push(`  Account summary returned but no balance extracted. Keys: ${Object.keys(result).join(", ")}`);
+        // Log all keys at every level for debugging
+        debugLog.push(`  Account summary returned but no balance extracted.`);
+        debugLog.push(`    Top-level keys: ${Object.keys(result).join(", ")}`);
+        for (const [k, v] of Object.entries(result)) {
+          if (v && typeof v === "object" && !Array.isArray(v)) {
+            debugLog.push(`    ${k} keys: ${Object.keys(v as Record<string, unknown>).join(", ")}`);
+          }
+        }
       }
     } else if (!summaryRes.ok) {
-      debugLog.push(`  DrivewealthAccountSummary failed: HTTP ${summaryRes.status}`);
+      debugLog.push(`  DrivewealthAccountSummary failed: HTTP ${summaryRes.status} - ${summaryRes.body || ""}`);
     }
   } catch (e) {
     debugLog.push(`  DrivewealthAccountSummary error: ${e}`);
   }
 
-  // Fall back: compute balance from goal values
+  // Fall back: compute balance from goal values (sum clpValue, currentValue, value, etc.)
   if (!balance && goals.length > 0) {
     balance = goals.reduce((sum, g) => sum + g.value, 0);
     if (balance > 0) {
@@ -534,8 +633,11 @@ async function scrapeRacional(options: ScraperOptions, debugLog: string[]): Prom
     }
   }
 
+  // Dedup uses date|description|amount|balance|source|owner as the key.
+  // Because we embed the Firestore document ID in the description (e.g. "Deposito (abc123)"),
+  // each document produces a unique dedup key even when date/amount/balance are identical.
   const deduplicated = deduplicateMovements(allMovements);
-  debugLog.push(`4. Total: ${deduplicated.length} unique movement(s)`);
+  debugLog.push(`4. Total: ${deduplicated.length} unique movement(s) (before dedup: ${allMovements.length})`);
   progress(`Listo - ${deduplicated.length} movimientos totales`);
 
   // Persist tokens for next run
