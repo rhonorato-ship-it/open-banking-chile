@@ -19,11 +19,14 @@ import { runApiScraper } from "../infrastructure/api-runner.js";
 // and suggesting APK decompilation as the next step.
 
 const CANDIDATE_BASES = [
-  "https://api.tenpo.cl",
-  "https://services.tenpo.cl",
-  "https://api.tenpo.cl/v1",
-  "https://services.tenpo.cl/v1",
-  "https://app.tenpo.cl/api",
+  "https://api.prod.tenpo.cl",
+  "https://api.prod.tenpo.cl/v1",
+  "https://api.prod.tenpo.cl/api",
+  "https://api.prod.tenpo.cl/api/v1",
+  "https://prod-b.tenpo.cl",
+  "https://prod-b.tenpo.cl/api",
+  "https://prod-c.tenpo.cl",
+  "https://prod-c.tenpo.cl/api",
 ];
 
 const UA = "Tenpo/Android (open-banking-chile)";
