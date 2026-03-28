@@ -408,7 +408,7 @@ async function scrapeRacional(options: ScraperOptions, debugLog: string[]): Prom
   // ── Step 2: Fetch goals (portfolio names) ──
   const goals: RacionalGoal[] = [];
   try {
-    const goalDocs = await firestoreQueryByUserId("goals", localId, idToken, "createdAt");
+    const goalDocs = await firestoreQueryByUserId("goals", localId, idToken);
     debugLog.push(`  goals: ${goalDocs.length} document(s)`);
     for (const doc of goalDocs) {
       const obj = docToObject(doc);
@@ -429,7 +429,7 @@ async function scrapeRacional(options: ScraperOptions, debugLog: string[]): Prom
   const allMovements: BankMovement[] = [];
 
   try {
-    const depositDocs = await firestoreQueryByUserId("deposits", localId, idToken, "createdAt");
+    const depositDocs = await firestoreQueryByUserId("deposits", localId, idToken);
     debugLog.push(`  deposits: ${depositDocs.length} document(s)`);
     let depositCount = 0;
     for (const doc of depositDocs) {
@@ -446,7 +446,7 @@ async function scrapeRacional(options: ScraperOptions, debugLog: string[]): Prom
 
   // ── Step 4: Fetch withdrawals (all history) ──
   try {
-    const withdrawalDocs = await firestoreQueryByUserId("withdrawals", localId, idToken, "executionDate");
+    const withdrawalDocs = await firestoreQueryByUserId("withdrawals", localId, idToken);
     debugLog.push(`  withdrawals: ${withdrawalDocs.length} document(s)`);
     let withdrawalCount = 0;
     for (const doc of withdrawalDocs) {
@@ -463,7 +463,7 @@ async function scrapeRacional(options: ScraperOptions, debugLog: string[]): Prom
 
   // ── Step 5: Fetch contributions (dividends, commissions, etc.) ──
   try {
-    const contribDocs = await firestoreQueryByUserId("contributions", localId, idToken, "createdAt");
+    const contribDocs = await firestoreQueryByUserId("contributions", localId, idToken);
     debugLog.push(`  contributions: ${contribDocs.length} document(s)`);
     let contribCount = 0;
     for (const doc of contribDocs) {
