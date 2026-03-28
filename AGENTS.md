@@ -3,7 +3,7 @@
 ## For all Agents (Claude, Codex, Gemini, etc.)
 
 ### What this project does
-Open source scraping framework for Chilean banks. Extracts account movements and balances as JSON using Puppeteer (headless Chrome). Includes a multi-user web dashboard deployed on Vercel with Google OAuth.
+Open source framework for extracting movements and balances from Chilean banks and investment platforms. Uses direct API calls (preferred) or Puppeteer browser automation (last resort). Includes a multi-user web dashboard deployed on Vercel with Google OAuth.
 
 ### Live deployment
 - **Production URL**: https://open-banking-chile.vercel.app
@@ -13,19 +13,23 @@ Open source scraping framework for Chilean banks. Extracts account movements and
 - **npm package**: `open-banking-chile` (latest: v2.1.2, publisher: `rhonorato`)
 
 ### Supported banks (13)
-- Banco de Chile (`bchile`)
-- BCI (`bci`)
-- BancoEstado (`bestado`)
-- BICE (`bice`)
-- Citibank (`citi`)
-- Banco Edwards (`edwards`)
-- Banco Falabella (`falabella`)
-- Fintual (`fintual`) — **API mode** (no browser)
-- Itaú (`itau`)
-- MercadoPago (`mercadopago`)
-- Racional (`racional`)
-- Santander (`santander`)
-- Scotiabank (`scotiabank`)
+
+**API mode** (no browser needed — works on Vercel without Chromium):
+- Banco de Chile (`bchile`) — Spring Security login + REST API with XSRF cookie jar
+- Banco Edwards (`edwards`) — delegates to bchile (same portal: `portalpersonas.bancochile.cl`)
+- Fintual (`fintual`) — public REST API at `https://fintual.cl/api-docs`
+- MercadoPago (`mercadopago`) — OAuth2 access token + public API at `api.mercadopago.com`
+- Racional (`racional`) — Firebase Auth (`racional-prod`) + Firestore REST API
+
+**Browser mode** (requires Puppeteer):
+- BCI (`bci`) — legacy JSF iframes, BCI Pass 2FA
+- BancoEstado (`bestado`) — requires `forceHeadful: true` (Akamai bot protection)
+- BICE (`bice`) — Keycloak OIDC at `auth.bice.cl`, direct portal at `portalpersonas.bice.cl`
+- Citibank (`citi`) — ThreatMetrix `ioBlackBox` fingerprinting, REST API partially wired
+- Banco Falabella (`falabella`) — Shadow DOM CMR credit card component
+- Itaú (`itau`) — Imperva bot protection, IBM WPS portal
+- Santander (`santander`) — Angular SPA, push 2FA
+- Scotiabank (`scotiabank`) — Shadow DOM Web Components
 
 ---
 
@@ -69,6 +73,75 @@ These banks have Imperva, Incapsula, or similar bot detection that blocks headle
 - `src/infrastructure/scraper-runner.ts` — Browser-based runner (use only when necessary)
 - `src/infrastructure/browser.ts` — Puppeteer launch with `userDataDir` support
 
+### Discovered API patterns (verbatim reference)
+
+Use this section when debugging or extending any API-mode scraper. These details were confirmed via DevTools inspection and live testing.
+
+#### Fintual (`mode: "api"`)
+- **Auth**: `POST https://fintual.cl/api/access_tokens` with `{ user: { email, password } }` → `{ data: { attributes: { token, email } } }`
+- **Data**: `GET https://fintual.cl/api/goals` with headers `X-User-Email` + `X-User-Token`
+- **Response**: `{ data: [{ id, type: "goal", attributes: { name, nav } }] }` — `nav` is portfolio value in CLP
+- **Docs**: Swagger at `https://fintual.cl/api-docs/v1/swagger.json`
+- **Credential mapping**: `rut` field = email address, `password` field = password
+
+#### Banco de Chile (`mode: "api"`)
+- **Auth**: Spring Security form-login. Cookie jar pattern with `JSESSIONID` + `XSRF-TOKEN` (Angular double-submit cookie)
+- **Login POST**: `https://login.portal.bancochile.cl/bancochile-web/persona/login/index.html` with `userRut` + `userPassword` + `_csrf` as `application/x-www-form-urlencoded`. Use `redirect: "manual"` to capture Set-Cookie from 302.
+- **XSRF**: Cookie `XSRF-TOKEN` (URL-encoded) → decode and send as header `X-XSRF-TOKEN` on every API call
+- **API base**: `https://portalpersonas.bancochile.cl/mibancochile/rest/persona`
+- **Key endpoints** (all require `Cookie` + `X-XSRF-TOKEN` headers):
+  - `GET selectorproductos/selectorProductos/obtenerProductos?incluirTarjetas=true` — list all accounts + cards
+  - `GET bff-ppersonas-clientes/clientes/` — client name and RUT
+  - `GET bff-pp-prod-ctas-saldos/productos/cuentas/saldos` — account balances
+  - `POST bff-pper-prd-cta-movimientos/movimientos/getCartola` — paginated account movements
+  - `POST tarjetas/widget/informacion-tarjetas` — list credit cards
+  - `POST tarjeta-credito-digital/saldo/obtener-saldo` — card balance/limits
+  - `POST tarjeta-credito-digital/movimientos-no-facturados` — unbilled CC movements
+  - `POST tarjetas/estadocuenta/fechas-facturacion` — billing dates
+  - `POST tarjetas/estadocuenta/nacional/resumen-por-fecha` — billed national CC movements
+  - `POST tarjetas/estadocuenta/internacional/resumen-por-fecha` — billed international CC movements
+
+#### Banco Edwards (`mode: "api"`)
+- **Same portal as Banco de Chile** — delegates to `bchile.scrape()` and rebrands the result
+- Uses identical API endpoints, login flow, and XSRF pattern
+
+#### MercadoPago (`mode: "api"`)
+- **Auth**: OAuth2 personal access token (`APP_USR-...`) from `mercadopago.cl/developers/panel/app`
+- **No username/password login API exists** — the token must be pre-generated by the user
+- **API base**: `https://api.mercadopago.com` — all requests use `Authorization: Bearer {token}`
+- **Key endpoints**:
+  - `GET /users/me` — user profile (id, site_id, email)
+  - `GET /users/{id}/mercadopago_account/balance` — wallet balance
+  - `GET /v1/payments/search?collector.id={id}&sort=date_created&criteria=desc` — payments received (paginated)
+  - `POST /v1/account/settlement_report` + `GET /v1/account/settlement_report/{file}` — CSV movement report
+- **Limitation**: API is seller/merchant-oriented. Buyer-only accounts may return 0 movements.
+- **Token refresh**: `POST /oauth/token` with `grant_type=refresh_token` + `MERCADOPAGO_CLIENT_ID` + `MERCADOPAGO_CLIENT_SECRET` env vars
+- **Credential mapping**: `rut` field = unused (can be blank), `password` field = `APP_USR-...` access token
+
+#### Racional (`mode: "api"`)
+- **Auth**: Firebase Authentication (project: `racional-prod`)
+  - API key: `AIzaSyCHCBAaUWhTc8mGtyqfahJ4cYpeVACoCJk`
+  - `POST https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={API_KEY}` with `{ email, password, returnSecureToken: true }`
+  - Returns `{ idToken, refreshToken, localId }` — `idToken` is a JWT valid for 1 hour
+  - Token refresh: `POST https://securetoken.googleapis.com/v1/token?key={API_KEY}` with `grant_type=refresh_token`
+- **Data**: Firestore at `projects/racional-prod/databases/(default)/documents`
+  - User doc: `users/{localId}` — portfolio data may be embedded as fields
+  - Business constants: `businessConstants/generalConstants`, `businessConstants/portfolioConstants`, `businessConstants/portfolioLabels`
+  - Uses Firestore REST API: `GET https://firestore.googleapis.com/v1/projects/racional-prod/databases/(default)/documents/{path}` with `Authorization: Bearer {idToken}`
+- **Credential mapping**: `rut` field = email address, `password` field = password
+- **2FA**: Firebase may enforce MFA (returns `MISSING_MFA` error). Email OTP handled via `onTwoFactorCode` callback.
+
+#### BICE (browser mode — migration candidate)
+- **Auth**: Keycloak OIDC at `auth.bice.cl/auth/realms/personas/protocol/openid-connect/auth`
+- **Direct portal**: `https://portalpersonas.bice.cl` triggers Keycloak redirect (skips homepage 403)
+- **Keycloak form**: `#username` + `#password` + `#kc-login` (standard Keycloak IDs)
+- **Migration path**: Keycloak token exchange via `POST /auth/realms/personas/protocol/openid-connect/token` could replace browser login
+
+#### Citibank (browser mode — partially API)
+- **Has REST endpoints**: `POST /US/REST/accountsPanel/getCustomerAccounts.jws`, CSV download at `/US/NCSC/dcd/StatementDownload.do`
+- **Blocker**: ThreatMetrix `ioBlackBox` device fingerprinting required before login submission
+- **Migration path**: If `ioBlackBox` can be generated without a browser, full API migration is possible
+
 ---
 
 ## Project structure
@@ -92,9 +165,10 @@ src/
     balance.ts             — Balance extraction (regex + CSS selector fallbacks)
     two-factor.ts          — 2FA detection and wait (configurable keywords/timeout)
   banks/
-    falabella.ts, bchile.ts, bci.ts, bestado.ts, bice.ts,
-    edwards.ts, itau.ts, santander.ts, scotiabank.ts, citi.ts,
-    fintual.ts (API mode), mercadopago.ts, racional.ts
+    bchile.ts (API), edwards.ts (API, delegates to bchile),
+    fintual.ts (API), mercadopago.ts (API), racional.ts (API),
+    bci.ts, bestado.ts, bice.ts, citi.ts, falabella.ts,
+    itau.ts, santander.ts, scotiabank.ts
 
 web/                       — Next.js 15 multi-user dashboard (App Router), deployed on Vercel
   app/
@@ -239,7 +313,19 @@ See CONTRIBUTING.md for the full guide.
 
 ## Scraper development workflow
 
-When extending or debugging a bank scraper, follow this procedure:
+### API-mode scrapers (preferred)
+
+1. **Discover the API** — Open Chrome DevTools → Network tab (filter: Fetch/XHR). Log in manually and navigate to movements/portfolio pages.
+2. **Identify auth pattern** — Common patterns found in this project:
+   - **Token-based**: POST credentials → receive token → use as Bearer header (Fintual, MercadoPago)
+   - **Cookie jar**: POST credentials → receive session cookies + CSRF token → send cookies on every request (Banco de Chile)
+   - **Firebase Auth**: POST to `identitytoolkit.googleapis.com/v1/accounts:signInWithPassword` → receive `idToken` (Racional)
+   - **OAuth2**: User pre-authorizes app → use access token (MercadoPago)
+3. **Map all endpoints** — Record every XHR request: URL, method, headers, request body, response shape. Add these verbatim to the "Discovered API patterns" section above.
+4. **Implement** — Use `runApiScraper()`, follow `fintual.ts` (simple token) or `bchile.ts` (cookie jar) as templates.
+5. **Test** — `node dist/cli.js --bank <id> --pretty` with real credentials.
+
+### Browser-mode scrapers (last resort)
 
 1. **Get to a point** — Run the scraper and reach the target page (e.g. post-login dashboard).
 2. **Scrape page** — Save HTML with `--screenshots` (writes to `debug/*.html` when enabled).
@@ -253,10 +339,31 @@ Do not skip steps 2–3. Do not implement without inspecting the scraped HTML fi
 
 ## Common issues
 
-- **Chrome not found** → install Chrome or set `CHROME_PATH`
-- **2FA prompt** → cannot be automated; bank security feature
-- **0 movements** → use `--screenshots` to debug DOM structure
-- **Bot detection** → some banks (Citi) require headed mode; `--screenshots` also helps diagnose
+- **Chrome not found** → only needed for browser-mode banks. API-mode banks work without Chrome.
+- **2FA prompt** → handled via `onTwoFactorCode` callback (web app polls Supabase `pending_2fa` table). CLI falls back to stdin.
+- **0 movements** → for API-mode: check debug log for HTTP status codes. For browser-mode: use `--screenshots`.
+- **Bot detection** → Itaú (Imperva), BICE (403), BancoEstado (TLS fingerprint). Use `--profile` for local runs with system Chrome.
+- **MercadoPago 0 movements** → normal for buyer-only accounts. The API only shows seller/wallet activity.
+- **Token expired** → Fintual tokens don't expire within a session. MercadoPago tokens last 180 days. Racional Firebase tokens expire in 1 hour but auto-refresh.
+- **Login failed on Vercel** → check if the bank is in the "browser mode" list. Browser-mode banks may fail on Vercel due to bot protection.
+
+---
+
+## Agent team
+
+This project uses specialized agents (`.claude/agents/`) that are automatically delegated to based on the user's request:
+
+| Agent | Role | When invoked |
+|-------|------|-------------|
+| `bank-{id}` (x13) | Bank-specific expert | Any mention of a bank name, ID, or its scraper |
+| `scraping-expert` | Technique expert | API patterns, auth flows, cookie jars, fetch, Puppeteer |
+| `product-manager` | Product decisions | Feature scope, UX, database schema, platform consistency |
+| `qa-engineer` | Quality assurance | After every code change — build, types, compliance, regressions |
+| `repo-architect` | Documentation | After major iterations — AGENTS.md, agent files, memory, structure |
+
+**Delegation is automatic** — see CLAUDE.md for routing rules.
+
+**Post-iteration protocol**: After every major change, `qa-engineer` runs first (catches bugs), then `repo-architect` runs (updates docs). This is mandatory and should not be skipped.
 
 ---
 

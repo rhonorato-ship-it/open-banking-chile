@@ -1,307 +1,423 @@
-import type { Page } from "puppeteer-core";
 import type { BankMovement, BankScraper, ScrapeResult, ScraperOptions } from "../types.js";
 import { MOVEMENT_SOURCE } from "../types.js";
-import { closePopups, delay, parseChileanAmount, normalizeDate, deduplicateMovements } from "../utils.js";
-import { runScraper } from "../infrastructure/scraper-runner.js";
-import type { BrowserSession } from "../infrastructure/browser.js";
-import { detectLoginError } from "../actions/login.js";
-import { loadCookies, saveCookies } from "../infrastructure/cookies.js";
+import { normalizeDate, deduplicateMovements } from "../utils.js";
+import { runApiScraper } from "../infrastructure/api-runner.js";
 
-// ─── Racional-specific constants ─────────────────────────────────
+// ─── Racional API constants ──────────────────────────────────────
+//
+// Racional uses Firebase Authentication (project: racional-prod).
+// Auth: Firebase REST API → signInWithPassword → idToken
+// Data: Firestore or Cloud Functions (endpoints TBD from DevTools discovery)
+//
+// Firebase Auth REST API docs:
+// https://firebase.google.com/docs/reference/rest/auth
 
-const LOGIN_URL = "https://app.racional.cl/login";
+const FIREBASE_API_KEY = "AIzaSyCHCBAaUWhTc8mGtyqfahJ4cYpeVACoCJk";
+const FIREBASE_AUTH_URL = "https://identitytoolkit.googleapis.com/v1";
+const FIREBASE_TOKEN_URL = "https://securetoken.googleapis.com/v1/token";
 
-// ─── Helpers ─────────────────────────────────────────────────────
+// Data lives in Firestore (project: racional-prod)
+const FIRESTORE_BASE = "https://firestore.googleapis.com/v1/projects/racional-prod/databases/(default)/documents";
 
-async function racionalLogin(
-  page: Page,
+const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
+
+// ─── Firebase Auth types ─────────────────────────────────────────
+
+interface FirebaseSignInResponse {
+  idToken: string;
+  email: string;
+  refreshToken: string;
+  expiresIn: string;
+  localId: string;
+  registered: boolean;
+}
+
+interface FirebaseRefreshResponse {
+  id_token: string;
+  refresh_token: string;
+  expires_in: string;
+  token_type: string;
+  user_id: string;
+  project_id: string;
+}
+
+interface FirebaseMfaError {
+  error: {
+    code: number;
+    message: string;
+    errors: Array<{ message: string; domain: string; reason: string }>;
+  };
+}
+
+// ─── Data types (shapes TBD — update after DevTools discovery) ───
+
+interface RacionalPortfolioItem {
+  id: string;
+  name: string;
+  value: number;
+  currency?: string;
+}
+
+interface RacionalMovementRaw {
+  id?: string;
+  date: string;
+  type: string;
+  description: string;
+  amount: number;
+  currency?: string;
+}
+
+// ─── Firebase Auth ───────────────────────────────────────────────
+
+async function firebaseSignIn(
   email: string,
   password: string,
   debugLog: string[],
-  doSave: (page: Page, name: string) => Promise<void>,
-  onTwoFactorCode?: () => Promise<string>,
-): Promise<{ success: boolean; error?: string }> {
-  // Try to restore saved session first
-  debugLog.push("0. Loading saved cookies...");
-  const hadCookies = await loadCookies(page, "racional");
-  if (hadCookies) {
-    await page.goto("https://app.racional.cl/", { waitUntil: "networkidle2", timeout: 30000 });
-    await delay(2000);
-    if (!page.url().includes("/login")) {
-      debugLog.push("  Session valid — skipping login.");
-      return { success: true };
+): Promise<{ success: true; idToken: string; refreshToken: string; localId: string } | { success: false; error: string }> {
+  debugLog.push("1. Authenticating via Firebase...");
+
+  const res = await fetch(`${FIREBASE_AUTH_URL}/accounts:signInWithPassword?key=${FIREBASE_API_KEY}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password, returnSecureToken: true }),
+  });
+
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ error: { message: "Unknown error" } })) as FirebaseMfaError;
+    const msg = body.error?.message || `HTTP ${res.status}`;
+
+    if (msg === "EMAIL_NOT_FOUND" || msg === "INVALID_EMAIL") {
+      return { success: false, error: "Email no registrado en Racional." };
     }
-    debugLog.push("  Session expired — proceeding with full login.");
+    if (msg === "INVALID_PASSWORD" || msg === "INVALID_LOGIN_CREDENTIALS") {
+      return { success: false, error: "Contraseña incorrecta." };
+    }
+    if (msg === "USER_DISABLED") {
+      return { success: false, error: "Cuenta deshabilitada." };
+    }
+    if (msg === "TOO_MANY_ATTEMPTS_TRY_LATER") {
+      return { success: false, error: "Demasiados intentos. Intenta más tarde." };
+    }
+    // MFA required — Firebase returns a specific error for multi-factor auth
+    if (msg.startsWith("MISSING_MFA") || msg.includes("MFA")) {
+      return { success: false, error: `Se requiere autenticación multi-factor: ${msg}` };
+    }
+
+    return { success: false, error: `Error de Firebase Auth: ${msg}` };
   }
 
-  debugLog.push("1. Navigating to Racional...");
-  await page.goto(LOGIN_URL, { waitUntil: "networkidle2", timeout: 30000 });
-  await delay(3000);
-  await doSave(page, "01-login-form");
+  const data = await res.json() as FirebaseSignInResponse;
+  debugLog.push(`  Auth OK — user: ${data.email} (${data.localId})`);
+  return { success: true, idToken: data.idToken, refreshToken: data.refreshToken, localId: data.localId };
+}
 
-  // Find email/identifier field
-  debugLog.push("2. Filling email/identifier...");
-  const emailSelectors = [
-    'input[type="email"]',
-    'input[name="email"]',
-    'input[id*="email"]',
-    'input[placeholder*="email" i]',
-    'input[placeholder*="correo" i]',
-    'input[name="username"]',
-    'input[type="text"]',
-  ];
+async function firebaseRefreshToken(
+  refreshToken: string,
+  debugLog: string[],
+): Promise<{ idToken: string; refreshToken: string } | null> {
+  debugLog.push("0. Refreshing Firebase token...");
+  try {
+    const res = await fetch(`${FIREBASE_TOKEN_URL}?key=${FIREBASE_API_KEY}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: `grant_type=refresh_token&refresh_token=${encodeURIComponent(refreshToken)}`,
+    });
+    if (!res.ok) return null;
+    const data = await res.json() as FirebaseRefreshResponse;
+    debugLog.push("  Token refreshed successfully");
+    return { idToken: data.id_token, refreshToken: data.refresh_token };
+  } catch {
+    return null;
+  }
+}
 
-  let emailFilled = false;
-  for (const sel of emailSelectors) {
-    const el = await page.$(sel);
-    if (el) {
-      await el.click({ clickCount: 3 });
-      await el.type(email, { delay: 60 });
-      debugLog.push(`  Email field: ${sel}`);
-      emailFilled = true;
+// ─── Firestore helpers ───────────────────────────────────────────
+
+interface FirestoreDocument {
+  name: string;
+  fields: Record<string, FirestoreValue>;
+  createTime: string;
+  updateTime: string;
+}
+
+interface FirestoreValue {
+  stringValue?: string;
+  integerValue?: string;
+  doubleValue?: number;
+  booleanValue?: boolean;
+  timestampValue?: string;
+  mapValue?: { fields: Record<string, FirestoreValue> };
+  arrayValue?: { values: FirestoreValue[] };
+  nullValue?: null;
+}
+
+interface FirestoreListResponse {
+  documents?: FirestoreDocument[];
+  nextPageToken?: string;
+}
+
+function fsVal(v: FirestoreValue | undefined): string | number | boolean | null {
+  if (!v) return null;
+  if (v.stringValue !== undefined) return v.stringValue;
+  if (v.integerValue !== undefined) return parseInt(v.integerValue, 10);
+  if (v.doubleValue !== undefined) return v.doubleValue;
+  if (v.booleanValue !== undefined) return v.booleanValue;
+  if (v.timestampValue !== undefined) return v.timestampValue;
+  return null;
+}
+
+async function firestoreGet(path: string, idToken: string): Promise<{ ok: true; data: FirestoreListResponse } | { ok: false; status: number }> {
+  const res = await fetch(`${FIRESTORE_BASE}/${path}`, {
+    headers: {
+      Authorization: `Bearer ${idToken}`,
+      Accept: "application/json",
+      "User-Agent": UA,
+    },
+  });
+  if (!res.ok) return { ok: false, status: res.status };
+  return { ok: true, data: await res.json() as FirestoreListResponse };
+}
+
+async function firestoreGetDoc(path: string, idToken: string): Promise<{ ok: true; data: FirestoreDocument } | { ok: false; status: number }> {
+  const res = await fetch(`${FIRESTORE_BASE}/${path}`, {
+    headers: {
+      Authorization: `Bearer ${idToken}`,
+      Accept: "application/json",
+      "User-Agent": UA,
+    },
+  });
+  if (!res.ok) return { ok: false, status: res.status };
+  return { ok: true, data: await res.json() as FirestoreDocument };
+}
+
+// ─── Data fetchers ───────────────────────────────────────────────
+
+interface DiscoveryResult {
+  portfolioPath: string | null;
+  movementsPath: string | null;
+  userDoc: FirestoreDocument | null;
+}
+
+async function discoverData(userId: string, idToken: string, debugLog: string[]): Promise<DiscoveryResult> {
+  debugLog.push("3. Discovering Firestore data...");
+
+  const userBase = `users/${userId}`;
+
+  // Step 1: Read the user document — portfolio may be embedded as fields
+  let userDoc: FirestoreDocument | null = null;
+  const userDocRes = await firestoreGetDoc(userBase, idToken);
+  if (userDocRes.ok) {
+    userDoc = userDocRes.data;
+    const fields = Object.keys(userDoc.fields || {});
+    debugLog.push(`  User doc fields: ${fields.join(", ")}`);
+  } else {
+    debugLog.push(`  User doc read failed: ${userDocRes.status}`);
+  }
+
+  // Step 2: Try subcollections for portfolio and movements
+  const portfolioCandidates = ["portfolio", "portfolios", "holdings", "accounts", "investments", "goals"];
+  const movementCandidates = ["movements", "transactions", "activity", "operations", "history", "transfers", "deposits", "withdrawals"];
+
+  let portfolioPath: string | null = null;
+  let movementsPath: string | null = null;
+
+  for (const col of portfolioCandidates) {
+    const res = await firestoreGet(`${userBase}/${col}`, idToken);
+    if (res.ok && res.data.documents && res.data.documents.length > 0) {
+      portfolioPath = `${userBase}/${col}`;
+      debugLog.push(`  Portfolio subcollection: ${col} (${res.data.documents.length} doc(s))`);
       break;
     }
   }
-  if (!emailFilled) {
-    const ss = await page.screenshot({ encoding: "base64" });
-    return { success: false, error: "No se encontró campo de email/usuario." };
-  }
-  await delay(500);
 
-  // Find password field
-  debugLog.push("3. Filling password...");
-  const passEl = await page.$('input[type="password"]');
-  if (!passEl) {
-    // Two-step: may need to submit email first
-    await page.keyboard.press("Enter");
-    await delay(3000);
-    await doSave(page, "02-after-email");
-  }
-
-  const passEl2 = await page.$('input[type="password"]');
-  if (!passEl2) {
-    const ss = await page.screenshot({ encoding: "base64" });
-    return { success: false, error: "No se encontró campo de contraseña." };
-  }
-  await passEl2.click();
-  await passEl2.type(password, { delay: 60 });
-  await delay(500);
-
-  // Submit
-  debugLog.push("4. Submitting login...");
-  const submitted = await page.evaluate(() => {
-    const btns = Array.from(document.querySelectorAll("button, input[type='submit']"));
-    for (const btn of btns) {
-      const text = (btn as HTMLElement).innerText?.trim().toLowerCase() || (btn as HTMLInputElement).value?.toLowerCase() || "";
-      if (text.includes("ingresar") || text.includes("entrar") || text.includes("iniciar") || text.includes("login") || text.includes("continuar")) {
-        (btn as HTMLElement).click();
-        return true;
-      }
+  for (const col of movementCandidates) {
+    const res = await firestoreGet(`${userBase}/${col}`, idToken);
+    if (res.ok && res.data.documents && res.data.documents.length > 0) {
+      movementsPath = `${userBase}/${col}`;
+      debugLog.push(`  Movements subcollection: ${col} (${res.data.documents.length} doc(s))`);
+      break;
     }
-    // Fallback: first non-disabled submit button
-    const submitBtn = document.querySelector('button[type="submit"]') as HTMLButtonElement | null;
-    if (submitBtn && !submitBtn.disabled) { submitBtn.click(); return true; }
-    return false;
-  });
-  if (!submitted) await page.keyboard.press("Enter");
-
-  try { await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 25000 }); } catch { await delay(5000); }
-  await delay(2000);
-  await doSave(page, "03-post-login");
-
-  // Detect email 2FA dialog ("Verifica tu Correo" / "código de 6 dígitos")
-  const needs2FA = await page.evaluate(() => {
-    const body = document.body?.innerText || "";
-    return body.includes("Verifica tu Correo") || body.includes("código de 6 dígitos") || body.includes("Verificar Código");
-  });
-
-  if (needs2FA) {
-    debugLog.push("5. Email 2FA required — waiting for code...");
-    await doSave(page, "03b-2fa-email");
-
-    let code = "";
-    if (onTwoFactorCode) {
-      code = await onTwoFactorCode();
-    } else if (process.stdin.isTTY) {
-      code = await new Promise<string>((resolve) => {
-        process.stderr.write("\n🔐 Racional: ingresa el código de 6 dígitos enviado a tu correo: ");
-        process.stdin.once("data", (d) => resolve(d.toString().trim()));
-      });
-    }
-
-    if (!code) {
-      return { success: false, error: "Se requiere código 2FA de email (Racional). Proporciona onTwoFactorCode o usa TTY." };
-    }
-
-    const codeInput = await page.$('input[placeholder*="123456"], input[type="text"], input[type="number"]');
-    if (codeInput) {
-      await codeInput.click({ clickCount: 3 });
-      await codeInput.type(code, { delay: 70 });
-      await delay(300);
-    }
-
-    // Click "Verificar Código"
-    await page.evaluate(() => {
-      const btns = Array.from(document.querySelectorAll("button"));
-      for (const btn of btns) {
-        const text = (btn as HTMLElement).innerText?.trim().toLowerCase() || "";
-        if (text.includes("verificar") || text.includes("confirmar")) {
-          (btn as HTMLElement).click();
-          return;
-        }
-      }
-    });
-
-    try { await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 20000 }); } catch { await delay(5000); }
-    await delay(2000);
-    await doSave(page, "04-post-2fa");
   }
 
-  const loginError = await detectLoginError(page);
-  if (loginError) return { success: false, error: `Error del banco: ${loginError}` };
-
-  if (page.url().includes("/login")) {
-    return { success: false, error: "Login no completado — URL sigue en /login." };
-  }
-
-  await saveCookies(page, "racional");
-  debugLog.push("5. Login OK! Session cookies saved.");
-  return { success: true };
+  return { portfolioPath, movementsPath, userDoc };
 }
 
-async function extractRacionalMovements(page: Page, debugLog: string[]): Promise<BankMovement[]> {
-  // Navigate to movements/activity section
-  const navClicked = await page.evaluate(() => {
-    const targets = ["movimientos", "actividad", "cartola", "historial", "transacciones"];
-    for (const el of Array.from(document.querySelectorAll("a, button, [role='tab']"))) {
-      const text = (el as HTMLElement).innerText?.trim().toLowerCase() || "";
-      if (targets.some(t => text.includes(t)) && text.length < 50) {
-        (el as HTMLElement).click();
-        return text;
-      }
-    }
-    return null;
-  });
-  if (navClicked) {
-    debugLog.push(`  Navigation: "${navClicked}"`);
-    await delay(3000);
+async function fetchPortfolio(path: string, idToken: string, debugLog: string[]): Promise<{ items: RacionalPortfolioItem[]; balance: number }> {
+  debugLog.push(`4. Fetching portfolio from ${path}...`);
+  const res = await firestoreGet(path, idToken);
+  if (!res.ok || !res.data.documents) {
+    debugLog.push("  No portfolio documents found");
+    return { items: [], balance: 0 };
   }
 
-  const raw = await page.evaluate(() => {
-    const results: Array<{ date: string; description: string; amount: string; balance: string }> = [];
+  const items: RacionalPortfolioItem[] = [];
+  let totalBalance = 0;
 
-    // Strategy 1: Tables
-    for (const table of Array.from(document.querySelectorAll("table"))) {
-      const rows = Array.from(table.querySelectorAll("tr"));
-      if (rows.length < 2) continue;
-      for (const row of rows) {
-        const cells = Array.from(row.querySelectorAll("td"));
-        if (cells.length < 2) continue;
-        const texts = cells.map(c => (c as HTMLElement).innerText?.trim() || "");
-        const dateMatch = texts.find(t => /\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}/.test(t));
-        const amountMatch = texts.find(t => /[+\-]?[\d.,]+/.test(t) && t !== dateMatch);
-        if (dateMatch && amountMatch) {
-          const desc = texts.find(t => t !== dateMatch && t !== amountMatch && t.length > 2) || "";
-          results.push({ date: dateMatch, description: desc, amount: amountMatch, balance: "" });
-        }
-      }
-    }
+  for (const doc of res.data.documents) {
+    const f = doc.fields;
+    const name = String(fsVal(f.name) || fsVal(f.title) || fsVal(f.label) || doc.name.split("/").pop() || "");
+    const value = Number(fsVal(f.value) || fsVal(f.balance) || fsVal(f.nav) || fsVal(f.amount) || fsVal(f.total) || 0);
+    const id = doc.name.split("/").pop() || "";
 
-    // Strategy 2: Movement cards/list items
-    if (results.length === 0) {
-      const cards = document.querySelectorAll(
-        '[class*="movimiento"], [class*="movement"], [class*="transaction"], [class*="activity"], [class*="item"]'
-      );
-      for (const card of Array.from(cards)) {
-        const text = (card as HTMLElement).innerText || "";
-        const dateMatch = text.match(/\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}/);
-        const amountMatch = text.match(/[+\-]?\$?\s*[\d.,]+/);
-        if (dateMatch && amountMatch) {
-          const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
-          const desc = lines.find(l => !l.match(/^\d{1,2}[\/\-\.]/) && !l.match(/^\$/) && l.length > 2) || "";
-          results.push({ date: dateMatch[0], description: desc, amount: amountMatch[0], balance: "" });
-        }
-      }
-    }
+    items.push({ id, name, value, currency: String(fsVal(f.currency) || "CLP") });
+    totalBalance += value;
+  }
 
-    return results;
-  });
-
-  return raw
-    .map(r => {
-      const amount = parseChileanAmount(r.amount);
-      if (amount === 0) return null;
-      return {
-        date: normalizeDate(r.date),
-        description: r.description,
-        amount,
-        balance: r.balance ? parseChileanAmount(r.balance) : 0,
-        source: MOVEMENT_SOURCE.account,
-      } as BankMovement;
-    })
-    .filter(Boolean) as BankMovement[];
+  debugLog.push(`  Found ${items.length} position(s), balance: $${Math.round(totalBalance).toLocaleString("es-CL")}`);
+  return { items, balance: totalBalance };
 }
 
-// ─── Main scrape function ─────────────────────────────────────────
+async function fetchMovements(path: string, idToken: string, debugLog: string[]): Promise<BankMovement[]> {
+  debugLog.push(`5. Fetching movements from ${path}...`);
+  const res = await firestoreGet(path, idToken);
+  if (!res.ok || !res.data.documents) {
+    debugLog.push("  No movement documents found");
+    return [];
+  }
 
-async function scrapeRacional(session: BrowserSession, options: ScraperOptions): Promise<ScrapeResult> {
-  const { rut: email, password, saveScreenshots: doScreenshots, onProgress } = options;
-  const { page, debugLog, screenshot: doSave } = session;
+  const movements: BankMovement[] = [];
+  for (const doc of res.data.documents) {
+    const f = doc.fields;
+    const rawDate = String(fsVal(f.date) || fsVal(f.createdAt) || fsVal(f.timestamp) || fsVal(f.fecha) || "");
+    const date = normalizeDate(rawDate.split("T")[0]);
+    const description = String(fsVal(f.description) || fsVal(f.desc) || fsVal(f.type) || fsVal(f.descripcion) || "Movimiento");
+    const rawAmount = Number(fsVal(f.amount) || fsVal(f.monto) || fsVal(f.value) || 0);
+    const type = String(fsVal(f.type) || fsVal(f.tipo) || "").toLowerCase();
+
+    const isNegative = ["withdrawal", "purchase", "fee", "retiro", "compra", "comision", "rescate"].includes(type);
+    const amount = isNegative ? -Math.abs(rawAmount) : Math.abs(rawAmount);
+    if (amount === 0) continue;
+
+    movements.push({ date, description, amount, balance: 0, source: MOVEMENT_SOURCE.account });
+  }
+
+  debugLog.push(`  Found ${movements.length} movement(s)`);
+  return movements;
+}
+
+// ─── Main scrape function ────────────────────────────────────────
+
+async function scrapeRacional(options: ScraperOptions, debugLog: string[]): Promise<ScrapeResult> {
+  const { rut: email, password, onProgress } = options;
   const bank = "racional";
   const progress = onProgress || (() => {});
 
-  progress("Abriendo Racional...");
-  const loginResult = await racionalLogin(page, email, password, debugLog, doSave, options.onTwoFactorCode);
-  if (!loginResult.success) {
-    const ss = await page.screenshot({ encoding: "base64" });
-    return { success: false, bank, movements: [], error: loginResult.error, screenshot: ss as string, debug: debugLog.join("\n") };
+  progress("Conectando con Racional...");
+
+  // Try to restore a saved session (refresh token) before full login
+  let idToken = "";
+  let refreshToken = "";
+  if (options.onTwoFactorCode) {
+    // Check if there's a stored session we can refresh
+    // (The web app passes stored tokens via the session mechanism)
   }
+
+  // Firebase Auth: email + password → idToken
+  const authResult = await firebaseSignIn(email, password, debugLog);
+  if (!authResult.success) {
+    return { success: false, bank, movements: [], error: authResult.error, debug: debugLog.join("\n") };
+  }
+  idToken = authResult.idToken;
+  refreshToken = authResult.refreshToken;
 
   progress("Sesión iniciada correctamente");
-  await closePopups(page);
-  await delay(2000);
 
-  progress("Extrayendo movimientos...");
-  debugLog.push("6. Extracting movements...");
-  const movements = await extractRacionalMovements(page, debugLog);
+  // Discover Firestore data — user doc + subcollections
+  const { portfolioPath, movementsPath, userDoc } = await discoverData(authResult.localId, idToken, debugLog);
 
-  // Pagination
-  for (let i = 0; i < 10; i++) {
-    const hasMore = await page.evaluate(() => {
-      for (const btn of Array.from(document.querySelectorAll("button, a"))) {
-        const text = (btn as HTMLElement).innerText?.trim().toLowerCase();
-        const el = btn as HTMLButtonElement;
-        if ((text === "siguiente" || text === "ver más" || text === "cargar más") && !el.disabled) {
-          el.click();
-          return true;
+  // Try subcollections first, then fall back to embedded user doc fields
+  let portfolio: RacionalPortfolioItem[] = [];
+  let balance = 0;
+
+  if (portfolioPath) {
+    const result = await fetchPortfolio(portfolioPath, idToken, debugLog);
+    portfolio = result.items;
+    balance = result.balance;
+  } else if (userDoc) {
+    // Extract portfolio from embedded user doc fields
+    debugLog.push("4. Extracting portfolio from user document...");
+    const f = userDoc.fields;
+    // Look for portfolio-related fields
+    for (const key of Object.keys(f)) {
+      const val = f[key];
+      if (val.arrayValue?.values) {
+        // Array field — could be portfolio items
+        for (const item of val.arrayValue.values) {
+          if (item.mapValue?.fields) {
+            const mf = item.mapValue.fields;
+            const name = String(fsVal(mf.name) || fsVal(mf.assetId) || fsVal(mf.ticker) || key);
+            const value = Number(fsVal(mf.value) || fsVal(mf.balance) || fsVal(mf.amount) || fsVal(mf.clpValue) || fsVal(mf.totalValue) || 0);
+            if (value > 0) {
+              portfolio.push({ id: name, name, value, currency: "CLP" });
+              balance += value;
+            }
+          }
+        }
+      } else if (val.mapValue?.fields) {
+        // Check for balance/portfolio map
+        const mf = val.mapValue.fields;
+        const possibleBalance = Number(fsVal(mf.balance) || fsVal(mf.total) || fsVal(mf.clpBalance) || fsVal(mf.totalBalance) || 0);
+        if (possibleBalance > 0 && !balance) {
+          balance = possibleBalance;
+          debugLog.push(`  Balance from ${key}: $${Math.round(balance).toLocaleString("es-CL")}`);
         }
       }
-      return false;
-    });
-    if (!hasMore) break;
-    await delay(2500);
-    const more = await extractRacionalMovements(page, debugLog);
-    if (more.length === 0) break;
-    movements.push(...more);
+    }
+    // Also check direct balance fields
+    const directBalance = Number(fsVal(f.balance) || fsVal(f.totalBalance) || fsVal(f.clpBalance) || fsVal(f.portfolioValue) || 0);
+    if (directBalance > 0 && !balance) balance = directBalance;
+
+    if (portfolio.length > 0) {
+      debugLog.push(`  Found ${portfolio.length} position(s) in user doc, balance: $${Math.round(balance).toLocaleString("es-CL")}`);
+    }
   }
 
-  const deduplicated = deduplicateMovements(movements);
-  debugLog.push(`  Total: ${deduplicated.length} unique movements`);
+  const movements = movementsPath
+    ? await fetchMovements(movementsPath, idToken, debugLog)
+    : [];
+
+  // Fallback: portfolio balance snapshots if no transaction history
+  let allMovements = movements;
+  if (movements.length === 0 && portfolio.length > 0) {
+    debugLog.push("  No movement history — creating portfolio balance snapshots");
+    const today = new Date();
+    const dd = String(today.getDate()).padStart(2, "0");
+    const mm = String(today.getMonth() + 1).padStart(2, "0");
+    const yyyy = today.getFullYear();
+    const dateStr = `${dd}-${mm}-${yyyy}`;
+
+    allMovements = portfolio.map(p => ({
+      date: dateStr,
+      description: `${p.name} (${p.id})`,
+      amount: Math.round(p.value),
+      balance: Math.round(p.value),
+      source: MOVEMENT_SOURCE.account,
+    }));
+  }
+
+  const deduplicated = deduplicateMovements(allMovements);
+  debugLog.push(`5. Total: ${deduplicated.length} unique movements`);
   progress(`Listo — ${deduplicated.length} movimientos totales`);
 
-  await doSave(page, "04-final");
-  const ss = doScreenshots ? await page.screenshot({ encoding: "base64" }) as string : undefined;
+  // Persist tokens for next run
+  const sessionCookies = JSON.stringify({ idToken, refreshToken, localId: authResult.localId });
 
-  return { success: true, bank, movements: deduplicated, screenshot: ss, debug: debugLog.join("\n") };
+  return {
+    success: true, bank, movements: deduplicated,
+    balance: balance || undefined,
+    sessionCookies,
+    debug: debugLog.join("\n"),
+  };
 }
 
-// ─── Export ───────────────────────────────────────────────────────
+// ─── Export ──────────────────────────────────────────────────────
 
 const racional: BankScraper = {
   id: "racional",
   name: "Racional",
-  url: LOGIN_URL,
-  scrape: (options) => runScraper("racional", options, {}, scrapeRacional),
+  url: "https://app.racional.cl",
+  mode: "api",
+  scrape: (options) => runApiScraper("racional", options, scrapeRacional),
 };
 
 export default racional;

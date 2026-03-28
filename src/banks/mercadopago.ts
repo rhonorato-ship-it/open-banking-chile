@@ -1,412 +1,365 @@
-import type { Page } from "puppeteer-core";
 import type { BankMovement, BankScraper, ScrapeResult, ScraperOptions } from "../types.js";
 import { MOVEMENT_SOURCE } from "../types.js";
-import { closePopups, delay, parseChileanAmount, normalizeDate, deduplicateMovements } from "../utils.js";
-import { runScraper } from "../infrastructure/scraper-runner.js";
-import type { BrowserSession } from "../infrastructure/browser.js";
-import { detectLoginError } from "../actions/login.js";
-import { loadCookies, saveCookies } from "../infrastructure/cookies.js";
+import { normalizeDate, deduplicateMovements } from "../utils.js";
+import { runApiScraper } from "../infrastructure/api-runner.js";
 
-// ─── MercadoPago-specific constants ──────────────────────────────
+// ─── MercadoPago API constants ───────────────────────────────────
+//
+// MercadoPago has a public REST API at api.mercadopago.com.
+// Auth: OAuth2 with personal access token from mercadopago.cl/developers.
+// The password field accepts the APP_USR-... access token.
+//
+// IMPORTANT: The MercadoPago API is seller/merchant-oriented.
+// It shows payments received, not purchases made as a buyer.
+// Buyer-only accounts may return zero movements — this is an API limitation.
 
-// MercadoLibre Chile SSO — redirects to mercadopago.com.cl after login
-const LOGIN_URL = "https://www.mercadolibre.com/jms/mlc/lgz/msl/login/H4sIAAAAAAAAAzWOwQ6CMAxAf6XpOfUHgBpOxpuZV9MDwGCDJKwkLAfj34tuHtp37zWtrTNzP0MSdHXvnb2A0jToSaFzIDEMloFh5bT5VBxOzY_cDlBrFYGiiqJIcAFz2dPnBF8fh0d4P7tg04pKjlWkJ47wr2pJ5w5DDoFXqoFPdLbqT2q1J7hkHl6x2n9lWaFCsgAAAA/user-legal-id-social";
-const ACTIVITIES_URL = "https://www.mercadopago.cl/activities";
+const API_BASE = "https://api.mercadopago.com";
+const PAYMENTS_LIMIT = 100;
+const MAX_PAGES = 20;
+
+// ─── API types ───────────────────────────────────────────────────
+
+interface MpUser {
+  id: number;
+  site_id: string;
+  email: string;
+  first_name: string;
+  last_name: string;
+}
+
+interface MpBalance {
+  available_balance: number;
+  total_amount: number;
+  unavailable_balance: number;
+}
+
+interface MpPayment {
+  id: number;
+  date_created: string;
+  date_approved: string | null;
+  description: string;
+  transaction_amount: number;
+  currency_id: string;
+  status: string;
+  status_detail: string;
+  payment_type_id: string;
+  operation_type: string;
+}
+
+interface MpSearchResponse {
+  results: MpPayment[];
+  paging: { total: number; limit: number; offset: number };
+}
+
+interface MpSessionData {
+  access_token: string;
+  refresh_token?: string;
+  expires_at?: number;
+  user_id?: number;
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────
 
-async function mercadopagoLogin(
-  page: Page,
-  identifier: string,
-  password: string,
-  debugLog: string[],
-  doSave: (page: Page, name: string) => Promise<void>,
-  onTwoFactorCode?: () => Promise<string>,
-): Promise<{ success: boolean; error?: string }> {
-  // Try to restore a saved session — if cookies are valid, skip the full login flow
-  debugLog.push("0. Loading saved cookies (if any)...");
-  const hadCookies = await loadCookies(page, "mercadopago");
-  if (hadCookies) {
-    debugLog.push("  Cookies loaded — checking if session is still valid...");
-    await page.goto(ACTIVITIES_URL, { waitUntil: "networkidle2", timeout: 30000 });
-    await delay(2000);
-    const urlAfterCookies = page.url();
-    if (!urlAfterCookies.includes("/login") && !urlAfterCookies.includes("/lgz/") && !urlAfterCookies.includes("mercadolibre.com/jms")) {
-      debugLog.push("  Session valid! Skipping login.");
-      return { success: true };
-    }
-    debugLog.push("  Session expired — proceeding with full login.");
+function parseTokenInput(password: string): MpSessionData {
+  // Try JSON first (session blob from previous run)
+  if (password.startsWith("{")) {
+    try {
+      return JSON.parse(password) as MpSessionData;
+    } catch { /* not JSON, treat as raw token */ }
   }
-
-  debugLog.push("1. Navigating to MercadoLibre login...");
-  await page.goto(LOGIN_URL, { waitUntil: "networkidle2", timeout: 60000 });
-  await delay(4000);
-  await doSave(page, "01-login-form");
-
-  // MercadoLibre login accepts RUN (RUT), email, or phone
-  // Andes design system: form fields use data-andes-* attributes
-  debugLog.push("2. Filling identifier (RUT/email/phone)...");
-  const identifierSelectors = [
-    "#user_id",
-    'input[name="user_id"]',
-    'input[id*="user_id"]',
-    'input[placeholder*="correo" i]',
-    'input[placeholder*="teléfono" i]',
-    'input[placeholder*="RUN" i]',
-    'input[placeholder*="rut" i]',
-    'input[type="email"]',
-    'input[type="text"]',
-  ];
-
-  let identifierFilled = false;
-  for (const sel of identifierSelectors) {
-    const el = await page.$(sel);
-    if (el) {
-      await el.click({ clickCount: 3 });
-      await el.type(identifier, { delay: 70 });
-      debugLog.push(`  Identifier field: ${sel}`);
-      identifierFilled = true;
-      break;
-    }
-  }
-  if (!identifierFilled) {
-    return { success: false, error: "No se encontró campo de usuario/RUT/email." };
-  }
-  await delay(500);
-
-  // MercadoLibre uses a two-step login (identifier → continue → password)
-  debugLog.push("3. Clicking Continue...");
-  const continueClicked = await page.evaluate(() => {
-    const btns = Array.from(document.querySelectorAll("button, input[type='submit']"));
-    for (const btn of btns) {
-      const text = (btn as HTMLElement).innerText?.trim().toLowerCase() || (btn as HTMLInputElement).value?.toLowerCase() || "";
-      if (text.includes("continuar") || text === "siguiente" || text === "next") {
-        (btn as HTMLElement).click();
-        return true;
-      }
-    }
-    // Fallback: first submit button
-    const submitBtn = document.querySelector('button[type="submit"]') as HTMLButtonElement | null;
-    if (submitBtn && !submitBtn.disabled) { submitBtn.click(); return true; }
-    return false;
-  });
-  if (!continueClicked) await page.keyboard.press("Enter");
-
-  await delay(4000);
-  await doSave(page, "02-after-identifier");
-
-  // MercadoLibre may show a verification method picker ("Elige un método de verificación")
-  // before the password field. Use Puppeteer's native click (not el.click() inside evaluate)
-  // so React synthetic event handlers fire correctly on Andes components.
-  debugLog.push("3b. Checking for verification method picker...");
-  let pickerClicked = false;
-  const candidateEls = await page.$$("a, button, li, [role='button'], [role='option'], [role='listitem']");
-  for (const el of candidateEls) {
-    const text = await el.evaluate(e => (e as HTMLElement).innerText?.trim().toLowerCase() || "");
-    if (text === "contraseña" || text.startsWith("contraseña")) {
-      await el.click();
-      pickerClicked = true;
-      debugLog.push("  Method picker found — clicked Contraseña (Puppeteer native click)");
-      break;
-    }
-  }
-  if (pickerClicked) {
-    await delay(3000);
-    await doSave(page, "02b-after-method-pick");
-  }
-
-  // Password field (shown after identifier step or after method selection)
-  debugLog.push("4. Filling password...");
-  const passEl = await page.$('#password, input[name="password"], input[type="password"]');
-  if (!passEl) {
-    return { success: false, error: "No se encontró campo de contraseña después del identificador." };
-  }
-  await passEl.click();
-  await passEl.type(password, { delay: 70 });
-  await delay(500);
-
-  // Submit login
-  debugLog.push("5. Submitting login...");
-  const submitted = await page.evaluate(() => {
-    const btns = Array.from(document.querySelectorAll("button, input[type='submit']"));
-    for (const btn of btns) {
-      const text = (btn as HTMLElement).innerText?.trim().toLowerCase() || (btn as HTMLInputElement).value?.toLowerCase() || "";
-      if (text.includes("ingresar") || text.includes("entrar") || text.includes("iniciar") || text.includes("continuar")) {
-        (btn as HTMLElement).click();
-        return true;
-      }
-    }
-    const submitBtn = document.querySelector('button[type="submit"]') as HTMLButtonElement | null;
-    if (submitBtn && !submitBtn.disabled) { submitBtn.click(); return true; }
-    return false;
-  });
-  if (!submitted) await page.keyboard.press("Enter");
-
-  try { await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 30000 }); } catch { await delay(5000); }
-  await delay(3000);
-  await doSave(page, "03-post-login");
-
-  // MercadoLibre may show a 2FA device-recognition challenge:
-  // "Usa un segundo método de verificación para confirmar que la cuenta te pertenece"
-  const needs2FA = await page.evaluate(() => {
-    const body = document.body?.innerText || "";
-    return body.includes("segundo método de verificación") || body.includes("verificar que eres tú");
-  });
-
-  if (needs2FA) {
-    debugLog.push("6. 2FA required — clicking Continuar...");
-    const continueClicked = await page.evaluate(() => {
-      const btns = Array.from(document.querySelectorAll("button, a"));
-      for (const btn of btns) {
-        const text = (btn as HTMLElement).innerText?.trim().toLowerCase() || "";
-        if (text === "continuar" || text === "continue") { (btn as HTMLElement).click(); return true; }
-      }
-      return false;
-    });
-    if (continueClicked) {
-      await delay(3000);
-      await doSave(page, "04-2fa-method-picker");
-
-      // Prefer email as the 2FA method — least friction for automated flows
-      const emailMethodClicked = await (async () => {
-        const els = await page.$$("a, button, li, [role='button'], [role='option'], [role='listitem']");
-        for (const el of els) {
-          const text = await el.evaluate(e => (e as HTMLElement).innerText?.trim().toLowerCase() || "");
-          if (text.startsWith("e-mail") || text.startsWith("email") || text.startsWith("correo")) {
-            await el.click();
-            return true;
-          }
-        }
-        return false;
-      })();
-
-      if (emailMethodClicked) {
-        debugLog.push("  Email 2FA selected — waiting for code...");
-        await delay(3000);
-        await doSave(page, "04b-2fa-code-input");
-
-        // Retrieve the 2FA code (via callback or interactive TTY prompt)
-        let code = "";
-        if (onTwoFactorCode) {
-          code = await onTwoFactorCode();
-        } else if (process.stdin.isTTY) {
-          code = await new Promise<string>((resolve) => {
-            process.stderr.write("\n🔐 MercadoPago: ingresa el código 2FA enviado a tu email: ");
-            process.stdin.once("data", (d) => resolve(d.toString().trim()));
-          });
-        }
-
-        if (code) {
-          const codeInput = await page.$('input[type="text"], input[type="number"], input[name*="code"], input[name*="otp"], input[placeholder*="código" i]');
-          if (codeInput) {
-            await codeInput.click({ clickCount: 3 });
-            await codeInput.type(code, { delay: 70 });
-            await delay(500);
-            // Submit the code
-            await page.evaluate(() => {
-              const btns = Array.from(document.querySelectorAll("button[type='submit'], button"));
-              for (const btn of btns) {
-                const text = (btn as HTMLElement).innerText?.trim().toLowerCase() || "";
-                if (text.includes("confirmar") || text.includes("verificar") || text === "continuar") {
-                  (btn as HTMLElement).click(); return;
-                }
-              }
-              (document.querySelector('button[type="submit"]') as HTMLButtonElement | null)?.click();
-            });
-            try { await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 30000 }); } catch { await delay(5000); }
-            await delay(2000);
-            await doSave(page, "05-post-2fa");
-          }
-        }
-      } else {
-        // Non-automatable 2FA (QR code, facial recognition).
-        // In headful mode: wait up to 2 min for the user to complete it manually.
-        // The browser window is visible — the user scans the QR with the MercadoLibre app.
-        const isHeadful = !!(process.env.MERCADOPAGO_HEADFUL || (page as unknown as { _target?: unknown })._target);
-        if (process.stderr.isTTY) {
-          process.stderr.write(
-            "\n🔐 MercadoPago requiere verificación QR o facial.\n" +
-            "   Completa la verificación en la ventana del navegador (si usaste --headful).\n" +
-            "   Esperando hasta 2 minutos...\n"
-          );
-        }
-        debugLog.push("  Waiting up to 2min for manual 2FA (QR/facial)...");
-        try {
-          // waitForNavigation is safer here than waitForFunction — avoids "context destroyed" errors
-          await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 120000 });
-          await delay(2000);
-          await doSave(page, "05-post-manual-2fa");
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          // "Execution context was destroyed" means a navigation happened — treat as success
-          if (msg.includes("context was destroyed") || msg.includes("detached")) {
-            await delay(2000);
-            await doSave(page, "05-post-manual-2fa");
-          } else {
-            await doSave(page, "04-2fa-timeout");
-            return { success: false, error: "Tiempo de espera agotado para 2FA. Corre con --headful para completar QR manualmente la primera vez." };
-          }
-        }
-      }
-    }
-  }
-
-  const loginError = await detectLoginError(page);
-  if (loginError) return { success: false, error: `Error del banco: ${loginError}` };
-
-  const url = page.url();
-  if (url.includes("/login") || url.includes("/lgz/") || url.includes("mercadolibre.com/jms")) {
-    return { success: false, error: "Login no completado — requiere 2FA manual." };
-  }
-
-  // Save session cookies so subsequent runs skip the login/2FA flow
-  await saveCookies(page, "mercadopago");
-  debugLog.push("6. Login OK! Session cookies saved.");
-  return { success: true };
+  // Raw APP_USR-... token
+  return { access_token: password };
 }
 
-async function extractMercadopagoMovements(page: Page, debugLog: string[]): Promise<BankMovement[]> {
-  // Navigate to activities/movements page
-  const currentUrl = page.url();
-  if (!currentUrl.includes("mercadopago") && !currentUrl.includes("activities")) {
-    debugLog.push(`  Navigating to activities (from ${currentUrl})...`);
-    await page.goto(ACTIVITIES_URL, { waitUntil: "networkidle2", timeout: 30000 });
-    await delay(4000);
-  }
-
-  // Dismiss any auth/consent prompts
-  await closePopups(page);
-  await delay(1000);
-
-  const raw = await page.evaluate(() => {
-    const results: Array<{ date: string; description: string; amount: string; balance: string }> = [];
-
-    // Strategy 1: Andes design system rows — data-andes attributes
-    const andesRows = document.querySelectorAll(
-      '[data-testid*="activity"], [data-testid*="movement"], [data-testid*="transaction"], [class*="activity-row"], [class*="movement-row"]'
-    );
-    for (const row of Array.from(andesRows)) {
-      const text = (row as HTMLElement).innerText || "";
-      const dateMatch = text.match(/\d{1,2}\s+(?:ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)[a-z]*\.?\s*\d{0,4}|(\d{4}-\d{2}-\d{2})|(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/i);
-      const amountMatch = text.match(/[+\-]?\s*\$\s*[\d.,]+/);
-      if (dateMatch && amountMatch) {
-        const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
-        const desc = lines.find(l => l !== dateMatch[0] && !l.match(/^\$/) && !l.match(/^[+\-]/) && l.length > 2) || "";
-        results.push({ date: dateMatch[0], description: desc, amount: amountMatch[0], balance: "" });
-      }
-    }
-
-    // Strategy 2: General table-based extraction
-    if (results.length === 0) {
-      for (const table of Array.from(document.querySelectorAll("table"))) {
-        const rows = Array.from(table.querySelectorAll("tr"));
-        for (const row of rows) {
-          const cells = Array.from(row.querySelectorAll("td"));
-          if (cells.length < 2) continue;
-          const texts = cells.map(c => (c as HTMLElement).innerText?.trim() || "");
-          const dateIdx = texts.findIndex(t => /\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}/.test(t));
-          const amountIdx = texts.findIndex(t => /[+\-]?\$[\d.,]+/.test(t));
-          if (dateIdx >= 0 && amountIdx >= 0) {
-            const desc = texts.find((t, i) => i !== dateIdx && i !== amountIdx && t.length > 2) || "";
-            results.push({ date: texts[dateIdx], description: desc, amount: texts[amountIdx], balance: "" });
-          }
-        }
-      }
-    }
-
-    // Strategy 3: List items / cards
-    if (results.length === 0) {
-      const cards = document.querySelectorAll("li, article, [class*='card'], [class*='item']");
-      for (const card of Array.from(cards)) {
-        const text = (card as HTMLElement).innerText || "";
-        const dateMatch = text.match(/\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}/);
-        const amountMatch = text.match(/[+\-]?\s*\$\s*[\d.,]+/);
-        if (dateMatch && amountMatch && text.length < 300) {
-          const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
-          const desc = lines.find(l => l !== dateMatch[0] && !l.match(/^\$/) && l.length > 2) || "";
-          results.push({ date: dateMatch[0], description: desc, amount: amountMatch[0], balance: "" });
-        }
-      }
-    }
-
-    return results;
+async function mpGet<T>(token: string, path: string, params?: Record<string, string>): Promise<T> {
+  const url = new URL(`${API_BASE}${path}`);
+  if (params) for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url.toString(), {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json",
+    },
   });
+  if (!res.ok) throw new Error(`MP GET ${path} → ${res.status} ${res.statusText}`);
+  return res.json() as Promise<T>;
+}
 
-  return raw
-    .map(r => {
-      const amount = parseChileanAmount(r.amount);
-      if (amount === 0) return null;
-      return {
-        date: normalizeDate(r.date),
-        description: r.description,
-        amount,
+async function mpPost<T>(token: string, path: string, body: unknown): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`MP POST ${path} → ${res.status} ${res.statusText}`);
+  return res.json() as Promise<T>;
+}
+
+// ─── Data fetchers ───────────────────────────────────────────────
+
+async function fetchUserInfo(token: string, debugLog: string[]): Promise<MpUser> {
+  debugLog.push("1. Fetching user info...");
+  const user = await mpGet<MpUser>(token, "/users/me");
+  debugLog.push(`  User: ${user.first_name} ${user.last_name} (${user.email}), site: ${user.site_id}`);
+  return user;
+}
+
+async function fetchBalance(token: string, userId: number, debugLog: string[]): Promise<number | undefined> {
+  debugLog.push("2. Fetching account balance...");
+  try {
+    const balance = await mpGet<MpBalance>(token, `/users/${userId}/mercadopago_account/balance`);
+    debugLog.push(`  Available: $${balance.available_balance.toLocaleString("es-CL")}`);
+    return balance.available_balance;
+  } catch (err) {
+    debugLog.push(`  Balance not available: ${err instanceof Error ? err.message : String(err)}`);
+    return undefined;
+  }
+}
+
+async function fetchPayments(token: string, userId: number, debugLog: string[]): Promise<BankMovement[]> {
+  debugLog.push("3. Searching payments...");
+  const movements: BankMovement[] = [];
+  let offset = 0;
+
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const res = await mpGet<MpSearchResponse>(token, "/v1/payments/search", {
+      "collector.id": String(userId),
+      sort: "date_created",
+      criteria: "desc",
+      limit: String(PAYMENTS_LIMIT),
+      offset: String(offset),
+    });
+
+    for (const p of res.results) {
+      if (p.status !== "approved") continue;
+      const dateStr = p.date_approved || p.date_created;
+      const date = normalizeDate(dateStr.split("T")[0]);
+      const isIncoming = p.operation_type === "regular_payment" || p.operation_type === "money_transfer";
+      movements.push({
+        date,
+        description: p.description || `${p.payment_type_id} #${p.id}`,
+        amount: isIncoming ? Math.abs(p.transaction_amount) : -Math.abs(p.transaction_amount),
         balance: 0,
         source: MOVEMENT_SOURCE.account,
-      } as BankMovement;
-    })
-    .filter(Boolean) as BankMovement[];
+      });
+    }
+
+    debugLog.push(`  Page ${page + 1}: ${res.results.length} payments (${res.results.filter(p => p.status === "approved").length} approved)`);
+
+    offset += res.paging.limit;
+    if (offset >= res.paging.total || res.results.length === 0) break;
+  }
+
+  return movements;
 }
 
-// ─── Main scrape function ─────────────────────────────────────────
+async function fetchSettlementMovements(token: string, debugLog: string[]): Promise<BankMovement[]> {
+  debugLog.push("4. Generating settlement report...");
+  const now = new Date();
+  const from = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
+  const formatDate = (d: Date) => d.toISOString().split("T")[0] + "T00:00:00Z";
 
-async function scrapeMercadopago(session: BrowserSession, options: ScraperOptions): Promise<ScrapeResult> {
-  const { rut: identifier, password, saveScreenshots: doScreenshots, onProgress } = options;
-  const { page, debugLog, screenshot: doSave } = session;
+  let reportFile: string;
+  try {
+    const report = await mpPost<{ id: number; file_name: string; status: string }>(token, "/v1/account/settlement_report", {
+      begin_date: formatDate(from),
+      end_date: formatDate(now),
+    });
+    reportFile = report.file_name;
+    debugLog.push(`  Report generated: ${reportFile}`);
+  } catch (err) {
+    // Settlement reports may not be available for non-seller accounts
+    debugLog.push(`  Settlement report not available: ${err instanceof Error ? err.message : String(err)}`);
+    return [];
+  }
+
+  // Download CSV
+  try {
+    const csvRes = await fetch(`${API_BASE}/v1/account/settlement_report/${reportFile}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!csvRes.ok) {
+      debugLog.push(`  Report download failed: ${csvRes.status}`);
+      return [];
+    }
+    const csv = await csvRes.text();
+    return parseSettlementCsv(csv, debugLog);
+  } catch (err) {
+    debugLog.push(`  Report download error: ${err instanceof Error ? err.message : String(err)}`);
+    return [];
+  }
+}
+
+function parseSettlementCsv(csv: string, debugLog: string[]): BankMovement[] {
+  const lines = csv.split("\n").filter(l => l.trim());
+  if (lines.length < 2) return [];
+
+  // Detect delimiter (MercadoPago uses ; in some locales, , in others)
+  const header = lines[0];
+  const delim = header.includes(";") ? ";" : ",";
+  const cols = header.split(delim).map(c => c.trim().replace(/^"|"$/g, ""));
+
+  const dateIdx = cols.findIndex(c => c === "DATE" || c === "FECHA");
+  const descIdx = cols.findIndex(c => c === "DESCRIPTION" || c === "DESCRIPCION");
+  const creditIdx = cols.findIndex(c => c === "NET_CREDIT" || c.includes("CREDIT"));
+  const debitIdx = cols.findIndex(c => c === "NET_DEBIT" || c.includes("DEBIT"));
+  const typeIdx = cols.findIndex(c => c === "RECORD_TYPE" || c === "TIPO_REGISTRO");
+
+  if (dateIdx < 0 || (creditIdx < 0 && debitIdx < 0)) {
+    debugLog.push("  CSV columns not recognized");
+    return [];
+  }
+
+  const movements: BankMovement[] = [];
+  for (let i = 1; i < lines.length; i++) {
+    const fields = lines[i].split(delim).map(f => f.trim().replace(/^"|"$/g, ""));
+    // Skip summary/total/initial rows
+    if (typeIdx >= 0) {
+      const rt = fields[typeIdx]?.toLowerCase() || "";
+      if (rt === "initial" || rt === "total" || rt === "inicial") continue;
+    }
+
+    const rawDate = fields[dateIdx] || "";
+    const date = normalizeDate(rawDate.split("T")[0]);
+    if (!date || date === "Invalid") continue;
+
+    const credit = parseFloat((fields[creditIdx] || "0").replace(/,/g, "")) || 0;
+    const debit = parseFloat((fields[debitIdx] || "0").replace(/,/g, "")) || 0;
+    const amount = credit - debit;
+    if (amount === 0) continue;
+
+    movements.push({
+      date,
+      description: fields[descIdx] || "Movimiento MercadoPago",
+      amount,
+      balance: 0,
+      source: MOVEMENT_SOURCE.account,
+    });
+  }
+
+  debugLog.push(`  Parsed ${movements.length} movements from CSV`);
+  return movements;
+}
+
+// ─── Token refresh ───────────────────────────────────────────────
+
+async function refreshTokenIfNeeded(session: MpSessionData, debugLog: string[]): Promise<MpSessionData> {
+  if (!session.refresh_token) return session;
+
+  const clientId = process.env.MERCADOPAGO_CLIENT_ID;
+  const clientSecret = process.env.MERCADOPAGO_CLIENT_SECRET;
+  if (!clientId || !clientSecret) return session;
+
+  // Only refresh if expires_at is within 7 days
+  if (session.expires_at && session.expires_at > Date.now() + 7 * 24 * 60 * 60 * 1000) return session;
+
+  debugLog.push("0. Refreshing access token...");
+  try {
+    const res = await fetch(`${API_BASE}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({
+        grant_type: "refresh_token",
+        client_id: clientId,
+        client_secret: clientSecret,
+        refresh_token: session.refresh_token,
+      }),
+    });
+    if (res.ok) {
+      const data = await res.json() as { access_token: string; refresh_token: string; expires_in: number };
+      debugLog.push("  Token refreshed successfully");
+      return {
+        access_token: data.access_token,
+        refresh_token: data.refresh_token,
+        expires_at: Date.now() + data.expires_in * 1000,
+        user_id: session.user_id,
+      };
+    }
+    debugLog.push(`  Refresh failed: ${res.status} — using existing token`);
+  } catch { /* use existing token */ }
+  return session;
+}
+
+// ─── Main scrape function ────────────────────────────────────────
+
+async function scrapeMercadopago(options: ScraperOptions, debugLog: string[]): Promise<ScrapeResult> {
+  const { rut: _identifier, password, onProgress } = options;
   const bank = "mercadopago";
   const progress = onProgress || (() => {});
 
-  progress("Abriendo MercadoPago...");
-  const loginResult = await mercadopagoLogin(page, identifier, password, debugLog, doSave, options.onTwoFactorCode);
-  if (!loginResult.success) {
-    const ss = await page.screenshot({ encoding: "base64" });
-    return { success: false, bank, movements: [], error: loginResult.error, screenshot: ss as string, debug: debugLog.join("\n") };
+  if (!password || (!password.startsWith("APP_USR") && !password.startsWith("{"))) {
+    return {
+      success: false, bank, movements: [],
+      error: "MercadoPago requiere un access token (APP_USR-...) de mercadopago.cl/developers/panel/app. Usa ese token como contraseña.",
+      debug: debugLog.join("\n"),
+    };
+  }
+
+  let session = parseTokenInput(password);
+  session = await refreshTokenIfNeeded(session, debugLog);
+  const token = session.access_token;
+
+  progress("Conectando con MercadoPago API...");
+  let user: MpUser;
+  try {
+    user = await fetchUserInfo(token, debugLog);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const hint = msg.includes("401") ? " Token inválido o expirado. Genera uno nuevo en mercadopago.cl/developers." : "";
+    return { success: false, bank, movements: [], error: `Error de autenticación: ${msg}.${hint}`, debug: debugLog.join("\n") };
+  }
+
+  if (user.site_id !== "MLC") {
+    debugLog.push(`  Warning: site_id is ${user.site_id}, expected MLC (Chile)`);
   }
 
   progress("Sesión iniciada correctamente");
-  await closePopups(page);
-  await delay(2000);
 
-  progress("Extrayendo movimientos...");
-  debugLog.push("7. Extracting movements...");
-  const movements = await extractMercadopagoMovements(page, debugLog);
+  // Fetch data in parallel (balance is independent, payments + settlement can overlap)
+  const [balanceResult, paymentsResult, settlementResult] = await Promise.allSettled([
+    fetchBalance(token, user.id, debugLog),
+    fetchPayments(token, user.id, debugLog),
+    fetchSettlementMovements(token, debugLog),
+  ]);
 
-  // Load more / pagination
-  for (let i = 0; i < 10; i++) {
-    const hasMore = await page.evaluate(() => {
-      for (const btn of Array.from(document.querySelectorAll("button, a"))) {
-        const text = (btn as HTMLElement).innerText?.trim().toLowerCase();
-        const el = btn as HTMLButtonElement;
-        if ((text === "ver más" || text === "cargar más" || text?.includes("más movimientos") || text?.includes("ver todos")) && !el.disabled) {
-          el.click();
-          return true;
-        }
-      }
-      return false;
-    });
-    if (!hasMore) break;
-    await delay(2500);
-    const more = await extractMercadopagoMovements(page, debugLog);
-    if (more.length === 0) break;
-    movements.push(...more);
+  const balance = balanceResult.status === "fulfilled" ? balanceResult.value : undefined;
+  const payments = paymentsResult.status === "fulfilled" ? paymentsResult.value : [];
+  const settlements = settlementResult.status === "fulfilled" ? settlementResult.value : [];
+
+  if (paymentsResult.status === "rejected") debugLog.push(`  Payments error: ${paymentsResult.reason}`);
+  if (settlementResult.status === "rejected") debugLog.push(`  Settlement error: ${settlementResult.reason}`);
+
+  const allMovements = deduplicateMovements([...payments, ...settlements]);
+  debugLog.push(`5. Total: ${allMovements.length} unique movements`);
+
+  if (allMovements.length === 0) {
+    debugLog.push("  Note: 0 movements may be normal for buyer-only accounts — the MercadoPago API only shows seller/wallet activity.");
   }
 
-  const deduplicated = deduplicateMovements(movements);
-  debugLog.push(`  Total: ${deduplicated.length} unique movements`);
-  progress(`Listo — ${deduplicated.length} movimientos totales`);
+  progress(`Listo — ${allMovements.length} movimientos totales`);
 
-  await doSave(page, "05-final");
-  const ss = doScreenshots ? await page.screenshot({ encoding: "base64" }) as string : undefined;
+  // Persist session for token refresh on next run
+  const sessionCookies = JSON.stringify({
+    access_token: session.access_token,
+    refresh_token: session.refresh_token,
+    expires_at: session.expires_at,
+    user_id: user.id,
+  });
 
-  return { success: true, bank, movements: deduplicated, screenshot: ss, debug: debugLog.join("\n") };
+  return { success: true, bank, movements: allMovements, balance, sessionCookies, debug: debugLog.join("\n") };
 }
 
-// ─── Export ───────────────────────────────────────────────────────
+// ─── Export ──────────────────────────────────────────────────────
 
 const mercadopago: BankScraper = {
   id: "mercadopago",
   name: "MercadoPago",
   url: "https://www.mercadopago.cl",
-  scrape: (options) => runScraper("mercadopago", options, {}, scrapeMercadopago),
+  mode: "api",
+  scrape: (options) => runApiScraper("mercadopago", options, scrapeMercadopago),
 };
 
 export default mercadopago;
