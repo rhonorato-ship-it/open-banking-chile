@@ -1,303 +1,305 @@
-import type { Page, Frame } from "puppeteer-core";
 import type { BankMovement, BankScraper, ScrapeResult, ScraperOptions } from "../types.js";
 import { MOVEMENT_SOURCE } from "../types.js";
-import { delay, parseChileanAmount, normalizeDate, deduplicateMovements } from "../utils.js";
-import { runScraper } from "../infrastructure/scraper-runner.js";
-import type { BrowserSession } from "../infrastructure/browser.js";
+import { parseChileanAmount, normalizeDate, deduplicateMovements } from "../utils.js";
+import { runApiScraper } from "../infrastructure/api-runner.js";
 
-// Citi uses online.citi.com (global portal — Citibank sold Chilean retail to Scotiabank,
-// remaining CL users are redirected here).
-const LOGIN_URL = "https://www.citi.com";
+// ─── Citibank constants ─────────────────────────────────────────
+//
+// Auth: Form-based login at online.citi.com
+// Data: REST API for accounts, CSV download for movements
+// Note: ioBlackBox (ThreatMetrix) is NOT sent — we attempt login without it.
+//       If bot detection blocks us, the error will be clear.
+//
+// No browser needed — this scraper uses fetch() exclusively.
 
-// ─── Anti-detection ───────────────────────────────────────────
+const HOME_URL = "https://www.citi.com";
+const SIGNON_URL = "https://online.citi.com/US/login.do";
+const ACCOUNTS_URL = "https://online.citi.com/US/REST/accountsPanel/getCustomerAccounts.jws";
+const CSV_DOWNLOAD_URL = "https://online.citi.com/US/NCSC/dcd/StatementDownload.do";
 
-async function applyStealthPatches(page: Page): Promise<void> {
-  // Override navigator.webdriver (headless indicator)
-  await page.evaluateOnNewDocument(() => {
-    Object.defineProperty(navigator, "webdriver", { get: () => false });
-    // Spoof plugins length (0 in headless)
-    Object.defineProperty(navigator, "plugins", { get: () => ({ length: 5 }) });
-    // Spoof languages
-    Object.defineProperty(navigator, "languages", { get: () => ["es-CL", "es", "en-US", "en"] });
-  });
+const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+// ─── Cookie jar ─────────────────────────────────────────────────
+
+interface CookieJar {
+  cookies: Map<string, string>;
+  set(raw: string): void;
+  setAll(headers: Headers): void;
+  header(): string;
 }
 
-// ─── Login ────────────────────────────────────────────────────
+function createCookieJar(): CookieJar {
+  const cookies = new Map<string, string>();
+  return {
+    cookies,
+    set(raw: string) {
+      const [nameValue] = raw.split(";");
+      const eqIdx = nameValue.indexOf("=");
+      if (eqIdx > 0) cookies.set(nameValue.slice(0, eqIdx).trim(), nameValue.slice(eqIdx + 1).trim());
+    },
+    setAll(headers: Headers) {
+      const setCookies = headers.getSetCookie?.() ?? [];
+      for (const raw of setCookies) this.set(raw);
+    },
+    header() {
+      return Array.from(cookies.entries()).map(([k, v]) => `${k}=${v}`).join("; ");
+    },
+  };
+}
 
-async function getLoginFrame(page: Page): Promise<Frame | null> {
-  await delay(1500);
-  for (const frame of page.frames()) {
-    if (frame === page.mainFrame()) continue;
-    const hasUser = await frame.$('#username, [name="username"]').catch(() => null);
-    if (hasUser) return frame;
+// ─── HTML parsing helpers ───────────────────────────────────────
+
+/** Extract form action URL from HTML */
+function extractFormAction(html: string): string | null {
+  // Look for form with login-related attributes
+  const formMatch = html.match(/<form[^>]*action=["']([^"']+)["'][^>]*>/i);
+  return formMatch ? formMatch[1] : null;
+}
+
+/** Extract hidden input fields from HTML (CSRF tokens, etc.) */
+function extractHiddenFields(html: string): Record<string, string> {
+  const fields: Record<string, string> = {};
+  const regex = /<input[^>]*type=["']hidden["'][^>]*>/gi;
+  let match;
+  while ((match = regex.exec(html)) !== null) {
+    const tag = match[0];
+    const nameMatch = tag.match(/name=["']([^"']+)["']/i);
+    const valueMatch = tag.match(/value=["']([^"']*?)["']/i);
+    if (nameMatch) {
+      fields[nameMatch[1]] = valueMatch ? valueMatch[1] : "";
+    }
+  }
+  return fields;
+}
+
+/** Check if HTML contains 2FA challenge indicators */
+function is2FAChallenge(html: string): boolean {
+  const lower = html.toLowerCase();
+  return (
+    lower.includes("verification code") ||
+    lower.includes("one-time") ||
+    lower.includes("verify your identity") ||
+    lower.includes("security code") ||
+    lower.includes("one time password") ||
+    lower.includes("otp") ||
+    lower.includes("we sent") ||
+    lower.includes("enter the code")
+  );
+}
+
+/** Check if HTML contains login error indicators */
+function extractLoginError(html: string): string | null {
+  const lower = html.toLowerCase();
+  const errorKeywords = ["incorrect", "invalid", "failed", "try again", "incorrecto", "no match", "wrong password", "locked", "suspended"];
+  for (const kw of errorKeywords) {
+    if (lower.includes(kw)) {
+      // Try to extract a more specific error message from common error containers
+      const errorMatch = html.match(/<(?:div|span|p)[^>]*(?:class|id)=["'][^"']*error[^"']*["'][^>]*>([\s\S]*?)<\/(?:div|span|p)>/i);
+      if (errorMatch) {
+        const text = errorMatch[1].replace(/<[^>]+>/g, "").trim();
+        if (text.length > 0 && text.length < 300) return text;
+      }
+      return `Login error detected (keyword: "${kw}")`;
+    }
   }
   return null;
 }
 
-async function waitForIoBlackBox(frame: Frame | Page, timeoutMs = 8000): Promise<boolean> {
-  // ioBlackBox is a hidden field populated by ThreatMetrix/LexisNexis JS.
-  // Submitting without it triggers bot detection — wait for it to be set.
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const val = await frame.evaluate(() => {
-      const el = document.querySelector<HTMLInputElement>('[name="ioBlackBox"], #ioBlackBox, input[id*="blackbox" i]');
-      return el?.value ?? "";
-    });
-    if (val.length > 10) return true;
-    await delay(300);
-  }
-  // Proceed anyway — some Citi pages don't use ioBlackBox
-  return false;
-}
+// ─── Login ──────────────────────────────────────────────────────
 
 async function citiLogin(
-  page: Page,
   username: string,
   password: string,
   debugLog: string[],
-  doSave: (page: Page, name: string) => Promise<void>,
-): Promise<{ success: boolean; error?: string }> {
-  await applyStealthPatches(page);
+  onTwoFactorCode?: () => Promise<string>,
+): Promise<{ success: true; jar: CookieJar } | { success: false; error: string }> {
+  const jar = createCookieJar();
 
-  debugLog.push("1. Navigating to Citi...");
-  await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
-  // Wait for Angular/ThreatMetrix SDK and ioBlackBox to initialize
-  await delay(7000);
-  await doSave(page, "01-citi-login");
-
-  debugLog.push("2. Looking for login form...");
-  const frame: Frame | Page = await getLoginFrame(page) ?? page;
-  debugLog.push(frame !== page ? "  Found login iframe" : "  Using main page");
-
-  // ── Step 1: username ──────────────────────────────────────
-  const userSelectors = ["#username", '[name="username"]', 'input[autocomplete="username"]'];
-  let userEl = null;
-  for (const sel of userSelectors) {
-    userEl = await frame.$(sel).catch(() => null);
-    if (userEl) { debugLog.push(`  Username field: ${sel}`); break; }
-  }
-  if (!userEl) {
-    await doSave(page, "02-citi-no-user-field");
-    return { success: false, error: "No se encontró campo de usuario. Usa --screenshots para diagnosticar." };
-  }
-
-  const userPos = await frame.evaluate((el: Element) => {
-    const r = el.getBoundingClientRect();
-    return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
-  }, userEl);
-
-  await page.mouse.move(userPos.x - 40, userPos.y - 20, { steps: 10 });
-  await delay(200);
-  await page.mouse.click(userPos.x, userPos.y);
-  await delay(500);
-  await page.keyboard.type(username, { delay: 100 });
-  await delay(600);
-  await doSave(page, "03-citi-username-typed");
-
-  // ── Check for 2-step: "Next" button before password ──────
-  const nextBtn = await frame.evaluate(() => {
-    const candidates = Array.from(document.querySelectorAll<HTMLButtonElement>("button, [type='submit']"));
-    return candidates.find((b) => /next|siguiente|continuar/i.test(b.textContent ?? "")) !== undefined;
+  // Step 1: GET home page for initial cookies
+  debugLog.push("1. Fetching Citi home page for initial cookies...");
+  const homeRes = await fetch(HOME_URL, {
+    headers: { "User-Agent": UA, Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" },
+    redirect: "follow",
   });
+  jar.setAll(homeRes.headers);
+  debugLog.push(`  Status: ${homeRes.status}, cookies: ${jar.cookies.size}`);
 
-  if (nextBtn) {
-    debugLog.push("  2-step login: clicking Next");
-    const nextPos = await frame.evaluate(() => {
-      const btn = Array.from(document.querySelectorAll<HTMLButtonElement>("button, [type='submit']"))
-        .find((b) => /next|siguiente|continuar/i.test(b.textContent ?? ""));
-      if (!btn) return null;
-      const r = btn.getBoundingClientRect();
-      return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
-    });
-    if (nextPos) {
-      const navPromise = page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => null);
-      await page.mouse.move(nextPos.x - 10, nextPos.y - 5, { steps: 5 });
-      await delay(150);
-      await page.mouse.click(nextPos.x, nextPos.y);
-      await navPromise;
-      await delay(3000);
-      await doSave(page, "03b-citi-after-next");
-    }
-  }
-
-  // ── Step 2: password ──────────────────────────────────────
-  const passSelectors = ["#password", '[name="password"]', 'input[type="password"]', 'input[autocomplete="current-password"]'];
-  let passEl = null;
-  for (const sel of passSelectors) {
-    passEl = await frame.$(sel).catch(() => null);
-    if (passEl) { debugLog.push(`  Password field: ${sel}`); break; }
-  }
-  if (!passEl) {
-    await doSave(page, "03-citi-no-pass-field");
-    return { success: false, error: "No se encontró campo de contraseña." };
-  }
-
-  const passPos = await frame.evaluate((el: Element) => {
-    const r = el.getBoundingClientRect();
-    return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
-  }, passEl);
-
-  await page.mouse.move(passPos.x - 20, passPos.y, { steps: 8 });
-  await page.mouse.click(passPos.x, passPos.y);
-  await delay(400);
-  await page.keyboard.type(password, { delay: 95 });
-
-  // Wait for ioBlackBox fingerprint to be populated before submitting
-  const ioBlackBoxReady = await waitForIoBlackBox(frame);
-  if (!ioBlackBoxReady) {
-    debugLog.push("  Warning: ioBlackBox did not populate before submit (continuing best effort)");
-  }
-  await delay(1500);
-  await doSave(page, "04-citi-pre-submit");
-  debugLog.push("3. Submitting...");
-
-  const btnPos = await frame.evaluate(() => {
-    const btn =
-      document.querySelector<HTMLButtonElement>("#signInBtn") ||
-      Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(
-        (b) => /sign on|sign in|ingresar|entrar/i.test(b.textContent ?? ""),
-      );
-    if (!btn) return null;
-    const r = btn.getBoundingClientRect();
-    return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
+  // Step 2: GET signon page to collect form details and additional cookies
+  debugLog.push("2. Fetching signon page...");
+  const signonRes = await fetch(SIGNON_URL, {
+    headers: {
+      "User-Agent": UA,
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      Cookie: jar.header(),
+      Referer: HOME_URL,
+    },
+    redirect: "follow",
   });
+  jar.setAll(signonRes.headers);
+  const signonHtml = await signonRes.text();
+  debugLog.push(`  Signon status: ${signonRes.status}, HTML length: ${signonHtml.length}`);
 
-  const navPromise = page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => null);
-  if (btnPos) {
-    await page.mouse.move(btnPos.x - 15, btnPos.y - 5, { steps: 6 });
-    await delay(150);
-    await page.mouse.click(btnPos.x, btnPos.y);
-    debugLog.push(`  Clicked Sign On at ${btnPos.x},${btnPos.y}`);
+  // Step 3: Parse form action and hidden fields
+  debugLog.push("3. Parsing login form...");
+  const formAction = extractFormAction(signonHtml);
+  const hiddenFields = extractHiddenFields(signonHtml);
+  debugLog.push(`  Form action: ${formAction || "(not found)"}`);
+  debugLog.push(`  Hidden fields: ${Object.keys(hiddenFields).join(", ") || "(none)"}`);
+
+  // Build login POST URL
+  let loginPostUrl: string;
+  if (formAction) {
+    loginPostUrl = formAction.startsWith("http") ? formAction : `https://online.citi.com${formAction}`;
   } else {
-    await page.keyboard.press("Enter");
-    debugLog.push("  Submit via Enter");
+    // Fallback: post to the signon URL itself
+    loginPostUrl = SIGNON_URL;
   }
-  await navPromise;
-  await delay(3000);
-  debugLog.push(`  URL after submit: ${page.url()}`);
-  await doSave(page, "05-citi-after-login");
 
-  // Check for auth errors
-  const errorText = await page.evaluate(() => {
-    const errorKw = ["incorrect", "invalid", "wrong", "failed", "incorrecto", "inválido", "no match", "try again"];
-    for (const sel of [".error", '[class*="error"]', '[role="alert"]', ".errorMessage", "#errorMsg"]) {
-      for (const el of Array.from(document.querySelectorAll(sel))) {
-        const txt = (el as HTMLElement).innerText?.trim();
-        if (txt && errorKw.some((kw) => txt.toLowerCase().includes(kw))) return txt;
+  // Step 4: POST credentials (form-urlencoded, NO ioBlackBox)
+  debugLog.push("4. Submitting credentials...");
+  const body = new URLSearchParams({
+    ...hiddenFields,
+    username: username,
+    password: password,
+  });
+  // Explicitly remove ioBlackBox if present in hidden fields (we skip it)
+  // But keep it empty if the form expects it
+  if (hiddenFields["ioBlackBox"] !== undefined) {
+    body.set("ioBlackBox", "");
+  }
+
+  const loginRes = await fetch(loginPostUrl, {
+    method: "POST",
+    headers: {
+      "User-Agent": UA,
+      "Content-Type": "application/x-www-form-urlencoded",
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      Cookie: jar.header(),
+      Referer: SIGNON_URL,
+      Origin: "https://online.citi.com",
+    },
+    body: body.toString(),
+    redirect: "manual",
+  });
+  jar.setAll(loginRes.headers);
+
+  const location = loginRes.headers.get("location") || "";
+  debugLog.push(`  Login response: ${loginRes.status}, Location: ${location}`);
+
+  // Step 5: Follow redirects collecting cookies
+  let finalHtml = "";
+  let currentUrl = "";
+
+  if (loginRes.status >= 300 && loginRes.status < 400 && location) {
+    debugLog.push("5. Following redirects...");
+    let redirectUrl: string | null = location.startsWith("http") ? location : `https://online.citi.com${location}`;
+    let redirectCount = 0;
+
+    while (redirectUrl && redirectCount < 10) {
+      redirectCount++;
+      const redirectRes: Response = await fetch(redirectUrl, {
+        headers: {
+          "User-Agent": UA,
+          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          Cookie: jar.header(),
+          Referer: SIGNON_URL,
+        },
+        redirect: "manual",
+      });
+      jar.setAll(redirectRes.headers);
+      currentUrl = redirectUrl;
+
+      const nextLocation: string = redirectRes.headers.get("location") || "";
+      if (redirectRes.status >= 300 && redirectRes.status < 400 && nextLocation) {
+        redirectUrl = nextLocation.startsWith("http") ? nextLocation : `https://online.citi.com${nextLocation}`;
+        debugLog.push(`  Redirect ${redirectCount}: ${redirectRes.status} -> ${redirectUrl}`);
+      } else {
+        finalHtml = await redirectRes.text();
+        debugLog.push(`  Final: ${redirectRes.status}, URL: ${currentUrl}, HTML length: ${finalHtml.length}`);
+        redirectUrl = null;
       }
     }
-    return null;
-  });
-  if (errorText) return { success: false, error: `Error de login: ${errorText}` };
-
-  const url = page.url();
-  if (url.includes("citi.com") && !url.includes("login") && !url.includes("signon") && !url.includes("www.citi.com/us")) {
-    debugLog.push("4. Login OK!");
-    return { success: true };
+  } else {
+    finalHtml = await loginRes.text();
+    currentUrl = loginPostUrl;
+    debugLog.push(`  No redirect, reading response body. HTML length: ${finalHtml.length}`);
   }
 
-  await doSave(page, "06-citi-stuck-login");
-  return { success: false, error: `Login no completado (URL: ${url}). Usa --screenshots para diagnosticar.` };
-}
-
-// ─── Extraction ───────────────────────────────────────────────
-
-async function extractMovements(page: Page, debugLog: string[], doSave: (page: Page, name: string) => Promise<void>): Promise<BankMovement[]> {
-  debugLog.push("5. Extracting movements...");
-  await delay(5000);
-  debugLog.push(`  Dashboard URL: ${page.url()}`);
-  await doSave(page, "07-citi-dashboard");
-
-  // Try known Citi transaction download endpoint first (CSV, most reliable)
-  const csvUrl = await tryCsvDownload(page, debugLog);
-  if (csvUrl.length > 0) return csvUrl;
-
-  // Fall back to DOM scraping
-  const links = await page.evaluate(() =>
-    Array.from(document.querySelectorAll("a[href]"))
-      .map((a) => ({ text: (a as HTMLElement).innerText?.trim().slice(0, 40), href: (a as HTMLAnchorElement).href }))
-      .filter((l) => l.text && l.href)
-      .slice(0, 25),
-  );
-  debugLog.push(`  Links: ${JSON.stringify(links)}`);
-
-  const movHrefs = links.filter((l) =>
-    l.href.includes("transaction") || l.href.includes("movement") ||
-    l.href.includes("account") || l.href.includes("activity"),
-  );
-  if (movHrefs.length > 0) {
-    debugLog.push(`  Navigating to: ${movHrefs[0].href}`);
-    await page.goto(movHrefs[0].href, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await delay(3000);
+  // Step 6: Check for login errors
+  const loginError = extractLoginError(finalHtml);
+  if (loginError) {
+    return { success: false, error: `Error de login: ${loginError}` };
   }
-  await doSave(page, "08-citi-movements");
 
-  const movements = await page.evaluate(() => {
-    const results: Array<{ date: string; description: string; amount: string; balance: string }> = [];
-    const rows = document.querySelectorAll("table tbody tr, .transaction-row, .movement-row, [class*='transaction']");
-    for (const row of rows) {
-      const cells = Array.from(row.querySelectorAll("td, .cell, [class*='cell']"));
-      if (cells.length < 3) continue;
-      const texts = cells.map((c) => (c as HTMLElement).innerText?.trim() || "");
-      const datePattern = /\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}/;
-      if (!datePattern.test(texts[0])) continue;
-      results.push({ date: texts[0], description: texts[1] || "", amount: texts[texts.length - 1], balance: texts[texts.length - 2] || "0" });
+  // Step 7: Check for 2FA challenge
+  if (is2FAChallenge(finalHtml)) {
+    debugLog.push("6. 2FA challenge detected");
+    if (!onTwoFactorCode) {
+      return { success: false, error: "Se requiere codigo 2FA pero no se proporciono callback onTwoFactorCode." };
     }
-    return results;
-  });
 
-  debugLog.push(`  Found ${movements.length} movements via DOM`);
-  return movements
-    .map((m) => ({
-      date: normalizeDate(m.date),
-      description: m.description,
-      amount: parseChileanAmount(m.amount),
-      balance: parseChileanAmount(m.balance),
-      source: MOVEMENT_SOURCE.account,
-    }))
-    .filter((m) => m.amount !== 0);
-}
+    const code = await onTwoFactorCode();
+    debugLog.push(`  2FA code received (length: ${code.length})`);
 
-async function tryCsvDownload(page: Page, debugLog: string[]): Promise<BankMovement[]> {
-  // Citi exposes a REST endpoint for account list and CSV download (documented in bankscrape reference)
-  try {
-    const accounts = await page.evaluate(async () => {
-      const res = await fetch("/US/REST/accountsPanel/getCustomerAccounts.jws", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-      });
-      if (!res.ok) return null;
-      return res.json();
+    // Find the 2FA form action and hidden fields
+    const twoFAAction = extractFormAction(finalHtml);
+    const twoFAHidden = extractHiddenFields(finalHtml);
+    const twoFAUrl = twoFAAction
+      ? (twoFAAction.startsWith("http") ? twoFAAction : `https://online.citi.com${twoFAAction}`)
+      : currentUrl;
+
+    const twoFABody = new URLSearchParams({
+      ...twoFAHidden,
+      // Common field names for 2FA code
+      otpCode: code,
+      verificationCode: code,
+      code: code,
     });
 
-    if (!accounts) return [];
-    debugLog.push(`  REST accounts: ${JSON.stringify(accounts).slice(0, 200)}`);
+    const twoFARes = await fetch(twoFAUrl, {
+      method: "POST",
+      headers: {
+        "User-Agent": UA,
+        "Content-Type": "application/x-www-form-urlencoded",
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        Cookie: jar.header(),
+        Referer: currentUrl,
+        Origin: "https://online.citi.com",
+      },
+      body: twoFABody.toString(),
+      redirect: "follow",
+    });
+    jar.setAll(twoFARes.headers);
+    const twoFAHtml = await twoFARes.text();
+    debugLog.push(`  2FA response: ${twoFARes.status}, HTML length: ${twoFAHtml.length}`);
 
-    // If accounts found, navigate to statement download
-    const downloadUrl = `/US/NCSC/dcd/StatementDownload.do`;
-    const today = new Date();
-    const from = new Date(today.getFullYear(), today.getMonth() - 3, 1);
-    const fmt = (d: Date) => `${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}/${d.getFullYear()}`;
-
-    const csvText = await page.evaluate(async (url: string, fromStr: string, toStr: string) => {
-      const params = new URLSearchParams({ fromDate: fromStr, toDate: toStr, downloadType: "CSV" });
-      const res = await fetch(`${url}?${params}`, { credentials: "include" });
-      if (!res.ok || !res.headers.get("content-type")?.includes("text")) return null;
-      return res.text();
-    }, downloadUrl, fmt(from), fmt(today));
-
-    if (!csvText) return [];
-    debugLog.push("  CSV download succeeded");
-    return parseCitiCsv(csvText);
-  } catch {
-    return [];
+    const twoFAError = extractLoginError(twoFAHtml);
+    if (twoFAError) {
+      return { success: false, error: `Error 2FA: ${twoFAError}` };
+    }
+    if (is2FAChallenge(twoFAHtml)) {
+      return { success: false, error: "Codigo 2FA rechazado o expirado." };
+    }
   }
+
+  // Check if we landed on a known post-login page
+  if (currentUrl.includes("login") || currentUrl.includes("signon")) {
+    // Might still be on login page
+    if (!finalHtml.includes("accountsPanel") && !finalHtml.includes("dashboard") && !finalHtml.includes("Welcome")) {
+      return { success: false, error: `Login no completado. URL final: ${currentUrl}. Posible bloqueo por ioBlackBox.` };
+    }
+  }
+
+  debugLog.push(`  Login OK! Cookies: ${jar.cookies.size}`);
+  return { success: true, jar };
 }
+
+// ─── CSV parsing ────────────────────────────────────────────────
 
 function parseCitiCsv(csv: string): BankMovement[] {
   const lines = csv.split("\n").filter((l) => l.trim());
   const movements: BankMovement[] = [];
+  // Skip header row
   for (const line of lines.slice(1)) {
     const cols = line.split(",").map((c) => c.trim().replace(/^"|"$/g, ""));
     if (cols.length < 4) continue;
@@ -311,61 +313,126 @@ function parseCitiCsv(csv: string): BankMovement[] {
   return movements;
 }
 
-// ─── Main ─────────────────────────────────────────────────────
+// ─── Data extraction ────────────────────────────────────────────
 
-async function scrapeCiti(session: BrowserSession, options: ScraperOptions): Promise<ScrapeResult> {
-  const { rut: username, password, onProgress } = options;
-  const { page, browser, debugLog, screenshot } = session;
-  const progress = onProgress || (() => {});
-
-  // Set up new-tab listener BEFORE login — Citi's interstitial opens a new tab
-  const newPagePromise = new Promise<Page>((resolve) => {
-    browser.once("targetcreated", async (target) => {
-      const newPage = await target.page();
-      if (newPage) resolve(newPage);
-    });
+async function fetchAccounts(jar: CookieJar, debugLog: string[]): Promise<unknown> {
+  debugLog.push("  Fetching accounts via REST...");
+  const res = await fetch(ACCOUNTS_URL, {
+    method: "POST",
+    headers: {
+      "User-Agent": UA,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      Cookie: jar.header(),
+      Referer: "https://online.citi.com/US/ag/dashboard",
+      Origin: "https://online.citi.com",
+    },
+    body: JSON.stringify({}),
   });
-
-  progress("Abriendo Citi...");
-  const loginResult = await citiLogin(page, username, password, debugLog, screenshot);
-  if (!loginResult.success) {
-    return { success: false, bank: "citi", movements: [], error: loginResult.error, debug: debugLog.join("\n") };
+  jar.setAll(res.headers);
+  if (!res.ok) {
+    debugLog.push(`  Accounts REST failed: ${res.status}`);
+    return null;
   }
-
-  // Handle interstitial new-tab
-  let activePage = page;
-  if (page.url().includes("interstitial") || page.isClosed()) {
-    debugLog.push("  Waiting for new tab from interstitial...");
-    try {
-      const newPage = await Promise.race([
-        newPagePromise,
-        new Promise<null>((_, reject) => setTimeout(() => reject(new Error("timeout")), 12000)),
-      ]) as Page | null;
-      if (newPage) {
-        activePage = newPage;
-        await delay(4000);
-        debugLog.push(`  New tab URL: ${activePage.url()}`);
-      }
-    } catch {
-      await delay(3000);
-    }
-  }
-
-  progress("Extrayendo movimientos...");
-  const movements = await extractMovements(activePage, debugLog, screenshot);
-  const deduplicated = deduplicateMovements(movements);
-  debugLog.push(`6. Total: ${deduplicated.length} movimientos`);
-  progress(`Listo — ${deduplicated.length} movimientos`);
-  return { success: true, bank: "citi", movements: deduplicated, debug: debugLog.join("\n") };
+  const data = await res.json();
+  debugLog.push(`  Accounts REST OK: ${JSON.stringify(data).slice(0, 200)}`);
+  return data;
 }
 
-// ─── Export ───────────────────────────────────────────────────
+async function downloadCsv(jar: CookieJar, debugLog: string[]): Promise<BankMovement[]> {
+  const today = new Date();
+  const from = new Date(today.getFullYear(), today.getMonth() - 3, 1);
+  const fmt = (d: Date) =>
+    `${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}/${d.getFullYear()}`;
+
+  const params = new URLSearchParams({
+    fromDate: fmt(from),
+    toDate: fmt(today),
+    downloadType: "CSV",
+  });
+
+  const url = `${CSV_DOWNLOAD_URL}?${params}`;
+  debugLog.push(`  Downloading CSV: ${url}`);
+
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": UA,
+      Accept: "text/csv,text/plain,*/*",
+      Cookie: jar.header(),
+      Referer: "https://online.citi.com/US/ag/dashboard",
+    },
+  });
+  jar.setAll(res.headers);
+
+  if (!res.ok) {
+    debugLog.push(`  CSV download failed: ${res.status}`);
+    return [];
+  }
+
+  const contentType = res.headers.get("content-type") || "";
+  if (!contentType.includes("text") && !contentType.includes("csv")) {
+    debugLog.push(`  CSV download returned unexpected content-type: ${contentType}`);
+    return [];
+  }
+
+  const csvText = await res.text();
+  debugLog.push(`  CSV download OK, length: ${csvText.length}`);
+  if (csvText.length < 10) {
+    debugLog.push("  CSV is empty or too short");
+    return [];
+  }
+
+  return parseCitiCsv(csvText);
+}
+
+// ─── Main scrape function ───────────────────────────────────────
+
+async function scrapeCiti(options: ScraperOptions, debugLog: string[]): Promise<ScrapeResult> {
+  const { rut: username, password, onProgress, onTwoFactorCode } = options;
+  const bank = "citi";
+  const progress = onProgress || (() => {});
+
+  // Login
+  progress("Conectando con Citibank API...");
+  const loginResult = await citiLogin(username, password, debugLog, onTwoFactorCode);
+  if (!loginResult.success) {
+    return { success: false, bank, movements: [], error: loginResult.error, debug: debugLog.join("\n") };
+  }
+
+  const { jar } = loginResult;
+  progress("Sesion iniciada correctamente");
+
+  // Fetch accounts (informational — the CSV is our main data source)
+  debugLog.push("7. Fetching account data...");
+  progress("Obteniendo cuentas...");
+  await fetchAccounts(jar, debugLog);
+
+  // Download CSV with movements
+  debugLog.push("8. Downloading CSV movements...");
+  progress("Descargando movimientos...");
+  const csvMovements = await downloadCsv(jar, debugLog);
+  debugLog.push(`  CSV movements: ${csvMovements.length}`);
+
+  const deduplicated = deduplicateMovements(csvMovements);
+  debugLog.push(`9. Total: ${deduplicated.length} unique movements`);
+  progress(`Listo -- ${deduplicated.length} movimientos`);
+
+  return {
+    success: true,
+    bank,
+    movements: deduplicated,
+    debug: debugLog.join("\n"),
+  };
+}
+
+// ─── Export ─────────────────────────────────────────────────────
 
 const citi: BankScraper = {
   id: "citi",
   name: "Citibank",
   url: "https://www.citi.com",
-  scrape: (options) => runScraper("citi", options, {}, scrapeCiti),
+  mode: "api",
+  scrape: (options) => runApiScraper("citi", options, scrapeCiti),
 };
 
 export default citi;
