@@ -18,7 +18,7 @@ function stringToPhase(msg: string): Phase {
 }
 
 /** Hard timeouts per scraper mode. API scrapers are fetch-only and should be fast. Browser scrapers need time for page loads + 2FA. */
-const TIMEOUT_API_MS = 30_000;      // 30s for API mode (fetch calls + movement storage)
+const TIMEOUT_API_MS = 90_000;      // 90s for API mode (may include browser fallback for Cloudflare)
 const TIMEOUT_BROWSER_MS = 120_000; // 120s for browser mode (page loads, 2FA waits)
 
 export async function GET(req: Request, { params }: { params: Promise<{ bankId: string }> }) {
@@ -125,26 +125,29 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
 
         send({ phase: 1, label: "Iniciando conexión", message: "Abriendo sesión segura" });
 
-        // ── Browser setup (only for non-API scrapers) ────────────
-        const needsBrowser = bank.mode !== "api";
+        // ── Browser setup ──────────────────────────────────────────
+        // Always prepare browser options — even API-mode scrapers may need
+        // a browser fallback when Cloudflare/Imperva blocks HTTP login.
         let chromePath: string | undefined;
         let launchArgs: string[] | undefined;
         let remoteCDP: string | undefined;
-        if (needsBrowser) {
-          // Prefer remote browser service (full Chrome, no bot detection issues)
-          const browserWsUrl = process.env.BROWSER_WS_URL;
-          const browserbaseKey = process.env.BROWSERBASE_API_KEY;
 
-          if (browserWsUrl) {
-            remoteCDP = browserWsUrl;
-          } else if (browserbaseKey) {
-            remoteCDP = `wss://connect.browserbase.com?apiKey=${browserbaseKey}`;
-          } else {
-            // Fallback: local @sparticuz/chromium (headless-shell, may be blocked by bot protection)
+        const browserWsUrl = process.env.BROWSER_WS_URL;
+        const browserbaseKey = process.env.BROWSERBASE_API_KEY;
+
+        if (browserWsUrl) {
+          remoteCDP = browserWsUrl;
+        } else if (browserbaseKey) {
+          remoteCDP = `wss://connect.browserbase.com?apiKey=${browserbaseKey}`;
+        } else {
+          // Fallback: local @sparticuz/chromium (free, already bundled)
+          try {
             const chromium = (await import("@sparticuz/chromium")).default;
             chromePath = await chromium.executablePath();
             launchArgs = chromium.args.filter((a: string) => !a.startsWith("--headless"));
             launchArgs.push("--headless=shell");
+          } catch {
+            // @sparticuz/chromium not available — browser fallback will fail gracefully
           }
         }
 
@@ -225,7 +228,7 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
           },
         });
 
-        const timeoutMs = needsBrowser ? TIMEOUT_BROWSER_MS : TIMEOUT_API_MS;
+        const timeoutMs = bank.mode !== "api" ? TIMEOUT_BROWSER_MS : TIMEOUT_API_MS;
         let scrapeTimerId: ReturnType<typeof setTimeout> | undefined;
         const timeoutPromise = new Promise<never>((_, reject) => {
           scrapeTimerId = setTimeout(() => reject(new Error("SCRAPE_TIMEOUT")), timeoutMs);
