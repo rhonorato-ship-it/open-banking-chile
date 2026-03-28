@@ -19,6 +19,14 @@ Open source framework for extracting movements and balances from Chilean banks a
 Banks:
 - Banco de Chile (`bchile`) — Spring Security login + REST API with XSRF cookie jar
 - Banco Edwards (`edwards`) — delegates to bchile (same portal: `portalpersonas.bancochile.cl`)
+- BCI (`bci`) — JSF form login with ViewState CSRF + HTML table parsing. Data endpoints need live testing.
+- BancoEstado (`bestado`) — cookie jar auth. Akamai TLS fingerprint may block Node.js fetch; returns helpful error if blocked.
+- BICE (`bice`) — Keycloak OIDC token exchange at `auth.bice.cl` + cookie jar. Data endpoints need live testing.
+- Citibank (`citi`) — cookie jar login (ioBlackBox sent empty). REST at `/US/REST/accountsPanel/getCustomerAccounts.jws` + CSV download.
+- Banco Falabella (`falabella`) — cookie jar auth + REST API for account and CMR credit card data. Endpoints need live testing.
+- Itaú (`itau`) — WPS portal cookie jar + HTML parsing. Imperva may block; returns helpful error if blocked.
+- Santander (`santander`) — cookie jar auth via login iframe endpoint + REST API. Multi-account + CC support.
+- Scotiabank (`scotiabank`) — cookie jar auth + REST API. Historical periods via `SCOTIABANK_MONTHS` env var.
 
 WealthTech:
 - Fintual (`fintual`) — public REST API at `https://fintual.cl/api-docs`
@@ -29,15 +37,7 @@ PayTech:
 
 **Browser mode** (requires Puppeteer):
 
-Banks:
-- BCI (`bci`) — legacy JSF iframes, BCI Pass 2FA
-- BancoEstado (`bestado`) — requires `forceHeadful: true` (Akamai bot protection)
-- BICE (`bice`) — Keycloak OIDC at `auth.bice.cl`, direct portal at `portalpersonas.bice.cl`
-- Citibank (`citi`) — ThreatMetrix `ioBlackBox` fingerprinting, REST API partially wired
-- Banco Falabella (`falabella`) — Shadow DOM CMR credit card component
-- Itaú (`itau`) — Imperva bot protection, IBM WPS portal
-- Santander (`santander`) — Angular SPA, push 2FA
-- Scotiabank (`scotiabank`) — Shadow DOM Web Components
+None — all institutions migrated to API mode. Some may fall back to requiring browser if anti-bot protections block Node.js fetch (BancoEstado/Akamai, Itaú/Imperva, BCI/JSF, Citi/ioBlackBox).
 
 ---
 
@@ -86,13 +86,14 @@ Banks:
 
 **Web app 2FA flow**: When a scraper requests a code, the SSE endpoint sends `requires_2fa: true`. The frontend shows a code input field. The user types the code and submits it to `POST /api/2fa`, which writes to the `pending_2fa` Supabase table. The SSE route polls this table every 2 seconds for up to 90 seconds.
 
-### Institutions that should NOT use Chromium on Vercel (bot protection)
+### Institutions with anti-bot protections (may block API mode)
 
-These banks have Imperva, Incapsula, or similar bot detection that blocks headless Chrome. They will fail on Vercel and should either be migrated to API or used with `--profile` locally:
+All banks are now API mode, but these have anti-bot measures that may block Node.js `fetch()`. Their scrapers detect the block and return helpful error messages suggesting `--profile` as fallback:
 
-- **Itaú** — Imperva blocks headless Chrome ("No pudimos validar tu acceso")
-- **BICE** — Homepage returns 403 to non-browser requests
-- **BancoEstado** — Requires `forceHeadful: true` (TLS fingerprinting)
+- **Itaú** — Imperva bot protection. Scraper detects "No pudimos validar tu acceso" and suggests `--profile`.
+- **BancoEstado** — Akamai TLS fingerprinting. Scraper detects 403/captcha and suggests `--headful --profile`.
+- **Citi** — ThreatMetrix ioBlackBox. Scraper sends empty ioBlackBox; if login fails, suggests browser mode.
+- **BCI** — JSF ViewState. Server-rendered portal may reject non-browser requests.
 
 ### Key files
 
@@ -183,6 +184,7 @@ src/
     browser.ts             — Centralized browser launch, session management, anti-detection, userDataDir
     scraper-runner.ts      — Browser-based execution pipeline: validate → launch → scrape → logout → cleanup
     api-runner.ts          — API-based execution pipeline: validate → fetch → return (no browser)
+    cookies.ts             — Session cookie persistence (save/load to filesystem for CLI, /tmp for Lambda)
   actions/
     login.ts               — Generic login (RUT formats, password, submit, error detection)
     navigation.ts          — DOM navigation (click by text, sidebars, banner dismissal)

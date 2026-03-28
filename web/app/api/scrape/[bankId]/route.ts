@@ -1,7 +1,6 @@
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
 
-import chromium from "@sparticuz/chromium";
 import { auth } from "@/lib/auth";
 import { supabase } from "@/lib/db";
 import { decrypt, encrypt } from "@/lib/credentials";
@@ -111,15 +110,14 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
         let chromePath: string | undefined;
         let launchArgs: string[] | undefined;
         if (needsBrowser) {
+          // Dynamic import — only load @sparticuz/chromium when a browser is needed.
+          // This avoids the ~45s cold-start penalty for API-mode scrapers.
+          const chromium = (await import("@sparticuz/chromium")).default;
           chromePath = await chromium.executablePath();
-          // @sparticuz/chromium bundles chrome-headless-shell. Its args include
-          // SwiftShader GPU emulation flags required in Lambda-style environments.
-          // Filter out the --headless flag — browser.ts sets headless: false when
-          // launchArgs is present so the flag embedded in the args takes effect.
           launchArgs = chromium.args.filter(
             (a: string) => !a.startsWith("--headless"),
           );
-          launchArgs.push("--headless=shell"); // explicit, no quoting issues
+          launchArgs.push("--headless=shell");
         }
 
         // Load stored browser cookies (if any) — avoids 2FA on repeat runs
