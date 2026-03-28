@@ -9,6 +9,7 @@ const NAV_LINKS = [
   { href: "/movements", label: "Movimientos" },
   { href: "/analytics", label: "Analítica" },
   { href: "/banks", label: "Cuentas" },
+  { href: "/agent", label: "Agente" },
 ];
 
 export default function Navigation() {

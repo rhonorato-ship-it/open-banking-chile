@@ -5,6 +5,8 @@ import { signOut } from "next-auth/react";
 import Link from "next/link";
 import Navigation from "@/components/Navigation";
 import ScrapeProgress from "@/components/ScrapeProgress";
+import ScrapeProgressRealtime from "@/components/ScrapeProgressRealtime";
+import { getSupabaseBrowser } from "@/lib/supabase-browser";
 
 interface BankStatus {
   id: string;
@@ -74,11 +76,14 @@ export default function DashboardPage() {
   const [summary, setSummary] = useState<DashboardSummary | null>(null);
   const [coach, setCoach] = useState<CoachRec[]>([]);
   const [scraping, setScraping] = useState<{ id: string; name: string } | null>(null);
+  const [scrapingTaskId, setScrapingTaskId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState<string | null>(null);
   const [agenticMode, setAgenticMode] = useState(true);
   const [gmailConnected, setGmailConnected] = useState(false);
   const [gmailLoading, setGmailLoading] = useState(true);
+  const [agentOnline, setAgentOnline] = useState(false);
+  const [agentBanks, setAgentBanks] = useState<string[]>([]);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   function showToast(msg: string) {
@@ -147,11 +152,58 @@ export default function DashboardPage() {
     }
   }
 
+  async function loadAgentPresence() {
+    try {
+      const sb = getSupabaseBrowser();
+      const { data } = await sb.from("agent_presence").select("last_heartbeat, banks").limit(1);
+      if (data && data.length > 0) {
+        const staleMs = Date.now() - new Date(data[0].last_heartbeat).getTime();
+        setAgentOnline(staleMs < 90_000);
+        setAgentBanks(data[0].banks ?? []);
+      }
+    } catch {
+      // agent_presence table may not exist yet
+    }
+  }
+
+  async function startAgentSync(bankId: string, bankName: string) {
+    try {
+      const sb = getSupabaseBrowser();
+      const { data, error } = await sb.from("sync_tasks").insert({
+        user_id: "", // will be set by RLS — or we pass it from session
+        bank_id: bankId,
+        status: "pending",
+      }).select("id").single();
+
+      if (error || !data) {
+        // Fallback to SSE
+        setScraping({ id: bankId, name: bankName });
+        return;
+      }
+
+      setScrapingTaskId(data.id);
+      setScraping({ id: bankId, name: bankName });
+    } catch {
+      // Fallback to SSE
+      setScraping({ id: bankId, name: bankName });
+    }
+  }
+
+  function handleSync(bankId: string, bankName: string) {
+    if (agentOnline && agentBanks.includes(bankId)) {
+      startAgentSync(bankId, bankName);
+    } else {
+      setScrapingTaskId(null);
+      setScraping({ id: bankId, name: bankName });
+    }
+  }
+
   useEffect(() => {
     loadBanks();
     loadSummary();
     loadCoach();
     loadGmailStatus();
+    loadAgentPresence();
   }, []);
 
   const connected = banks.filter((b) => b.connected);
@@ -243,7 +295,7 @@ export default function DashboardPage() {
 
                     <div className="flex gap-2 mt-auto">
                       <button
-                        onClick={() => setScraping({ id: b.id, name: b.name })}
+                        onClick={() => handleSync(b.id, b.name)}
                         className={`flex-1 py-2 rounded-xl ${theme.accent} text-white text-xs font-bold hover:opacity-90 transition-opacity`}
                       >
                         Sincronizar
@@ -484,7 +536,14 @@ export default function DashboardPage() {
         )}
       </main>
 
-      {scraping && (
+      {scraping && scrapingTaskId ? (
+        <ScrapeProgressRealtime
+          taskId={scrapingTaskId}
+          bankName={scraping.name}
+          onDone={() => { setScraping(null); setScrapingTaskId(null); loadBanks(); loadSummary(); loadCoach(); showToast(`${scraping.name} sincronizado`); }}
+          onError={(msg) => { setScraping(null); setScrapingTaskId(null); loadBanks(); }}
+        />
+      ) : scraping ? (
         <ScrapeProgress
           bankId={scraping.id}
           bankName={scraping.name}
@@ -492,7 +551,7 @@ export default function DashboardPage() {
           onDone={() => { setScraping(null); loadBanks(); loadSummary(); loadCoach(); showToast(`${scraping.name} sincronizado`); }}
           onError={() => { setScraping(null); loadBanks(); }}
         />
-      )}
+      ) : null}
 
       {/* Toast */}
       {toast && (

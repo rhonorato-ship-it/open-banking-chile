@@ -43,6 +43,15 @@ async function main() {
   const args = process.argv.slice(2);
   const flags = new Set(args.filter((a) => a.startsWith("--") || a.startsWith("-")));
 
+  // ── Serve command: launch local sync agent ──
+  if (args[0] === "serve") {
+    const { startAgent } = await import("./agent.js");
+    const tokenIdx = args.indexOf("--token");
+    const token = tokenIdx >= 0 ? args[tokenIdx + 1] : undefined;
+    await startAgent(token);
+    return;
+  }
+
   if (flags.has("--help") || flags.has("-h")) {
     const bankList = listBanks()
       .map((b) => `  ${b.id.padEnd(15)} ${b.name}`)
