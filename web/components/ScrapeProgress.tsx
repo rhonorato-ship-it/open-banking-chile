@@ -10,6 +10,7 @@ interface PhaseEvent {
   message?: string;
   done?: boolean;
   error?: boolean;
+  requires_2fa?: boolean;
 }
 
 interface Props {
@@ -33,7 +34,11 @@ export default function ScrapeProgress({ bankId, bankName, onDone, onError }: Pr
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [done, setDone] = useState(false);
   const [retryCount, setRetryCount] = useState(0);
+  const [needs2FA, setNeeds2FA] = useState(false);
+  const [twoFACode, setTwoFACode] = useState("");
+  const [submitting2FA, setSubmitting2FA] = useState(false);
   const esRef = useRef<EventSource | null>(null);
+  const codeInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     // Reset state on retry
@@ -41,6 +46,9 @@ export default function ScrapeProgress({ bankId, bankName, onDone, onError }: Pr
     setCurrentMessage("");
     setErrorMsg(null);
     setDone(false);
+    setNeeds2FA(false);
+    setTwoFACode("");
+    setSubmitting2FA(false);
 
     const es = new EventSource(`/api/scrape/${bankId}`);
     esRef.current = es;
@@ -51,8 +59,22 @@ export default function ScrapeProgress({ bankId, bankName, onDone, onError }: Pr
       if (data.error) {
         setErrorMsg(data.message ?? "Error inesperado");
         setCurrentPhase(data.phase);
+        setNeeds2FA(false);
         es.close();
         return;
+      }
+
+      if (data.requires_2fa) {
+        setNeeds2FA(true);
+        setCurrentPhase(data.phase);
+        if (data.message) setCurrentMessage(data.message);
+        setTimeout(() => codeInputRef.current?.focus(), 100);
+        return;
+      }
+
+      // If we were waiting for 2FA and moved past phase 2, clear the input
+      if (needs2FA && data.phase > 2) {
+        setNeeds2FA(false);
       }
 
       setCurrentPhase(data.phase);
@@ -72,6 +94,24 @@ export default function ScrapeProgress({ bankId, bankName, onDone, onError }: Pr
 
     return () => es.close();
   }, [bankId, retryCount]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const submit2FACode = async () => {
+    if (!twoFACode.trim() || submitting2FA) return;
+    setSubmitting2FA(true);
+    try {
+      await fetch(`/api/2fa`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ bankId, code: twoFACode.trim() }),
+      });
+      setNeeds2FA(false);
+      setCurrentMessage("Código enviado — verificando...");
+    } catch {
+      setErrorMsg("Error al enviar código");
+    } finally {
+      setSubmitting2FA(false);
+    }
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
@@ -146,6 +186,34 @@ export default function ScrapeProgress({ bankId, bankName, onDone, onError }: Pr
             );
           })}
         </div>
+
+        {/* 2FA code input */}
+        {needs2FA && !errorMsg && (
+          <div className="mt-4 mb-2">
+            <p className="text-sm text-white/60 mb-2">{currentMessage}</p>
+            <div className="flex gap-2">
+              <input
+                ref={codeInputRef}
+                type="text"
+                inputMode="numeric"
+                autoComplete="one-time-code"
+                maxLength={8}
+                placeholder="Código de verificación"
+                value={twoFACode}
+                onChange={(e) => setTwoFACode(e.target.value.replace(/\D/g, ""))}
+                onKeyDown={(e) => e.key === "Enter" && submit2FACode()}
+                className="flex-1 px-4 py-2.5 rounded-xl bg-white/5 border border-white/15 text-white text-center text-lg tracking-[0.3em] font-mono placeholder:text-white/20 placeholder:tracking-normal placeholder:text-sm focus:outline-none focus:border-[#0ea5e9] focus:ring-1 focus:ring-[#0ea5e9]"
+              />
+              <button
+                onClick={submit2FACode}
+                disabled={!twoFACode.trim() || submitting2FA}
+                className="px-5 py-2.5 rounded-xl bg-[#0ea5e9] text-black text-sm font-bold hover:bg-[#38bdf8] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {submitting2FA ? "..." : "Enviar"}
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Actions on error */}
         {errorMsg && (

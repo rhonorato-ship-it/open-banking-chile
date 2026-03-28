@@ -12,16 +12,24 @@ Open source framework for extracting movements and balances from Chilean banks a
 - **Deploy command**: run `vercel --prod` from repo root (not from `web/` — root dir is configured as `web` in Vercel settings)
 - **npm package**: `open-banking-chile` (latest: v2.1.2, publisher: `rhonorato`)
 
-### Supported banks (13)
+### Supported institutions (13)
 
 **API mode** (no browser needed — works on Vercel without Chromium):
+
+Banks:
 - Banco de Chile (`bchile`) — Spring Security login + REST API with XSRF cookie jar
 - Banco Edwards (`edwards`) — delegates to bchile (same portal: `portalpersonas.bancochile.cl`)
+
+WealthTech:
 - Fintual (`fintual`) — public REST API at `https://fintual.cl/api-docs`
-- MercadoPago (`mercadopago`) — OAuth2 access token + public API at `api.mercadopago.com`
 - Racional (`racional`) — Firebase Auth (`racional-prod`) + Firestore REST API
 
+PayTech:
+- MercadoPago (`mercadopago`) — OAuth2 access token + public API at `api.mercadopago.com` (PayTech arm of MercadoLibre)
+
 **Browser mode** (requires Puppeteer):
+
+Banks:
 - BCI (`bci`) — legacy JSF iframes, BCI Pass 2FA
 - BancoEstado (`bestado`) — requires `forceHeadful: true` (Akamai bot protection)
 - BICE (`bice`) — Keycloak OIDC at `auth.bice.cl`, direct portal at `portalpersonas.bice.cl`
@@ -59,7 +67,26 @@ Open source framework for extracting movements and balances from Chilean banks a
 5. Check if the platform has a mobile app — mobile APIs are often simpler and better documented
 6. Only after confirming there is NO usable API should you consider browser automation
 
-### Banks that should NOT use Chromium on Vercel (bot protection)
+### 2FA requirements per institution
+
+| Institution | 2FA Type | Code Format | Delivery | Automatable? |
+|------------|----------|-------------|----------|-------------|
+| Banco de Chile | Push / SMS | 6 digits | Mobile app or SMS | Push: wait only. SMS: enter code |
+| BCI | Push (BCI Pass) | — | Mobile app | Wait only — no code entry |
+| BancoEstado | SMS | 6 digits | SMS | Enter code |
+| BICE | Push / SMS | 6 digits | Mobile app or SMS | Depends on user config |
+| Citi | SMS / Email | 6 digits | SMS or email | Enter code |
+| Falabella | SMS | 4-6 digits | SMS | Enter code |
+| Fintual | None | — | — | Fully automated (API token) |
+| Itaú | Push (Itaú Key) | — | Mobile app | Wait only — no code entry |
+| MercadoPago | Email / QR / Facial | 6 digits (email) | Email, QR, or face scan | Email: enter code. QR/facial: manual only |
+| Racional | Email OTP | 6 digits | Email | Enter code (sent to registered email) |
+| Santander | Push | — | Mobile app | Wait only |
+| Scotiabank | Dynamic key | 6 digits | Token device or SMS | Enter code |
+
+**Web app 2FA flow**: When a scraper requests a code, the SSE endpoint sends `requires_2fa: true`. The frontend shows a code input field. The user types the code and submits it to `POST /api/2fa`, which writes to the `pending_2fa` Supabase table. The SSE route polls this table every 2 seconds for up to 90 seconds.
+
+### Institutions that should NOT use Chromium on Vercel (bot protection)
 
 These banks have Imperva, Incapsula, or similar bot detection that blocks headless Chrome. They will fail on Vercel and should either be migrated to API or used with `--profile` locally:
 
