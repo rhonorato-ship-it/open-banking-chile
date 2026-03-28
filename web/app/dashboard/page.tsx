@@ -75,7 +75,7 @@ export default function DashboardPage() {
   const [scraping, setScraping] = useState<{ id: string; name: string } | null>(null);
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState<string | null>(null);
-  const [agenticMode, setAgenticMode] = useState(false);
+  const [agenticMode, setAgenticMode] = useState(true);
   const [gmailConnected, setGmailConnected] = useState(false);
   const [gmailLoading, setGmailLoading] = useState(true);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -111,7 +111,7 @@ export default function DashboardPage() {
       if (res.ok) {
         const data = await res.json();
         setGmailConnected(data.connected ?? false);
-        setAgenticMode(data.agenticMode ?? false);
+        setAgenticMode(data.agenticMode ?? true);
       }
     } catch {
       // Gmail endpoints may not exist yet — default to off
