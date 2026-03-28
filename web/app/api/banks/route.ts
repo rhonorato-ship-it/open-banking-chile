@@ -92,8 +92,9 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Missing or invalid fields" }, { status: 400 });
   }
 
-  const EMAIL_BANKS = new Set(["fintual", "racional", "mercadopago"]);
-  const normalizedRut = EMAIL_BANKS.has(normalizedBankId) ? rut.trim() : normalizeRut(rut);
+  // Banks that use email, username, or token instead of RUT — skip RUT validation
+  const NON_RUT_BANKS = new Set(["fintual", "racional", "mercadopago", "citi"]);
+  const normalizedRut = NON_RUT_BANKS.has(normalizedBankId) ? rut.trim() : normalizeRut(rut);
   if (!normalizedRut) {
     return NextResponse.json({ error: "RUT inválido" }, { status: 400 });
   }
