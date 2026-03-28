@@ -48,7 +48,9 @@ async function main() {
     const { startAgent } = await import("./agent.js");
     const tokenIdx = args.indexOf("--token");
     const token = tokenIdx >= 0 ? args[tokenIdx + 1] : undefined;
-    await startAgent(token);
+    const urlIdx = args.indexOf("--url");
+    const webUrl = urlIdx >= 0 ? args[urlIdx + 1] : undefined;
+    await startAgent(token, webUrl);
     return;
   }
 

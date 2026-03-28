@@ -2,7 +2,7 @@ import type { NextConfig } from "next";
 import path from "path";
 
 const nextConfig: NextConfig = {
-  serverExternalPackages: ["@sparticuz/chromium", "playwright-core", "open-banking-chile"],
+  serverExternalPackages: ["playwright-core", "open-banking-chile"],
   outputFileTracingRoot: path.join(__dirname, ".."),
   webpack(config) {
     // open-banking-chile is a symlinked local package -- serverExternalPackages

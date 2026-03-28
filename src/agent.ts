@@ -8,6 +8,9 @@
  * presence via heartbeats, and listens for sync_tasks via Realtime.  When a
  * task arrives it claims it, runs the bank scraper, uploads movements (with
  * SHA-256 hash dedup), and marks the task done.
+ *
+ * Credentials are fetched from the dashboard API (no local env vars needed).
+ * Falls back to env vars if the API is unreachable.
  */
 
 import { config } from "dotenv";
@@ -25,6 +28,7 @@ config();
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const TWOFACTOR_POLL_INTERVAL_MS = 2_000;
 const TWOFACTOR_TIMEOUT_MS = 90_000;
+const DEFAULT_WEB_URL = "https://open-banking-chile.vercel.app";
 
 // ─── Helpers ──────────────────────────────────────────────────
 
@@ -50,8 +54,60 @@ function movementHash(
     .digest("hex");
 }
 
-/** Detect which banks have credentials configured via env vars. */
-function detectConfiguredBanks(): Array<{ id: string; name: string }> {
+/** Prompt for input on a TTY. */
+function promptTTY(question: string): Promise<string> {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stderr,
+    });
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
+}
+
+// ─── Credential fetching from dashboard API ──────────────────
+
+/**
+ * Fetch the list of banks the user has configured in the dashboard.
+ * Returns bank IDs (e.g. ["bice", "bchile", "fintual"]).
+ */
+async function fetchConfiguredBanks(
+  token: string,
+  webUrl: string,
+): Promise<string[]> {
+  const res = await fetch(`${webUrl}/api/agent/credentials/list`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    throw new Error(`credentials/list returned ${res.status}`);
+  }
+  const data = await res.json();
+  return data.banks as string[];
+}
+
+/**
+ * Fetch decrypted credentials for a specific bank from the dashboard API.
+ */
+async function fetchCredentials(
+  token: string,
+  webUrl: string,
+  bankId: string,
+): Promise<{ rut: string; password: string }> {
+  const res = await fetch(
+    `${webUrl}/api/agent/credentials?bankId=${encodeURIComponent(bankId)}`,
+    { headers: { Authorization: `Bearer ${token}` } },
+  );
+  if (!res.ok) {
+    throw new Error(`credentials returned ${res.status} for ${bankId}`);
+  }
+  return (await res.json()) as { rut: string; password: string };
+}
+
+/** Detect which banks have credentials configured via env vars (fallback). */
+function detectConfiguredBanksFromEnv(): Array<{ id: string; name: string }> {
   const available = listBanks();
   const configured: Array<{ id: string; name: string }> = [];
 
@@ -68,8 +124,8 @@ function detectConfiguredBanks(): Array<{ id: string; name: string }> {
   return configured;
 }
 
-/** Read credentials for a bank from env vars. */
-function readCredentials(
+/** Read credentials for a bank from env vars (fallback). */
+function readCredentialsFromEnv(
   bankId: string,
 ): { rut: string; password: string } | null {
   const prefix = bankId.toUpperCase();
@@ -80,41 +136,61 @@ function readCredentials(
   return { rut, password };
 }
 
-/** Prompt for input on a TTY. */
-function promptTTY(question: string): Promise<string> {
-  return new Promise((resolve) => {
-    const rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stderr,
-    });
-    rl.question(question, (answer) => {
-      rl.close();
-      resolve(answer.trim());
-    });
-  });
+// ─── Auto-auth flow ──────────────────────────────────────────
+
+/**
+ * Interactive auth: prompt user to open the dashboard and paste the token.
+ */
+async function interactiveAuth(webUrl: string): Promise<string> {
+  console.log("");
+  console.log("  === Autenticacion del agente ===");
+  console.log("");
+  console.log(`  1. Abre tu navegador: ${webUrl}/agent`);
+  console.log("  2. Genera y copia el token.");
+  console.log("  3. Pegalo aqui abajo.");
+  console.log("");
+
+  const token = await promptTTY("  Token: ");
+
+  if (!token) {
+    console.error("Error: No se ingreso un token.");
+    process.exit(1);
+  }
+
+  return token;
 }
 
 // ─── Core agent ───────────────────────────────────────────────
 
-export async function startAgent(token?: string): Promise<void> {
+export async function startAgent(
+  token?: string,
+  webUrl?: string,
+): Promise<void> {
+  const resolvedWebUrl = webUrl || DEFAULT_WEB_URL;
+
   // ── Resolve token ────────────────────────────────────────
   const savedConfig = loadConfig();
-  const resolvedToken = token || savedConfig?.token;
+  let resolvedToken = token || savedConfig?.token;
 
+  // Auto-auth: if no token and running in a TTY, prompt interactively
   if (!resolvedToken) {
-    console.error(
-      "Error: No agent token provided.\n" +
-        "  Pass --token <token> or save it with:\n" +
-        '  echo \'{"token":"your-token"}\' > ~/.config/open-banking-chile/agent.json',
-    );
-    process.exit(1);
+    if (process.stdin.isTTY) {
+      resolvedToken = await interactiveAuth(resolvedWebUrl);
+    } else {
+      console.error(
+        "Error: No agent token provided.\n" +
+          "  Pass --token <token> or run interactively to authenticate.\n" +
+          `  Or open ${resolvedWebUrl}/agent to get a token.`,
+      );
+      process.exit(1);
+    }
   }
 
-  // Persist token if it was passed via flag (so next run can skip --token)
-  if (token && token !== savedConfig?.token) {
+  // Persist token if it was passed via flag or interactive auth
+  if (resolvedToken !== savedConfig?.token) {
     saveConfig({
       ...savedConfig,
-      token,
+      token: resolvedToken,
       supabaseUrl: savedConfig?.supabaseUrl,
       supabaseKey: savedConfig?.supabaseKey,
     });
@@ -128,19 +204,41 @@ export async function startAgent(token?: string): Promise<void> {
   });
 
   // ── Detect configured banks ──────────────────────────────
-  const configuredBanks = detectConfiguredBanks();
+  // Try the dashboard API first, fall back to env vars
+  let configuredBanks: Array<{ id: string; name: string }> = [];
+  let credentialSource: "api" | "env" = "api";
+
+  try {
+    log("Fetching configured banks from dashboard...");
+    const bankIds = await fetchConfiguredBanks(resolvedToken, resolvedWebUrl);
+    const allBanks = listBanks();
+    configuredBanks = bankIds
+      .map((id) => {
+        const found = allBanks.find((b) => b.id === id);
+        return found ? { id: found.id, name: found.name } : null;
+      })
+      .filter((b): b is { id: string; name: string } => b !== null);
+    log(`Dashboard returned ${configuredBanks.length} bank(s).`);
+  } catch (err) {
+    warn(
+      `Could not fetch banks from dashboard: ${(err as Error).message}. Falling back to env vars.`,
+    );
+    configuredBanks = detectConfiguredBanksFromEnv();
+    credentialSource = "env";
+  }
 
   if (configuredBanks.length === 0) {
     console.error(
-      "Error: No bank credentials found in environment.\n" +
-        "  Set <BANK>_RUT and <BANK>_PASS (or <BANK>_PASSWORD) env vars.\n" +
-        "  Example: BICE_RUT=12345678-9 BICE_PASS=mypassword",
+      "Error: No bank credentials found.\n" +
+        `  Configure your banks at ${resolvedWebUrl}/banks\n` +
+        "  Or set <BANK>_RUT and <BANK>_PASS env vars as fallback.",
     );
     process.exit(1);
   }
 
   log("=== Open Banking Chile — Local Sync Agent ===");
   log(`Agent ID: ${agentId}`);
+  log(`Credential source: ${credentialSource}`);
   log(
     `Configured banks: ${configuredBanks.map((b) => b.id).join(", ")} (${configuredBanks.length})`,
   );
@@ -191,12 +289,28 @@ export async function startAgent(token?: string): Promise<void> {
     };
 
     try {
-      // Read credentials
-      const creds = readCredentials(bankId);
+      // ── Read credentials (API first, env fallback) ────
+      let creds: { rut: string; password: string } | null = null;
+
+      if (credentialSource === "api") {
+        try {
+          creds = await fetchCredentials(resolvedToken, resolvedWebUrl, bankId);
+        } catch (err) {
+          warn(
+            `Task ${taskId}: API credential fetch failed (${(err as Error).message}), trying env vars...`,
+          );
+        }
+      }
+
+      // Fallback to env vars
+      if (!creds) {
+        creds = readCredentialsFromEnv(bankId);
+      }
+
       if (!creds) {
         await updateTask({
           status: "error",
-          error_message: `No credentials found for bank ${bankId}. Set ${bankId.toUpperCase()}_RUT and ${bankId.toUpperCase()}_PASS env vars.`,
+          error_message: `No credentials found for bank ${bankId}. Configure them at ${resolvedWebUrl}/banks.`,
         });
         warn(`Task ${taskId}: no credentials for ${bankId}.`);
         return;
@@ -433,41 +547,54 @@ async function main(): Promise<void> {
     token = args[tokenIdx + 1];
   }
 
+  // Parse --url flag
+  let webUrl: string | undefined;
+  const urlIdx = args.indexOf("--url");
+  if (urlIdx >= 0 && args[urlIdx + 1]) {
+    webUrl = args[urlIdx + 1];
+  }
+
   // --help
   if (args.includes("--help") || args.includes("-h")) {
     console.log(`
 open-banking-chile serve — Local sync agent
 
 Usage:
-  open-banking-chile serve [--token <token>]
+  open-banking-chile serve [--token <token>] [--url <dashboard-url>]
 
 The agent connects to Supabase, announces its presence, and listens for
 sync tasks. When a task arrives, it runs the appropriate bank scraper and
 uploads movements.
 
+Credentials are fetched automatically from your dashboard account.
+No local env vars needed -- just authenticate once with your token.
+
 Options:
-  --token <token>  Agent auth token (or save to ~/.config/open-banking-chile/agent.json)
+  --token <token>  Agent auth token (or paste interactively on first run)
+  --url <url>      Dashboard URL (default: ${DEFAULT_WEB_URL})
   --help, -h       Show this help
 
-Environment:
+Environment (fallback, optional):
   SUPABASE_URL       Supabase project URL
   SUPABASE_ANON_KEY  Supabase anonymous key
   <BANK>_RUT         RUT for each bank  (e.g. BICE_RUT=12345678-9)
   <BANK>_PASS        Password for each bank (e.g. BICE_PASS=mypassword)
-  <BANK>_PASSWORD    Alias for <BANK>_PASS
   CHROME_PATH        Custom Chrome/Chromium path (optional)
 
 Examples:
-  # Run with token flag
+  # First run — authenticates interactively
+  npx open-banking-chile serve
+
+  # Run with explicit token
   npx open-banking-chile serve --token eyJhbG...
 
-  # Run with saved config + env vars from .env
-  npx open-banking-chile serve
+  # Run against a custom dashboard URL
+  npx open-banking-chile serve --url http://localhost:3434
 `);
     process.exit(0);
   }
 
-  await startAgent(token);
+  await startAgent(token, webUrl);
 }
 
 main().catch((err) => {

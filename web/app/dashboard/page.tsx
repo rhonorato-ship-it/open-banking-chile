@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { signOut } from "next-auth/react";
 import Link from "next/link";
 import Navigation from "@/components/Navigation";
 import ScrapeProgress from "@/components/ScrapeProgress";

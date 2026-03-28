@@ -1,14 +1,19 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import Navigation from "@/components/Navigation";
 import AgentStatus from "@/components/AgentStatus";
 
 export default function AgentPage() {
   const [token, setToken] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+
+  // Auto-generate token on page load
+  useEffect(() => {
+    generateToken();
+  }, []);
 
   async function generateToken() {
     setLoading(true);
@@ -50,8 +55,8 @@ export default function AgentPage() {
             Agente local
           </h1>
           <p className="text-sm text-slate-400 mt-1">
-            Sincroniza tus bancos desde tu computador, sin compartir credenciales
-            con la nube.
+            Sincroniza tus bancos desde tu computador.
+            Las credenciales se sincronizan desde tu cuenta. No necesitas configurar nada localmente.
           </p>
         </div>
 
@@ -65,25 +70,17 @@ export default function AgentPage() {
           </div>
         </section>
 
-        {/* Token generation */}
+        {/* Token + one-step setup */}
         <section className="p-5 rounded-2xl border border-slate-200 bg-white">
           <p className="text-xs text-slate-400 uppercase tracking-[0.15em] mb-3">
             Token de autenticacion
           </p>
-          <p className="text-sm text-slate-500 mb-4">
-            Este token permite al agente local sincronizar datos con tu cuenta.
-            Guardalo de forma segura y no lo compartas.
-          </p>
 
-          {!token ? (
-            <button
-              onClick={generateToken}
-              disabled={loading}
-              className="px-5 py-2.5 rounded-xl bg-teal-600 text-white text-sm font-bold hover:bg-teal-700 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-            >
-              {loading ? "Generando..." : "Generar token"}
-            </button>
-          ) : (
+          {loading ? (
+            <div className="animate-pulse space-y-3">
+              <div className="h-16 bg-slate-100 rounded-xl" />
+            </div>
+          ) : token ? (
             <div className="space-y-3">
               <div className="relative">
                 <pre className="p-4 rounded-xl bg-slate-50 border border-slate-200 text-xs font-[family-name:var(--font-geist-mono)] text-slate-700 break-all whitespace-pre-wrap select-all leading-relaxed">
@@ -98,88 +95,41 @@ export default function AgentPage() {
               </div>
               <button
                 onClick={generateToken}
-                disabled={loading}
                 className="text-xs text-slate-400 hover:text-slate-600 transition-colors"
               >
-                {loading ? "Generando..." : "Regenerar token"}
+                Regenerar token
               </button>
             </div>
-          )}
+          ) : null}
 
           {error && (
             <p className="text-xs text-rose-500 mt-3">{error}</p>
           )}
         </section>
 
-        {/* Setup instructions */}
+        {/* Setup instructions — single step */}
         <section className="p-5 rounded-2xl border border-slate-200 bg-white">
           <p className="text-xs text-slate-400 uppercase tracking-[0.15em] mb-3">
-            Instrucciones de instalacion
+            Como empezar
           </p>
 
-          <div className="space-y-5">
-            {/* Step 1 */}
+          <div className="space-y-4">
             <div>
-              <div className="flex items-center gap-2.5 mb-2">
-                <div className="w-6 h-6 rounded-full bg-teal-50 border border-teal-200 flex items-center justify-center">
-                  <span className="text-xs font-bold text-teal-700">1</span>
-                </div>
-                <p className="text-sm font-semibold text-slate-700">
-                  Instala el paquete
-                </p>
-              </div>
-              <pre className="p-3 rounded-xl bg-slate-50 border border-slate-200 text-xs font-[family-name:var(--font-geist-mono)] text-slate-600">
-                npm install -g open-banking-chile
-              </pre>
-            </div>
-
-            {/* Step 2 */}
-            <div>
-              <div className="flex items-center gap-2.5 mb-2">
-                <div className="w-6 h-6 rounded-full bg-teal-50 border border-teal-200 flex items-center justify-center">
-                  <span className="text-xs font-bold text-teal-700">2</span>
-                </div>
-                <p className="text-sm font-semibold text-slate-700">
-                  Crea un archivo de credenciales
-                </p>
-              </div>
-              <p className="text-xs text-slate-400 mb-2 ml-8">
-                Crea un archivo <code className="font-[family-name:var(--font-geist-mono)] bg-slate-100 px-1 py-0.5 rounded">credentials.env</code> con
-                tus credenciales bancarias:
+              <p className="text-sm text-slate-500 mb-3">
+                Ejecuta este comando en tu terminal. El agente te pedira el token automaticamente.
               </p>
               <pre className="p-3 rounded-xl bg-slate-50 border border-slate-200 text-xs font-[family-name:var(--font-geist-mono)] text-slate-600 leading-relaxed">
-{`# credentials.env
-BCHILE_RUT=12345678-9
-BCHILE_PASS=tu_clave
-
-SANTANDER_RUT=12345678-9
-SANTANDER_PASS=tu_clave`}
+                npx open-banking-chile serve
               </pre>
             </div>
 
-            {/* Step 3 */}
-            <div>
-              <div className="flex items-center gap-2.5 mb-2">
-                <div className="w-6 h-6 rounded-full bg-teal-50 border border-teal-200 flex items-center justify-center">
-                  <span className="text-xs font-bold text-teal-700">3</span>
-                </div>
-                <p className="text-sm font-semibold text-slate-700">
-                  Ejecuta el agente
-                </p>
-              </div>
-              <pre className="p-3 rounded-xl bg-slate-50 border border-slate-200 text-xs font-[family-name:var(--font-geist-mono)] text-slate-600 leading-relaxed">
-{`npx open-banking-chile serve \\
-  --token ${token ? token.slice(0, 20) + "..." : "<tu-token>"}`}
-              </pre>
+            <div className="p-3 rounded-xl bg-teal-50 border border-teal-200">
+              <p className="text-xs text-teal-700 leading-relaxed">
+                Las credenciales bancarias se sincronizan automaticamente desde tu cuenta.
+                No necesitas crear archivos de configuracion ni variables de entorno.
+                Solo ejecuta el comando y pega el token cuando te lo pida.
+              </p>
             </div>
-          </div>
-
-          <div className="mt-5 p-3 rounded-xl bg-teal-50 border border-teal-200">
-            <p className="text-xs text-teal-700 leading-relaxed">
-              El agente se conecta a Supabase Realtime y espera instrucciones de
-              sincronizacion. Tus credenciales nunca salen de tu computador --
-              solo los movimientos procesados se suben a la nube.
-            </p>
           </div>
         </section>
       </main>

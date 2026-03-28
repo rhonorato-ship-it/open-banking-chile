@@ -17,9 +17,8 @@ function stringToPhase(msg: string): Phase {
   return 4;
 }
 
-/** Hard timeouts per scraper mode. API scrapers are fetch-only and should be fast. Browser scrapers need time for page loads + 2FA. */
-const TIMEOUT_API_MS = 90_000;      // 90s for API mode (may include browser fallback for Cloudflare)
-const TIMEOUT_BROWSER_MS = 120_000; // 120s for browser mode (page loads, 2FA waits)
+/** Hard timeout for API-mode scrapers. */
+const TIMEOUT_API_MS = 90_000;
 
 export async function GET(req: Request, { params }: { params: Promise<{ bankId: string }> }) {
   const session = await auth();
@@ -33,6 +32,29 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
 
   const bank = getBank(bankId);
   if (!bank) return new Response("Bank not found", { status: 404 });
+
+  // ── Browser-mode banks must use the local agent ──────────────
+  if (bank.mode !== "api") {
+    const encoder = new TextEncoder();
+    const errorStream = new ReadableStream({
+      start(controller) {
+        const msg = {
+          phase: 1,
+          error: true,
+          message: "Este banco requiere navegador. Usa el agente local para sincronizar: npx open-banking-chile serve",
+        };
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(msg)}\n\n`));
+        controller.close();
+      },
+    });
+    return new Response(errorStream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      },
+    });
+  }
 
   const encoder = new TextEncoder();
   let keepaliveInterval: ReturnType<typeof setInterval> | undefined;
@@ -71,7 +93,6 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
       };
 
       // Keepalives as real SSE data events so the client's onmessage handler can reset its inactivity timer.
-      // SSE comments (": keepalive\n\n") are silently consumed by EventSource and never fire onmessage.
       keepaliveInterval = setInterval(() => {
         if (terminated) return;
         try { controller.enqueue(encoder.encode(`data: ${JSON.stringify({ keepalive: true })}\n\n`)); } catch { terminated = true; }
@@ -88,7 +109,7 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
         });
 
         if (lockError || !acquired) {
-          terminate({ phase: 1, error: true, message: "No se pudo iniciar la sincronización. Reintenta." });
+          terminate({ phase: 1, error: true, message: "No se pudo iniciar la sincronizacion. Reintenta." });
           return;
         }
 
@@ -123,39 +144,13 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
         const rut = await decrypt(cred.encrypted_rut, cred.rut_iv);
         const password = await decrypt(cred.encrypted_password, cred.password_iv);
 
-        send({ phase: 1, label: "Iniciando conexión", message: "Abriendo sesión segura" });
-
-        // ── Browser setup ──────────────────────────────────────────
-        // Always prepare browser options — even API-mode scrapers may need
-        // a browser fallback when Cloudflare/Imperva blocks HTTP login.
-        let chromePath: string | undefined;
-        let launchArgs: string[] | undefined;
-        let remoteCDP: string | undefined;
-
-        const browserWsUrl = process.env.BROWSER_WS_URL;
-        const browserbaseKey = process.env.BROWSERBASE_API_KEY;
-
-        if (browserWsUrl) {
-          remoteCDP = browserWsUrl;
-        } else if (browserbaseKey) {
-          remoteCDP = `wss://connect.browserbase.com?apiKey=${browserbaseKey}`;
-        } else {
-          // Fallback: local @sparticuz/chromium (free, already bundled)
-          try {
-            const chromium = (await import("@sparticuz/chromium")).default;
-            chromePath = await chromium.executablePath();
-            launchArgs = chromium.args.filter((a: string) => !a.startsWith("--headless"));
-            launchArgs.push("--headless=shell");
-          } catch {
-            // @sparticuz/chromium not available — browser fallback will fail gracefully
-          }
-        }
+        send({ phase: 1, label: "Iniciando conexion", message: "Abriendo sesion segura" });
 
         // ── 2FA callback ─────────────────────────────────────────
         const onTwoFactorCode = async (): Promise<string> => {
           if (mode === "agentic") {
             // Agentic mode: search Gmail for the code
-            send({ phase: 2, requires_2fa: true, agentic: true, label: "Verificación requerida", message: "Buscando código en Gmail..." });
+            send({ phase: 2, requires_2fa: true, agentic: true, label: "Verificacion requerida", message: "Buscando codigo en Gmail..." });
 
             // Import gmail module dynamically to avoid loading it for manual syncs
             const { searchFor2FACode } = await import("@/lib/gmail");
@@ -165,28 +160,28 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
             while (Date.now() < bankDeadline) {
               const code = await searchFor2FACode(userId, bankId);
               if (code) {
-                send({ phase: 2, message: "Código encontrado — verificando..." });
+                send({ phase: 2, message: "Codigo encontrado — verificando..." });
                 return code;
               }
               await new Promise(r => setTimeout(r, 3000));
             }
 
             // Generic fallback search (15s more)
-            send({ phase: 2, message: "Ampliando búsqueda..." });
+            send({ phase: 2, message: "Ampliando busqueda..." });
             const genericDeadline = Date.now() + 15_000;
             while (Date.now() < genericDeadline) {
               const code = await searchFor2FACode(userId, "__generic__");
               if (code) {
-                send({ phase: 2, message: "Código encontrado — verificando..." });
+                send({ phase: 2, message: "Codigo encontrado — verificando..." });
                 return code;
               }
               await new Promise(r => setTimeout(r, 3000));
             }
 
             // Fallback to manual
-            send({ phase: 2, requires_2fa: true, agentic: false, label: "Verificación requerida", message: "No se encontró código en Gmail — ingresa manualmente" });
+            send({ phase: 2, requires_2fa: true, agentic: false, label: "Verificacion requerida", message: "No se encontro codigo en Gmail — ingresa manualmente" });
           } else {
-            send({ phase: 2, requires_2fa: true, label: "Verificación requerida", message: "El banco solicita un código de verificación. Ingresa el código que recibiste." });
+            send({ phase: 2, requires_2fa: true, label: "Verificacion requerida", message: "El banco solicita un codigo de verificacion. Ingresa el codigo que recibiste." });
           }
 
           // Manual polling (existing logic)
@@ -208,17 +203,15 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
         };
 
         // ── Scrape with hard timeout ─────────────────────────────
+        // API-mode only — no browser setup needed
         const scrapePromise = bank.scrape({
           rut,
           password,
-          ...(remoteCDP ? { remoteCDP } : {}),
-          ...(chromePath ? { chromePath } : {}),
-          ...(launchArgs ? { launchArgs } : {}),
           onTwoFactorCode,
           onProgress: (msg: string) => {
             const phase = stringToPhase(msg);
             const labels: Record<Phase, string> = {
-              1: "Iniciando conexión",
+              1: "Iniciando conexion",
               2: "Autenticando",
               3: "Extrayendo movimientos",
               4: "Procesando datos",
@@ -228,10 +221,9 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
           },
         });
 
-        const timeoutMs = bank.mode !== "api" ? TIMEOUT_BROWSER_MS : TIMEOUT_API_MS;
         let scrapeTimerId: ReturnType<typeof setTimeout> | undefined;
         const timeoutPromise = new Promise<never>((_, reject) => {
-          scrapeTimerId = setTimeout(() => reject(new Error("SCRAPE_TIMEOUT")), timeoutMs);
+          scrapeTimerId = setTimeout(() => reject(new Error("SCRAPE_TIMEOUT")), TIMEOUT_API_MS);
         });
 
         let result;
@@ -297,8 +289,8 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
         console.error(`[scrape:${bankId}]`, message);
 
         const userMessage = message === "SCRAPE_TIMEOUT"
-          ? "La sincronización tardó demasiado y fue cancelada. Reintenta."
-          : "No se pudo completar la sincronización. Reintenta en unos minutos.";
+          ? "La sincronizacion tardo demasiado y fue cancelada. Reintenta."
+          : "No se pudo completar la sincronizacion. Reintenta en unos minutos.";
 
         terminate({ phase: 2, error: true, message: userMessage });
 
