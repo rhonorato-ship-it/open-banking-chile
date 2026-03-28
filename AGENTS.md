@@ -12,7 +12,7 @@ Open source framework for extracting movements and balances from Chilean banks a
 - **Deploy command**: run `vercel --prod` from repo root (not from `web/` — root dir is configured as `web` in Vercel settings)
 - **npm package**: `open-banking-chile` (latest: v2.1.2, publisher: `rhonorato`)
 
-### Supported institutions (13)
+### Supported institutions (15)
 
 **API mode** (no browser needed — works on Vercel without Chromium):
 
@@ -26,6 +26,10 @@ Banks:
 - Banco Falabella (`falabella`) — cookie jar auth + REST API for account and CMR credit card data. Endpoints need live testing.
 - Santander (`santander`) — cookie jar auth via login iframe endpoint + REST API. Multi-account + CC support.
 - Scotiabank (`scotiabank`) — cookie jar auth + REST API. Historical periods via `SCOTIABANK_MONTHS` env var.
+
+FinTech (mobile-only):
+- MACH (`mach`) — BCI subsidiary, mobile-only. Device-bound auth (AES-GCM encrypted PIN). API at `api.soymach.com/mobile/`. Best-effort scraper; requires device registration for full auth.
+- Tenpo (`tenpo`) — Mobile-only neobank (com.krealo.tenpo). Skeleton scraper probing common API patterns. Endpoints not yet discovered via APK decompilation.
 
 WealthTech:
 - Fintual (`fintual`) — public REST API at `https://fintual.cl/api-docs`
@@ -79,10 +83,12 @@ PayTech:
 | Falabella | SMS | 4-6 digits | SMS | Enter code |
 | Fintual | None | — | — | Fully automated (API token) |
 | Itaú | Push (Itaú Key) | — | Mobile app | Wait only — no code entry |
+| MACH | SMS / Push | 6 digits | Mobile app or SMS | Device-bound auth — not automatable without registered device |
 | MercadoPago | Email / QR / Facial | 6 digits (email) | Email, QR, or face scan | Email: enter code. QR/facial: manual only |
 | Racional | Email OTP | 6 digits | Email | Enter code (sent to registered email) |
 | Santander | Push | — | Mobile app | Wait only |
 | Scotiabank | Dynamic key | 6 digits | Token device or SMS | Enter code |
+| Tenpo | Unknown | Unknown | Unknown | Not yet discovered — APK decompilation needed |
 
 **Web app 2FA flow**: When a scraper requests a code, the SSE endpoint sends `requires_2fa: true`. The frontend shows a code input field. The user types the code and submits it to `POST /api/2fa`, which writes to the `pending_2fa` Supabase table. The SSE route polls this table every 2 seconds for up to 90 seconds.
 
@@ -159,6 +165,32 @@ Use this section when debugging or extending any API-mode scraper. These details
 - **Credential mapping**: `rut` field = email address, `password` field = password
 - **2FA**: Firebase may enforce MFA (returns `MISSING_MFA` error). Email OTP handled via `onTwoFactorCode` callback.
 
+#### MACH (`mode: "api"` — best-effort)
+- **Mobile-only** — no web portal. APK: `cl.bci.sismo.mach` (BCI subsidiary)
+- **Base URL**: `https://api.soymach.com/mobile/`
+- **Auth headers**: `Content-Type: application/json`, `Accept-Version: 0.31.0`, `mach-header-id: {device_id}`, `Authorization: Bearer {token}`
+- **Auth flow** (device-bound):
+  1. Device must be registered with the MACH app first (one-time)
+  2. PIN auth: `POST credentials/security-pin/authentication/verify` with AES-GCM encrypted PIN `{ "content": "...", "tag": "...", "iv": "..." }`
+  3. Token refresh: `POST auth/token/acknowledge` + stored refresh token
+- **Data endpoints** (all require Bearer token + mach-header-id):
+  - `GET accounts/balance` — account balance
+  - `GET accounts/information` — account details
+  - `GET movements/history/v2` — movement history (paginated)
+  - `GET credit-lines/balance` — credit card balance
+  - `GET credit-lines/movements/authorized` — CC unbilled movements
+  - `GET credit-lines/movements/statement` — CC billed movements
+- **Limitation**: Device registration and AES-GCM PIN encryption cannot be replicated server-side without the device key. Scraper returns helpful error explaining this.
+- **Credential mapping**: `rut` field = phone number, `password` field = security PIN (4-6 digits)
+
+#### Tenpo (`mode: "api"` — skeleton)
+- **Mobile-only** — no web portal. APK: `com.krealo.tenpo` (Kotlin backend, likely Spring Boot)
+- **No APK decompilation done yet** — endpoints are unknown
+- **Candidate base URLs**: `api.tenpo.cl`, `services.tenpo.cl`, `app.tenpo.cl/api`
+- **Scraper approach**: Probes common neobank API patterns (auth paths, payload shapes) across candidate URLs
+- **Next step**: Decompile APK to discover real endpoints and auth flow
+- **Credential mapping**: `rut` field = phone number or email, `password` field = PIN or password
+
 #### BICE (browser mode — migration candidate)
 - **Auth**: Keycloak OIDC at `auth.bice.cl/auth/realms/personas/protocol/openid-connect/auth`
 - **Direct portal**: `https://portalpersonas.bice.cl` triggers Keycloak redirect (skips homepage 403)
@@ -194,9 +226,9 @@ src/
     balance.ts             — Balance extraction (regex + CSS selector fallbacks)
     two-factor.ts          — 2FA detection and wait (configurable keywords/timeout)
   banks/
-    11 API-mode scrapers (fetch-only): bchile.ts, edwards.ts, fintual.ts,
-    racional.ts, bci.ts, bestado.ts, bice.ts, citi.ts, falabella.ts,
-    santander.ts, scotiabank.ts
+    13 API-mode scrapers (fetch-only): bchile.ts, edwards.ts, fintual.ts,
+    mach.ts, racional.ts, tenpo.ts, bci.ts, bestado.ts, bice.ts,
+    citi.ts, falabella.ts, santander.ts, scotiabank.ts
     2 browser-mode scrapers: itau.ts (IBM WebSphere, no JSON APIs),
     mercadopago.ts (MercadoLibre login requires browser)
 
@@ -385,7 +417,7 @@ This project uses specialized agents (`.claude/agents/`) that are automatically 
 
 | Agent | Role | When invoked |
 |-------|------|-------------|
-| `bank-{id}` (x13) | Bank-specific expert | Any mention of a bank name, ID, or its scraper |
+| `bank-{id}` (x15) | Bank-specific expert | Any mention of a bank name, ID, or its scraper |
 | `scraping-expert` | Technique expert | API patterns, auth flows, cookie jars, fetch, Puppeteer |
 | `product-manager` | Product decisions | Feature scope, UX, database schema, platform consistency |
 | `qa-engineer` | Quality assurance | After every code change — build, types, compliance, regressions |

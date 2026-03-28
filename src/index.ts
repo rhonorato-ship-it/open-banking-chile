@@ -7,10 +7,12 @@ import edwards from "./banks/edwards.js";
 import falabella from "./banks/falabella.js";
 import fintual from "./banks/fintual.js";
 import itau from "./banks/itau.js";
+import mach from "./banks/mach.js";
 import mercadopago from "./banks/mercadopago.js";
 import racional from "./banks/racional.js";
 import santander from "./banks/santander.js";
 import scotiabank from "./banks/scotiabank.js";
+import tenpo from "./banks/tenpo.js";
 import type { BankScraper } from "./types.js";
 
 /** Registro de todos los bancos disponibles */
@@ -24,10 +26,12 @@ export const banks: Record<string, BankScraper> = {
   falabella,
   fintual,
   itau,
+  mach,
   mercadopago,
   racional,
   santander,
   scotiabank,
+  tenpo,
 };
 
 /** Lista de bancos soportados */
@@ -69,7 +73,9 @@ export { default as edwards } from "./banks/edwards.js";
 export { default as falabella } from "./banks/falabella.js";
 export { default as fintual } from "./banks/fintual.js";
 export { default as itau } from "./banks/itau.js";
+export { default as mach } from "./banks/mach.js";
 export { default as mercadopago } from "./banks/mercadopago.js";
 export { default as racional } from "./banks/racional.js";
 export { default as santander } from "./banks/santander.js";
 export { default as scotiabank } from "./banks/scotiabank.js";
+export { default as tenpo } from "./banks/tenpo.js";

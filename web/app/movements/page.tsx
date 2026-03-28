@@ -17,7 +17,9 @@ interface Movement {
 const BANK_NAMES: Record<string, string> = {
   bchile: "Banco Chile", bci: "BCI", bestado: "BancoEstado", bice: "BICE",
   citi: "Citibank", edwards: "Edwards", falabella: "Falabella",
-  itau: "Itaú", santander: "Santander", scotiabank: "Scotiabank",
+  fintual: "Fintual", itau: "Itaú", mach: "MACH", mercadopago: "MercadoPago",
+  racional: "Racional", santander: "Santander", scotiabank: "Scotiabank",
+  tenpo: "Tenpo",
 };
 
 const MONTHS_ES = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"];

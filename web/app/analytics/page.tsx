@@ -34,7 +34,9 @@ const CATEGORY_NAMES: Record<string, string> = {
 const BANK_NAMES: Record<string, string> = {
   bchile: "B. Chile", bci: "BCI", bestado: "BancoEstado", bice: "BICE",
   citi: "Citi", edwards: "Edwards", falabella: "Falabella",
-  itau: "Itaú", santander: "Santander", scotiabank: "Scotiabank",
+  fintual: "Fintual", itau: "Itaú", mach: "MACH", mercadopago: "MP",
+  racional: "Racional", santander: "Santander", scotiabank: "Scotiabank",
+  tenpo: "Tenpo",
 };
 
 const BANK_COLORS = ["#0ea5e9", "#34d399", "#f87171", "#a78bfa", "#fb923c", "#e879f9", "#22d3ee", "#facc15"];
