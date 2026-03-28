@@ -200,12 +200,7 @@ export function defaultChromeProfilePath(): string | null {
       : [`${home}/.config/google-chrome`]; // Linux
 
   for (const dir of candidates) {
-    try {
-      const fs = require("fs");
-      if (fs.existsSync(dir)) return dir;
-    } catch {
-      // fs not available
-    }
+    if (fs.existsSync(dir)) return dir;
   }
   return null;
 }

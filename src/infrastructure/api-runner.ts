@@ -7,7 +7,8 @@ export type ApiScrapeFn = (
 
 /**
  * Browser-free scraper runner for banks/services with REST APIs.
- * Mirrors runScraper() lifecycle but uses fetch() instead of Puppeteer.
+ * Handles credential validation and error wrapping like runScraper(),
+ * but has no browser lifecycle (no launch, no logout, no cleanup).
  */
 export async function runApiScraper(
   bankId: string,

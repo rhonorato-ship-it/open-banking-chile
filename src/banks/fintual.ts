@@ -117,14 +117,19 @@ async function scrapeFintual(options: ScraperOptions, debugLog: string[]): Promi
   const yyyy = today.getFullYear();
   const dateStr = `${dd}-${mm}-${yyyy}`;
 
-  // Each goal is a portfolio position — convert to movements for the dashboard
-  const movements: BankMovement[] = goals.map((goal) => ({
-    date: dateStr,
-    description: goal.attributes.name,
-    amount: goal.attributes.nav,
-    balance: goal.attributes.nav,
-    source: MOVEMENT_SOURCE.account,
-  }));
+  // Each goal is a portfolio balance snapshot — one entry per goal per day.
+  // Use Math.round because NAV fluctuates intraday but CLP has no decimals.
+  // Description includes goal ID so the dedup hash is stable across syncs.
+  const movements: BankMovement[] = goals.map((goal) => {
+    const nav = Math.round(goal.attributes.nav);
+    return {
+      date: dateStr,
+      description: `${goal.attributes.name} (objetivo #${goal.id})`,
+      amount: nav,
+      balance: nav,
+      source: MOVEMENT_SOURCE.account,
+    };
+  });
 
   const totalBalance = goals.reduce((sum, g) => sum + g.attributes.nav, 0);
 

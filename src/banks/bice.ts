@@ -94,7 +94,7 @@ async function login(
   }
   await doSave(loginPage, "02-login-form");
 
-  debugLog.push("5. Filling RUT...");
+  debugLog.push("3. Filling RUT...");
   const rutField = await loginPage.$("#username");
   if (!rutField) {
     const ss = await loginPage.screenshot({ encoding: "base64" });
@@ -103,7 +103,7 @@ async function login(
   await rutField.click();
   await rutField.type(rut.replace(/[.\-]/g, ""), { delay: 50 });
 
-  debugLog.push("6. Filling password...");
+  debugLog.push("4. Filling password...");
   const passField = await loginPage.$("#password");
   if (!passField) {
     const ss = await loginPage.screenshot({ encoding: "base64" });
@@ -113,7 +113,7 @@ async function login(
   await passField.type(password, { delay: 50 });
   await delay(500);
 
-  debugLog.push("7. Submitting login...");
+  debugLog.push("5. Submitting login...");
   await doSave(loginPage, "03-pre-submit");
   const submitBtn = await loginPage.$("#kc-login");
   if (submitBtn) await submitBtn.click();
@@ -132,7 +132,7 @@ async function login(
     return { success: false, error: `Error de login: ${errorText || "Credenciales inválidas"}`, screenshot: ss as string };
   }
 
-  debugLog.push("8. Login OK!");
+  debugLog.push("6. Login OK!");
   return { success: true, activePage: loginPage };
 }
 
@@ -287,7 +287,7 @@ async function scrapeBice(session: BrowserSession, options: ScraperOptions): Pro
 
   // Navigate to movements
   progress("Navegando a movimientos...");
-  debugLog.push("9. Navigating to movements...");
+  debugLog.push("7. Navigating to movements...");
   const link = await activePage.$("a.ultimosMov");
   if (!link) {
     const ss = await activePage.screenshot({ encoding: "base64" });
