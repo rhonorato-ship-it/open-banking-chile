@@ -11,11 +11,13 @@ interface PhaseEvent {
   done?: boolean;
   error?: boolean;
   requires_2fa?: boolean;
+  agentic?: boolean;
 }
 
 interface Props {
   bankId: string;
   bankName: string;
+  agentic?: boolean;
   onDone: () => void;
   onError: (msg: string) => void;
 }
@@ -31,13 +33,15 @@ const PHASES: { id: Phase; label: string }[] = [
 /** If no SSE message arrives within this window, assume the connection is dead. */
 const INACTIVITY_TIMEOUT_MS = 45_000;
 
-export default function ScrapeProgress({ bankId, bankName, onDone, onError }: Props) {
+export default function ScrapeProgress({ bankId, bankName, agentic = false, onDone, onError }: Props) {
   const [currentPhase, setCurrentPhase] = useState<Phase>(1);
   const [currentMessage, setCurrentMessage] = useState("");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [done, setDone] = useState(false);
   const [retryCount, setRetryCount] = useState(0);
   const [needs2FA, setNeeds2FA] = useState(false);
+  const [agenticSearching, setAgenticSearching] = useState(false);
+  const [agenticFound, setAgenticFound] = useState(false);
   const [twoFACode, setTwoFACode] = useState("");
   const [submitting2FA, setSubmitting2FA] = useState(false);
   const esRef = useRef<EventSource | null>(null);
@@ -65,11 +69,13 @@ export default function ScrapeProgress({ bankId, bankName, onDone, onError }: Pr
     setErrorMsg(null);
     setDone(false);
     setNeeds2FA(false);
+    setAgenticSearching(false);
+    setAgenticFound(false);
     needs2FARef.current = false;
     setTwoFACode("");
     setSubmitting2FA(false);
 
-    const es = new EventSource(`/api/scrape/${bankId}`);
+    const es = new EventSource(`/api/scrape/${bankId}${agentic ? '?mode=agentic' : ''}`);
     esRef.current = es;
 
     // Start the inactivity timer
@@ -88,29 +94,54 @@ export default function ScrapeProgress({ bankId, bankName, onDone, onError }: Pr
         setErrorMsg(data.message ?? "Error inesperado");
         setCurrentPhase(data.phase);
         setNeeds2FA(false);
+        setAgenticSearching(false);
         needs2FARef.current = false;
         es.close();
         return;
       }
 
       if (data.requires_2fa) {
-        setNeeds2FA(true);
         needs2FARef.current = true;
         setCurrentPhase(data.phase);
         if (data.message) setCurrentMessage(data.message);
-        // Extend timeout during 2FA (user needs time to get the code)
-        if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
-        inactivityTimerRef.current = setTimeout(() => {
-          es.close();
-          setErrorMsg("Tiempo de espera agotado para el código 2FA.");
-        }, 120_000); // 2 minutes for 2FA
-        setTimeout(() => codeInputRef.current?.focus(), 100);
+
+        if (data.agentic === true) {
+          // Agentic mode: server is searching Gmail for the code
+          setAgenticSearching(true);
+          setAgenticFound(false);
+          setNeeds2FA(false);
+          // Extend timeout — agentic polling can take a while
+          if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
+          inactivityTimerRef.current = setTimeout(() => {
+            es.close();
+            setErrorMsg("Tiempo de espera agotado buscando código en Gmail.");
+          }, 120_000);
+        } else {
+          // Manual mode (or agentic fallback to manual)
+          setAgenticSearching(false);
+          setNeeds2FA(true);
+          // Extend timeout during 2FA (user needs time to get the code)
+          if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
+          inactivityTimerRef.current = setTimeout(() => {
+            es.close();
+            setErrorMsg("Tiempo de espera agotado para el código 2FA.");
+          }, 120_000); // 2 minutes for 2FA
+          setTimeout(() => codeInputRef.current?.focus(), 100);
+        }
         return;
+      }
+
+      // Agentic: code found message — brief success flash
+      if (data.message === "Código encontrado — verificando...") {
+        setAgenticSearching(false);
+        setAgenticFound(true);
+        setTimeout(() => setAgenticFound(false), 2000);
       }
 
       // If we were waiting for 2FA and moved past phase 2, clear the input
       if (needs2FARef.current && data.phase > 2) {
         setNeeds2FA(false);
+        setAgenticSearching(false);
         needs2FARef.current = false;
       }
 
@@ -135,7 +166,7 @@ export default function ScrapeProgress({ bankId, bankName, onDone, onError }: Pr
       if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
       es.close();
     };
-  }, [bankId, retryCount, resetInactivityTimer]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [bankId, agentic, retryCount, resetInactivityTimer]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const submit2FACode = async () => {
     if (!twoFACode.trim() || submitting2FA) return;
@@ -231,7 +262,34 @@ export default function ScrapeProgress({ bankId, bankName, onDone, onError }: Pr
           })}
         </div>
 
-        {/* 2FA code input */}
+        {/* Agentic 2FA: searching Gmail */}
+        {agenticSearching && !errorMsg && (
+          <div className="mt-4 mb-2 flex items-center gap-3 px-4 py-3 rounded-xl bg-white/[0.04] border border-[#0ea5e9]/20">
+            <svg
+              className="w-5 h-5 text-[#0ea5e9] shrink-0"
+              viewBox="0 0 24 24"
+              fill="none"
+              style={{ animation: "agentic-pulse 1.5s ease-in-out infinite" }}
+            >
+              <circle cx="11" cy="11" r="7" stroke="currentColor" strokeWidth="2" />
+              <path d="M16 16l4.5 4.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+            </svg>
+            <span className="text-sm text-[#0ea5e9]">Buscando código en Gmail...</span>
+          </div>
+        )}
+
+        {/* Agentic 2FA: code found flash */}
+        {agenticFound && !errorMsg && (
+          <div className="mt-4 mb-2 flex items-center gap-3 px-4 py-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20">
+            <svg className="w-5 h-5 text-emerald-400 shrink-0" viewBox="0 0 24 24" fill="none">
+              <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="2" />
+              <path d="M8 12l3 3 5-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+            <span className="text-sm text-emerald-400">Código encontrado — verificando...</span>
+          </div>
+        )}
+
+        {/* 2FA code input (manual mode) */}
         {needs2FA && !errorMsg && (
           <div className="mt-4 mb-2">
             <p className="text-sm text-white/60 mb-2">{currentMessage}</p>
@@ -289,6 +347,10 @@ export default function ScrapeProgress({ bankId, bankName, onDone, onError }: Pr
         @keyframes ring-pulse {
           0%, 100% { box-shadow: 0 0 0 0 rgba(14,165,233,0.4); }
           50% { box-shadow: 0 0 0 6px rgba(14,165,233,0); }
+        }
+        @keyframes agentic-pulse {
+          0%, 100% { opacity: 0.6; transform: scale(1); }
+          50% { opacity: 1; transform: scale(1.15); }
         }
       `}</style>
     </div>

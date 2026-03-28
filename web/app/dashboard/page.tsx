@@ -55,6 +55,9 @@ export default function DashboardPage() {
   const [scraping, setScraping] = useState<{ id: string; name: string } | null>(null);
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState<string | null>(null);
+  const [agenticMode, setAgenticMode] = useState(false);
+  const [gmailConnected, setGmailConnected] = useState(false);
+  const [gmailLoading, setGmailLoading] = useState(true);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   function showToast(msg: string) {
@@ -82,10 +85,52 @@ export default function DashboardPage() {
     }
   }
 
+  async function loadGmailStatus() {
+    try {
+      const res = await fetch("/api/gmail/status");
+      if (res.ok) {
+        const data = await res.json();
+        setGmailConnected(data.connected ?? false);
+        setAgenticMode(data.agenticMode ?? false);
+      }
+    } catch {
+      // Gmail endpoints may not exist yet — default to off
+    } finally {
+      setGmailLoading(false);
+    }
+  }
+
+  async function toggleAgenticMode(enabled: boolean) {
+    setAgenticMode(enabled);
+    try {
+      await fetch("/api/gmail/toggle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled }),
+      });
+    } catch {
+      setAgenticMode(!enabled); // revert on error
+    }
+  }
+
+  async function disconnectGmail() {
+    try {
+      const res = await fetch("/api/gmail/disconnect", { method: "POST" });
+      if (res.ok) {
+        setGmailConnected(false);
+        setAgenticMode(false);
+        showToast("Gmail desconectado");
+      }
+    } catch {
+      showToast("Error al desconectar Gmail");
+    }
+  }
+
   useEffect(() => {
     loadBanks();
     loadSummary();
     loadCoach();
+    loadGmailStatus();
   }, []);
 
   const connected = banks.filter((b) => b.connected);
@@ -398,12 +443,59 @@ export default function DashboardPage() {
             <p className="text-center text-white/20 text-xs mt-6">Conecta un banco para empezar a sincronizar.</p>
           )}
         </section>
+
+        {/* ── Agentic Mode Settings ── */}
+        {!loading && !gmailLoading && (
+          <section className="flex items-center justify-between gap-4 px-4 py-3 rounded-2xl border border-white/[0.07] bg-white/[0.03]">
+            <div className="flex items-center gap-3 min-w-0">
+              <label className="flex items-center gap-2.5 cursor-pointer select-none">
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={agenticMode}
+                  onClick={() => toggleAgenticMode(!agenticMode)}
+                  className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${agenticMode ? "bg-[#0ea5e9]" : "bg-white/10"}`}
+                >
+                  <span
+                    className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${agenticMode ? "translate-x-[18px]" : "translate-x-[3px]"}`}
+                  />
+                </button>
+                <span className="text-sm text-white/60">Sincronización agéntica</span>
+              </label>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              {agenticMode && !gmailConnected && (
+                <a
+                  href="/api/gmail/connect"
+                  className="px-3 py-1.5 rounded-lg border border-[#0ea5e9]/30 text-xs text-[#0ea5e9] hover:bg-[#0ea5e9]/10 transition-colors"
+                >
+                  Conecta Gmail
+                </a>
+              )}
+              {agenticMode && gmailConnected && (
+                <>
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-500/10 text-xs text-emerald-400">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                    Gmail conectado
+                  </span>
+                  <button
+                    onClick={disconnectGmail}
+                    className="text-xs text-white/25 hover:text-white/50 transition-colors"
+                  >
+                    Desconectar
+                  </button>
+                </>
+              )}
+            </div>
+          </section>
+        )}
       </main>
 
       {scraping && (
         <ScrapeProgress
           bankId={scraping.id}
           bankName={scraping.name}
+          agentic={agenticMode && gmailConnected}
           onDone={() => { setScraping(null); loadBanks(); loadSummary(); loadCoach(); showToast(`${scraping.name} sincronizado`); }}
           onError={() => { setScraping(null); loadBanks(); }}
         />
