@@ -129,11 +129,23 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
         const needsBrowser = bank.mode !== "api";
         let chromePath: string | undefined;
         let launchArgs: string[] | undefined;
+        let remoteCDP: string | undefined;
         if (needsBrowser) {
-          const chromium = (await import("@sparticuz/chromium")).default;
-          chromePath = await chromium.executablePath();
-          launchArgs = chromium.args.filter((a: string) => !a.startsWith("--headless"));
-          launchArgs.push("--headless=shell");
+          // Prefer remote browser service (full Chrome, no bot detection issues)
+          const browserWsUrl = process.env.BROWSER_WS_URL;
+          const browserbaseKey = process.env.BROWSERBASE_API_KEY;
+
+          if (browserWsUrl) {
+            remoteCDP = browserWsUrl;
+          } else if (browserbaseKey) {
+            remoteCDP = `wss://connect.browserbase.com?apiKey=${browserbaseKey}`;
+          } else {
+            // Fallback: local @sparticuz/chromium (headless-shell, may be blocked by bot protection)
+            const chromium = (await import("@sparticuz/chromium")).default;
+            chromePath = await chromium.executablePath();
+            launchArgs = chromium.args.filter((a: string) => !a.startsWith("--headless"));
+            launchArgs.push("--headless=shell");
+          }
         }
 
         // ── 2FA callback ─────────────────────────────────────────
@@ -196,6 +208,7 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
         const scrapePromise = bank.scrape({
           rut,
           password,
+          ...(remoteCDP ? { remoteCDP } : {}),
           ...(chromePath ? { chromePath } : {}),
           ...(launchArgs ? { launchArgs } : {}),
           onTwoFactorCode,

@@ -115,6 +115,12 @@ export interface ScraperOptions extends BankCredentials {
    * Useful for skipping login when the user already has an active session.
    */
   userDataDir?: string;
+  /**
+   * CDP WebSocket URL for a remote browser service (BrowserBase, Browserless, etc.).
+   * When set, connects to the remote browser instead of launching a local one.
+   * Bypasses @sparticuz/chromium entirely — the remote service provides full Chrome.
+   */
+  remoteCDP?: string;
 }
 
 /** Interfaz que debe implementar cada banco */

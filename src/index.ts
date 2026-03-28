@@ -35,11 +35,12 @@ export const banks: Record<string, BankScraper> = {
 };
 
 /** Lista de bancos soportados */
-export function listBanks(): Array<{ id: string; name: string; url: string }> {
+export function listBanks(): Array<{ id: string; name: string; url: string; mode: "api" | "browser" }> {
   return Object.values(banks).map((b) => ({
     id: b.id,
     name: b.name,
     url: b.url,
+    mode: b.mode ?? "browser",
   }));
 }
 

@@ -22,6 +22,12 @@ export interface BrowserOptions {
    * Cannot be used with launchArgs (Vercel/Lambda).
    */
   userDataDir?: string;
+  /**
+   * CDP WebSocket URL for a remote browser service (BrowserBase, Browserless, etc.).
+   * When set, connects via CDP instead of launching a local browser.
+   * Bypasses chromePath, launchArgs, and @sparticuz/chromium entirely.
+   */
+  remoteCDP?: string;
 }
 
 export interface BrowserSession {
@@ -77,8 +83,34 @@ export async function launchBrowser(
   options: BrowserOptions,
   saveScreenshots: boolean,
 ): Promise<BrowserSession> {
-  const { chromePath, headful, forceHeadful, extraArgs, viewport, launchArgs, userDataDir } = options;
+  const { chromePath, headful, forceHeadful, extraArgs, viewport, launchArgs, userDataDir, remoteCDP } = options;
   const debugLog: string[] = [];
+
+  // ── Remote browser (BrowserBase, Browserless, etc.) ──────────
+  // Connects via CDP WebSocket — full Chrome on remote infrastructure.
+  // Bypasses all local chromium concerns (bot detection, headless binary, IP reputation).
+  if (remoteCDP) {
+    debugLog.push(`Connecting to remote browser: ${remoteCDP.replace(/apiKey=[^&]+/, "apiKey=***")}`);
+    const browser = await chromium.connectOverCDP(remoteCDP);
+
+    const vp = viewport || { width: 1280, height: 900 };
+    const context = await browser.newContext({
+      userAgent: DEFAULT_UA,
+      viewport: vp,
+      locale: "es-CL",
+      bypassCSP: true,
+    });
+
+    await addStealthScripts(context);
+    const page = await context.newPage();
+
+    const doSave = async (p: Page, name: string) =>
+      saveScreenshot(p, name, saveScreenshots, debugLog);
+
+    return { browser, context, page, debugLog, screenshot: doSave };
+  }
+
+  // ── Local browser launch ─────────────────────────────────────
 
   // Some banks (e.g. BancoEstado) block headless browsers via TLS fingerprinting
   // and require a visible Chrome window. On Linux this needs a display server.
@@ -108,6 +140,12 @@ export async function launchBrowser(
     ? ensureStealthArgs(launchArgs)
     : [...DEFAULT_ARGS, ...(isLambda ? LAMBDA_ARGS : []), ...(extraArgs || [])];
 
+  // Add proxy support
+  const proxyUrl = process.env.PROXY_URL;
+  if (proxyUrl && !effectiveLaunchArgs.some((a) => a.startsWith("--proxy-server"))) {
+    effectiveLaunchArgs.push(`--proxy-server=${proxyUrl}`);
+  }
+
   // Determine headless mode
   // When caller provides launchArgs (e.g. @sparticuz/chromium.args), the headless
   // flag is already embedded in those args -- launch in headless mode.
@@ -130,30 +168,7 @@ export async function launchBrowser(
     bypassCSP: true,
   });
 
-  // Additional stealth overrides. Playwright already handles most fingerprinting
-  // vectors natively, but these cover edge cases that some banking bot-detection
-  // systems specifically check.
-  await context.addInitScript(() => {
-    // Belt-and-suspenders: ensure webdriver is false
-    Object.defineProperty(navigator, "webdriver", { get: () => false });
-
-    // Simulate non-empty plugin array (headless Chrome reports empty plugins)
-    Object.defineProperty(navigator, "plugins", {
-      get: () => [1, 2, 3, 4, 5],
-    });
-
-    // Override languages to match Chilean locale
-    Object.defineProperty(navigator, "languages", {
-      get: () => ["es-CL", "es", "en-US", "en"],
-    });
-
-    // Fix permissions API inconsistency that headless Chrome exposes
-    const originalQuery = window.navigator.permissions.query;
-    window.navigator.permissions.query = (parameters: PermissionDescriptor) =>
-      parameters.name === "notifications"
-        ? Promise.resolve({ state: Notification.permission } as PermissionStatus)
-        : originalQuery(parameters);
-  });
+  await addStealthScripts(context);
 
   const page = await context.newPage();
 
@@ -161,6 +176,28 @@ export async function launchBrowser(
     saveScreenshot(p, name, saveScreenshots, debugLog);
 
   return { browser, context, page, debugLog, screenshot: doSave };
+}
+
+/**
+ * Adds stealth overrides to a browser context. Playwright handles most
+ * fingerprinting vectors natively, but these cover edge cases that some
+ * banking bot-detection systems specifically check.
+ */
+async function addStealthScripts(context: BrowserContext): Promise<void> {
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => false });
+    Object.defineProperty(navigator, "plugins", {
+      get: () => [1, 2, 3, 4, 5],
+    });
+    Object.defineProperty(navigator, "languages", {
+      get: () => ["es-CL", "es", "en-US", "en"],
+    });
+    const originalQuery = window.navigator.permissions.query;
+    window.navigator.permissions.query = (parameters: PermissionDescriptor) =>
+      parameters.name === "notifications"
+        ? Promise.resolve({ state: Notification.permission } as PermissionStatus)
+        : originalQuery(parameters);
+  });
 }
 
 /**

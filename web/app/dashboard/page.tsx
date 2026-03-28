@@ -14,6 +14,7 @@ interface BankStatus {
   isSyncing: boolean;
   balance: number | null;
   change30d: number | null;
+  mode?: "api" | "browser";
 }
 
 interface DashboardSummary {
@@ -218,7 +219,14 @@ export default function DashboardPage() {
                           </p>
                         </div>
                       </div>
-                      <div className="w-2 h-2 rounded-full bg-emerald-500" title="Conectado" />
+                      <div className="flex items-center gap-1.5">
+                        {(b.mode ?? "browser") === "api" ? (
+                          <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-emerald-100 text-emerald-600 font-medium" title="API directa — siempre funciona">API</span>
+                        ) : (
+                          <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-600 font-medium" title="Requiere navegador">Browser</span>
+                        )}
+                        <div className="w-2 h-2 rounded-full bg-emerald-500" title="Conectado" />
+                      </div>
                     </div>
 
                     {b.balance !== null && (

@@ -22,7 +22,7 @@ export async function runScraper(
   browserOptions: Partial<BrowserOptions>,
   scrapeFn: ScrapeFn,
 ): Promise<ScrapeResult> {
-  const { rut, password, chromePath, saveScreenshots, headful, launchArgs, userDataDir } = options;
+  const { rut, password, chromePath, saveScreenshots, headful, launchArgs, userDataDir, remoteCDP } = options;
 
   if (!rut || !password) {
     return {
@@ -37,7 +37,7 @@ export async function runScraper(
 
   try {
     session = await launchBrowser(
-      { chromePath, headful, launchArgs, userDataDir, ...browserOptions },
+      { chromePath, headful, launchArgs, userDataDir, remoteCDP, ...browserOptions },
       !!saveScreenshots,
     );
 
