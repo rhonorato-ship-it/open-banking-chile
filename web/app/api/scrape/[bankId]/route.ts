@@ -28,6 +28,9 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
   const { bankId } = await params;
   const userId = session.user.id;
 
+  const url = new URL(req.url);
+  const mode = url.searchParams.get("mode") === "agentic" ? "agentic" : "manual";
+
   const bank = getBank(bankId);
   if (!bank) return new Response("Bank not found", { status: 404 });
 
@@ -135,7 +138,43 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
 
         // ── 2FA callback ─────────────────────────────────────────
         const onTwoFactorCode = async (): Promise<string> => {
-          send({ phase: 2, requires_2fa: true, label: "Verificación requerida", message: "El banco solicita un código de verificación. Ingresa el código que recibiste." });
+          if (mode === "agentic") {
+            // Agentic mode: search Gmail for the code
+            send({ phase: 2, requires_2fa: true, agentic: true, label: "Verificación requerida", message: "Buscando código en Gmail..." });
+
+            // Import gmail module dynamically to avoid loading it for manual syncs
+            const { searchFor2FACode } = await import("@/lib/gmail");
+
+            // Bank-specific search (15s)
+            const bankDeadline = Date.now() + 15_000;
+            while (Date.now() < bankDeadline) {
+              const code = await searchFor2FACode(userId, bankId);
+              if (code) {
+                send({ phase: 2, message: "Código encontrado — verificando..." });
+                return code;
+              }
+              await new Promise(r => setTimeout(r, 3000));
+            }
+
+            // Generic fallback search (15s more)
+            send({ phase: 2, message: "Ampliando búsqueda..." });
+            const genericDeadline = Date.now() + 15_000;
+            while (Date.now() < genericDeadline) {
+              const code = await searchFor2FACode(userId, "__generic__");
+              if (code) {
+                send({ phase: 2, message: "Código encontrado — verificando..." });
+                return code;
+              }
+              await new Promise(r => setTimeout(r, 3000));
+            }
+
+            // Fallback to manual
+            send({ phase: 2, requires_2fa: true, agentic: false, label: "Verificación requerida", message: "No se encontró código en Gmail — ingresa manualmente" });
+          } else {
+            send({ phase: 2, requires_2fa: true, label: "Verificación requerida", message: "El banco solicita un código de verificación. Ingresa el código que recibiste." });
+          }
+
+          // Manual polling (existing logic)
           const deadline = Date.now() + 90_000;
           while (Date.now() < deadline) {
             await new Promise(r => setTimeout(r, 2000));
