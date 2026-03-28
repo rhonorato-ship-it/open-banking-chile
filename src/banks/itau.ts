@@ -26,11 +26,33 @@ async function itauLogin(
   doSave: (page: Page, name: string) => Promise<void>,
 ): Promise<{ success: boolean; error?: string; screenshot?: string }> {
   debugLog.push("1. Navigating to login page...");
-  await page.goto(LOGIN_URL, { waitUntil: "networkidle2", timeout: 30000 });
-  await delay(2000);
+  // Itaú uses Imperva/Incapsula bot protection — networkidle2 may never fire.
+  // Use domcontentloaded + explicit wait for the login form instead.
+  try {
+    await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
+  } catch {
+    // timeout on initial load — may still render
+  }
+  await delay(3000);
   await doSave(page, "01-login");
 
+  // Check for Imperva block page
+  const blocked = await page.evaluate(() => {
+    const text = document.body?.innerText || "";
+    return text.includes("No pudimos validar tu acceso") || text.includes("Please stand by");
+  });
+  if (blocked) {
+    const ss = await page.screenshot({ encoding: "base64" });
+    return {
+      success: false,
+      error: "Itaú bloqueó el acceso (protección anti-bot Imperva). Usa --profile para abrir Chrome con tu perfil real.",
+      screenshot: ss as string,
+    };
+  }
+
   debugLog.push("2. Filling RUT...");
+  // Wait for the login form to render (WPS portal loads slowly)
+  try { await page.waitForSelector("#loginNameID", { timeout: 10000 }); } catch { /* may already be present */ }
   const rutEl = await page.$("#loginNameID");
   if (!rutEl) {
     const ss = await page.screenshot({ encoding: "base64" });

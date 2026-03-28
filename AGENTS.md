@@ -29,29 +29,44 @@ Open source scraping framework for Chilean banks. Extracts account movements and
 
 ---
 
-## Scraper strategy (API-first)
+## Scraper strategy (API-first — MANDATORY)
 
-When adding or fixing a scraper, follow this priority order:
+**Chromium is a last resort.** Every bank, investment platform, and financial service should be scraped via API or CLI whenever possible. Do NOT default to opening a browser.
 
-1. **API first** — If the service has a REST/GraphQL API, use `fetch()` via `runApiScraper()` from `src/infrastructure/api-runner.ts`. No browser, no Puppeteer, no Chromium. Set `mode: "api"` on the `BankScraper`. Example: Fintual uses `POST /api/access_tokens` + `GET /api/goals`.
+### Priority order (strict)
 
-2. **Browser with user's Chrome profile** — If a browser is needed (no known API, complex JS rendering), prefer the user's system Chrome with `userDataDir` for local/CLI usage. This leverages existing cookies, sessions, and saved passwords. Use `--profile` flag in CLI.
+1. **Direct API (`fetch()`)** — The default. Check DevTools Network tab, Swagger docs, or mobile app traffic for REST/GraphQL endpoints. Use `runApiScraper()` from `src/infrastructure/api-runner.ts`. Set `mode: "api"` on the `BankScraper`. Zero browser dependencies.
+   - Example: Fintual → `POST /api/access_tokens` + `GET /api/goals`
+   - Example: Banco de Chile already uses in-browser `fetch()` for its API — should be migrated to direct API calls
 
-3. **Headless Chromium** — Last resort, used on Vercel/Lambda via `@sparticuz/chromium`. Only for traditional banks with no API alternative.
+2. **In-browser API calls** — If auth requires a browser but data comes from JSON APIs, log in with Puppeteer then call the APIs via `page.evaluate(fetch(...))`. This is an intermediate step toward full API migration.
+   - Example: Banco de Chile currently does this (should be step 1 eventually)
 
-**When to open a browser window:**
-- The service has no usable API
-- Authentication requires 2FA, CAPTCHA, or OAuth that can't be done via API
-- The scraper should automate everything — minimize manual user interaction
+3. **Browser with user's Chrome profile** — When a browser is truly needed (no API, complex JS rendering, 2FA/OAuth), use the user's real Chrome via `--profile` flag. This leverages existing cookies, sessions, and saved passwords — avoids bot detection entirely.
 
-**When NOT to open a browser:**
-- The service has a REST API (even if undocumented — check DevTools Network tab)
-- Auth is email+password with a token response
-- Data is available as JSON from API endpoints
+4. **Headless Chromium on Vercel** — Absolute last resort. Many banks block headless Chrome (Imperva, Incapsula, reCAPTCHA). Only use `@sparticuz/chromium` for banks proven to work headless.
 
-**Key files:**
+### Before writing ANY scraper code
+
+1. Open the bank/platform's website in Chrome DevTools → Network tab
+2. Log in manually and observe the XHR/Fetch requests
+3. Look for JSON API responses — these are your targets
+4. Check for Swagger/OpenAPI docs (try `/api-docs`, `/swagger.json`, `/api/v1`)
+5. Check if the platform has a mobile app — mobile APIs are often simpler and better documented
+6. Only after confirming there is NO usable API should you consider browser automation
+
+### Banks that should NOT use Chromium on Vercel (bot protection)
+
+These banks have Imperva, Incapsula, or similar bot detection that blocks headless Chrome. They will fail on Vercel and should either be migrated to API or used with `--profile` locally:
+
+- **Itaú** — Imperva blocks headless Chrome ("No pudimos validar tu acceso")
+- **BICE** — Homepage returns 403 to non-browser requests
+- **BancoEstado** — Requires `forceHeadful: true` (TLS fingerprinting)
+
+### Key files
+
 - `src/infrastructure/api-runner.ts` — Browser-free runner for API scrapers
-- `src/infrastructure/scraper-runner.ts` — Browser-based runner for traditional scrapers
+- `src/infrastructure/scraper-runner.ts` — Browser-based runner (use only when necessary)
 - `src/infrastructure/browser.ts` — Puppeteer launch with `userDataDir` support
 
 ---

@@ -8,6 +8,8 @@ import type { BrowserSession } from "../infrastructure/browser.js";
 // ─── BICE-specific constants ─────────────────────────────────────
 
 const BANK_URL = "https://banco.bice.cl/personas";
+// Direct portal URL — triggers Keycloak redirect without needing the homepage dropdown
+const PORTAL_URL = "https://portalpersonas.bice.cl";
 
 // ─── BICE-specific helpers ───────────────────────────────────────
 
@@ -18,50 +20,73 @@ async function login(
   debugLog: string[],
   doSave: (page: Page, name: string) => Promise<void>,
 ): Promise<{ success: boolean; error?: string; screenshot?: string; activePage?: Page }> {
-  debugLog.push("1. Navigating to bank homepage...");
-  await page.goto(BANK_URL, { waitUntil: "networkidle2", timeout: 30000 });
-  await delay(2000);
-  await doSave(page, "01-homepage");
-
-  debugLog.push("2. Opening login dropdown...");
-  const loginDropdown = await page.$("#login-dropdown");
-  if (!loginDropdown) {
-    const ss = await page.screenshot({ encoding: "base64" });
-    return { success: false, error: "No se encontró el botón de login (#login-dropdown)", screenshot: ss as string };
-  }
-  await loginDropdown.click();
-  await delay(1500);
-
-  try { await page.waitForSelector(".dropdown-menu.show", { timeout: 5000 }); } catch { await loginDropdown.click(); await delay(2000); }
-
-  debugLog.push("3. Clicking 'Personas'...");
-  const personasLink = await page.$('a[data-click="Personas"]');
-  if (!personasLink) {
-    const ss = await page.screenshot({ encoding: "base64" });
-    return { success: false, error: "No se encontró el link 'Personas'", screenshot: ss as string };
-  }
-  await personasLink.click();
-
-  // Multi-redirect: banco.bice.cl → portalpersonas → auth.bice.cl
-  debugLog.push("4. Waiting for login form...");
   const browser = page.browser();
   let loginPage = page;
+
+  // Strategy 1: Navigate directly to portal — triggers Keycloak redirect without homepage
+  debugLog.push("1. Navigating directly to portal (skipping homepage)...");
+  await page.goto(PORTAL_URL, { waitUntil: "networkidle2", timeout: 30000 });
+  await delay(2000);
+
+  // Check if we landed on Keycloak login or got redirected there
+  let foundKeycloak = page.url().includes("auth.bice.cl");
+  if (!foundKeycloak) {
+    // Check all pages (Keycloak may open in a new tab)
+    const allPages = await browser.pages();
+    for (const p of allPages) {
+      if (p.url().includes("auth.bice.cl")) {
+        loginPage = p;
+        foundKeycloak = true;
+        break;
+      }
+    }
+  }
+
+  // Strategy 2: Fall back to homepage dropdown if direct portal didn't reach Keycloak
+  if (!foundKeycloak) {
+    debugLog.push("  Direct portal didn't reach Keycloak — trying homepage dropdown...");
+    await page.goto(BANK_URL, { waitUntil: "networkidle2", timeout: 30000 });
+    await delay(2000);
+    await doSave(page, "01-homepage");
+
+    const loginDropdown = await page.$("#login-dropdown");
+    if (!loginDropdown) {
+      const ss = await page.screenshot({ encoding: "base64" });
+      return { success: false, error: "No se encontró el botón de login (#login-dropdown)", screenshot: ss as string };
+    }
+    await loginDropdown.click();
+    await delay(1500);
+
+    try { await page.waitForSelector(".dropdown-menu.show", { timeout: 5000 }); } catch { await loginDropdown.click(); await delay(2000); }
+
+    const personasLink = await page.$('a[data-click="Personas"]');
+    if (!personasLink) {
+      const ss = await page.screenshot({ encoding: "base64" });
+      return { success: false, error: "No se encontró el link 'Personas'", screenshot: ss as string };
+    }
+    await personasLink.click();
+  }
+
+  // Wait for Keycloak login form
+  debugLog.push("2. Waiting for Keycloak login form...");
   try {
-    await new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error("timeout")), 25000);
-      const interval = setInterval(async () => {
-        const allPages = await browser.pages();
-        for (const p of allPages) {
-          if (p.url().includes("auth.bice.cl")) {
-            loginPage = p;
-            clearInterval(interval);
-            clearTimeout(timeout);
-            resolve();
-            return;
+    if (!foundKeycloak) {
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error("timeout")), 25000);
+        const interval = setInterval(async () => {
+          const allPages = await browser.pages();
+          for (const p of allPages) {
+            if (p.url().includes("auth.bice.cl")) {
+              loginPage = p;
+              clearInterval(interval);
+              clearTimeout(timeout);
+              resolve();
+              return;
+            }
           }
-        }
-      }, 1000);
-    });
+        }, 1000);
+      });
+    }
     await loginPage.waitForSelector("#username", { timeout: 15000 });
   } catch {
     const ss = await loginPage.screenshot({ encoding: "base64" });
