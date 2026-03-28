@@ -1,4 +1,4 @@
-import type { Page } from "puppeteer-core";
+import type { Page } from "playwright-core";
 import { delay } from "../utils.js";
 
 /** Click an element matching one of the given text labels */
@@ -9,7 +9,7 @@ export async function clickByText(
 ): Promise<boolean> {
   for (const text of texts) {
     const clicked = await page.evaluate(
-      (targetText: string, types: string) => {
+      ({ targetText, types }: { targetText: string; types: string }) => {
         const candidates = Array.from(document.querySelectorAll(types));
         for (const candidate of candidates) {
           const innerText = (candidate as HTMLElement).innerText?.trim().toLowerCase();
@@ -21,8 +21,7 @@ export async function clickByText(
         }
         return false;
       },
-      text.toLowerCase(),
-      elementTypes,
+      { targetText: text.toLowerCase(), types: elementTypes },
     );
 
     if (clicked) return true;
@@ -39,7 +38,7 @@ export async function clickSidebarItem(
   maxX = 300,
 ): Promise<boolean> {
   const clicked = await page.evaluate(
-    (ids: string[], texts: string[], mx: number) => {
+    ({ ids, texts, mx }: { ids: string[]; texts: string[]; mx: number }) => {
       for (const id of ids) {
         const el = document.querySelector(id) as HTMLElement | null;
         if (el) {
@@ -61,9 +60,7 @@ export async function clickSidebarItem(
 
       return false;
     },
-    selectorIds,
-    textPatterns,
-    maxX,
+    { ids: selectorIds, texts: textPatterns, mx: maxX },
   );
 
   return clicked;

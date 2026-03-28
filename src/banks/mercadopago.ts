@@ -367,7 +367,7 @@ async function extractActivities(session: BrowserSession): Promise<BankMovement[
 
   // Navigate to activities page
   debugLog.push("  Navigating to activities page...");
-  await page.goto(ACTIVITIES_URL, { waitUntil: "networkidle2", timeout: 30_000 });
+  await page.goto(ACTIVITIES_URL, { waitUntil: "networkidle", timeout: 30_000 });
   await delay(3000); // wait for SPA to render
 
   await session.screenshot(page, "mercadopago-activities");
@@ -550,7 +550,7 @@ async function scrapeMercadopago(
   // Step 1: Navigate to MercadoPago (redirects to ML login)
   debugLog.push("1. Navigating to MercadoPago home...");
   progress("Abriendo MercadoPago...");
-  await page.goto(HOME_URL, { waitUntil: "networkidle2", timeout: 45_000 });
+  await page.goto(HOME_URL, { waitUntil: "networkidle", timeout: 45_000 });
   await delay(2000);
   await doSave(page, "mercadopago-01-initial");
 
@@ -623,7 +623,7 @@ async function scrapeMercadopago(
 
     // Wait for navigation after login
     try {
-      await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 20_000 });
+      await page.waitForNavigation({ waitUntil: "networkidle", timeout: 20_000 });
     } catch {
       // Navigation might have already happened or be slower
       await delay(3000);
@@ -654,7 +654,7 @@ async function scrapeMercadopago(
 
       // Wait for redirect after 2FA
       try {
-        await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15_000 });
+        await page.waitForNavigation({ waitUntil: "networkidle", timeout: 15_000 });
       } catch {
         await delay(3000);
       }
@@ -696,7 +696,7 @@ async function scrapeMercadopago(
 
   // Navigate to home/dashboard if not already there
   if (!page.url().includes("mercadopago.cl")) {
-    await page.goto(HOME_URL, { waitUntil: "networkidle2", timeout: 30_000 });
+    await page.goto(HOME_URL, { waitUntil: "networkidle", timeout: 30_000 });
     await delay(2000);
   }
 

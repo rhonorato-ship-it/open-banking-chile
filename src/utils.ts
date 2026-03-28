@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import type { Page } from "puppeteer-core";
+import type { Page } from "playwright-core";
 import type { BankMovement, CardOwner } from "./types.js";
 import { CARD_OWNER } from "./types.js";
 

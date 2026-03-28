@@ -1,4 +1,4 @@
-import type { Page } from "puppeteer-core";
+import type { Page } from "playwright-core";
 import type { BankMovement } from "../types.js";
 import { MOVEMENT_SOURCE } from "../types.js";
 import { parseChileanAmount, normalizeDate, deduplicateMovements, delay } from "../utils.js";

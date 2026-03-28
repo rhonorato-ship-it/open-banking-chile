@@ -1,4 +1,4 @@
-import type { Page } from "puppeteer-core";
+import type { Page } from "playwright-core";
 import { delay, deduplicateMovements } from "../utils.js";
 import type { BankMovement } from "../types.js";
 

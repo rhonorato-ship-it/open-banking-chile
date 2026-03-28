@@ -1,4 +1,4 @@
-import type { Frame, Page } from "puppeteer-core";
+import type { Frame, Page } from "playwright-core";
 import { formatRut } from "../utils.js";
 
 type LoginContext = Page | Frame;
@@ -87,7 +87,7 @@ export async function fillRut(
 
   // Fallback: find first visible text input
   try {
-    return await context.evaluate((rutFormatted: string, rutClean: string) => {
+    return await context.evaluate(({ rutFormatted, rutClean }: { rutFormatted: string; rutClean: string }) => {
       const candidates = Array.from(document.querySelectorAll("input"));
       for (const input of candidates) {
         const el = input as HTMLInputElement;
@@ -99,7 +99,7 @@ export async function fillRut(
         return true;
       }
       return false;
-    }, formatted, clean);
+    }, { rutFormatted: formatted, rutClean: clean });
   } catch {
     return false;
   }
@@ -137,7 +137,7 @@ export async function clickSubmit(
   const texts = selectors?.submitTexts || DEFAULT_SUBMIT_TEXTS;
 
   const clicked = await context.evaluate(
-    (sels: string[], txts: string[]) => {
+    ({ sels, txts }: { sels: string[]; txts: string[] }) => {
       // Try selectors first
       for (const sel of sels) {
         const el = document.querySelector(sel) as HTMLElement | null;
@@ -167,8 +167,7 @@ export async function clickSubmit(
 
       return false;
     },
-    allSelectors,
-    texts,
+    { sels: allSelectors, txts: texts },
   );
 
   if (!clicked) {

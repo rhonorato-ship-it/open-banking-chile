@@ -1,5 +1,7 @@
-import puppeteer, { type Browser, type Page } from "puppeteer-core";
+import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
 import { findChrome, saveScreenshot } from "../utils.js";
+
+export type { Browser, BrowserContext, Page };
 
 export interface BrowserOptions {
   chromePath?: string;
@@ -24,6 +26,7 @@ export interface BrowserOptions {
 
 export interface BrowserSession {
   browser: Browser;
+  context: BrowserContext;
   page: Page;
   debugLog: string[];
   /** Save a named screenshot (noop if screenshots disabled) */
@@ -35,8 +38,8 @@ const DEFAULT_ARGS = [
   "--disable-setuid-sandbox",
   "--disable-dev-shm-usage",
   "--disable-gpu",
-  "--window-size=1280,900",
   "--disable-blink-features=AutomationControlled",
+  "--disable-features=IsolateOrigins,site-per-process",
 ];
 
 // Required when running Chromium inside a container (Vercel / AWS Lambda)
@@ -49,19 +52,25 @@ const DEFAULT_UA =
 /**
  * Launches a browser session for scraping.
  *
- * NOTE — Lightpanda (https://lightpanda.io) as a future alternative:
+ * Uses Playwright's Chromium driver which natively bypasses bot detection
+ * systems such as Cloudflare Turnstile without requiring stealth plugins.
+ * Playwright's browser automation protocol (CDP + custom) avoids the
+ * fingerprinting vectors that Puppeteer exposes:
+ * - No navigator.webdriver leak
+ * - No Chrome automation flags (cdc_ variables)
+ * - No WebGL/plugin enumeration inconsistencies
+ *
+ * NOTE -- Lightpanda (https://lightpanda.io) as a future alternative:
  * Lightpanda is a headless browser written in Zig that uses ~10-20x less memory
  * and runs ~10x faster than Chrome. It supports the Chrome DevTools Protocol (CDP),
- * so swapping would only require changing this function to use puppeteer.connect():
+ * so swapping would only require changing this function to use chromium.connectOverCDP():
  *
- *   const browser = await puppeteer.connect({
- *     browserWSEndpoint: "ws://127.0.0.1:9222", // Lightpanda serving CDP
- *   });
+ *   const browser = await chromium.connectOverCDP("http://127.0.0.1:9222");
  *
  * It is NOT integrated yet because (as of early 2026) it is still in beta and has
  * two blockers for banking scrapers:
  *   1. iframe support is incomplete (BCI and Santander rely on iframes)
- *   2. No cookie import/export API (issue #335) — breaks session persistence
+ *   2. No cookie import/export API (issue #335) -- breaks session persistence
  * Worth revisiting once it hits v1.0.
  */
 export async function launchBrowser(
@@ -92,32 +101,86 @@ export async function launchBrowser(
     );
   }
 
-  // When caller provides launchArgs (e.g. @sparticuz/chromium.args), the headless
-  // flag is already embedded in those args — pass headless: false so puppeteer
-  // doesn't prepend a conflicting --headless=new flag.
-  // Otherwise default to "shell" mode (compatible with both chrome-headless-shell
-  // and regular Chrome) rather than true (which maps to --headless=new in v22+).
+  // Build launch args
   const isLambda = !!(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
-  const headlessMode: boolean | "shell" = forceHeadful ? false : (headful ? false : "shell");
-  const browser = await puppeteer.launch({
+
+  const effectiveLaunchArgs = launchArgs
+    ? ensureStealthArgs(launchArgs)
+    : [...DEFAULT_ARGS, ...(isLambda ? LAMBDA_ARGS : []), ...(extraArgs || [])];
+
+  // Determine headless mode
+  // When caller provides launchArgs (e.g. @sparticuz/chromium.args), the headless
+  // flag is already embedded in those args -- launch in headless mode.
+  // Otherwise default to headless unless headful/forceHeadful is requested.
+  const isHeadless = launchArgs ? true : !(forceHeadful || headful);
+
+  const browser = await chromium.launch({
     executablePath,
-    headless: launchArgs ? false : headlessMode,
-    args: launchArgs ?? [...DEFAULT_ARGS, ...(isLambda ? LAMBDA_ARGS : []), ...(extraArgs || [])],
-    ...(userDataDir && !launchArgs ? { userDataDir } : {}),
+    headless: isHeadless,
+    args: effectiveLaunchArgs,
   });
 
-  const page = await browser.newPage();
   const vp = viewport || { width: 1280, height: 900 };
-  await page.setViewport(vp);
-  await page.setUserAgent(DEFAULT_UA);
 
-  // Hide automation signals
-  await page.evaluateOnNewDocument(() => {
-    Object.defineProperty(navigator, "webdriver", { get: () => false });
+  const context = await browser.newContext({
+    userAgent: DEFAULT_UA,
+    viewport: vp,
+    locale: "es-CL",
+    // Bypass CSP to allow page.evaluate in strict environments
+    bypassCSP: true,
   });
+
+  // Additional stealth overrides. Playwright already handles most fingerprinting
+  // vectors natively, but these cover edge cases that some banking bot-detection
+  // systems specifically check.
+  await context.addInitScript(() => {
+    // Belt-and-suspenders: ensure webdriver is false
+    Object.defineProperty(navigator, "webdriver", { get: () => false });
+
+    // Simulate non-empty plugin array (headless Chrome reports empty plugins)
+    Object.defineProperty(navigator, "plugins", {
+      get: () => [1, 2, 3, 4, 5],
+    });
+
+    // Override languages to match Chilean locale
+    Object.defineProperty(navigator, "languages", {
+      get: () => ["es-CL", "es", "en-US", "en"],
+    });
+
+    // Fix permissions API inconsistency that headless Chrome exposes
+    const originalQuery = window.navigator.permissions.query;
+    window.navigator.permissions.query = (parameters: PermissionDescriptor) =>
+      parameters.name === "notifications"
+        ? Promise.resolve({ state: Notification.permission } as PermissionStatus)
+        : originalQuery(parameters);
+  });
+
+  const page = await context.newPage();
 
   const doSave = async (p: Page, name: string) =>
     saveScreenshot(p, name, saveScreenshots, debugLog);
 
-  return { browser, page, debugLog, screenshot: doSave };
+  return { browser, context, page, debugLog, screenshot: doSave };
+}
+
+/**
+ * Ensures that caller-provided launch args (e.g. from @sparticuz/chromium)
+ * include the stealth-critical flags. Does not duplicate if already present.
+ * Also strips --headless flags since Playwright handles headless mode via
+ * its own launch option, not via Chrome args.
+ */
+function ensureStealthArgs(args: string[]): string[] {
+  const result = [...args];
+  const stealthFlags = [
+    "--disable-blink-features=AutomationControlled",
+    "--disable-features=IsolateOrigins,site-per-process",
+  ];
+  for (const flag of stealthFlags) {
+    if (!result.some((a) => a.startsWith(flag.split("=")[0]))) {
+      result.push(flag);
+    }
+  }
+  // Remove --enable-automation if present (conflicts with stealth)
+  // Remove --headless flags (Playwright manages headless mode via its launch option)
+  return result.filter((a) => a !== "--enable-automation" && !a.startsWith("--headless"));
 }

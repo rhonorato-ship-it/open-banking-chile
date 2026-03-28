@@ -119,7 +119,7 @@ async function itauLogin(
 
   // Step 5: Wait for navigation after login
   try {
-    await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 30_000 });
+    await page.waitForNavigation({ waitUntil: "networkidle", timeout: 30_000 });
   } catch {
     // Navigation might have already happened or be in progress
     await delay(5000);
@@ -243,7 +243,7 @@ async function extractBalance(session: BrowserSession): Promise<number | undefin
   debugLog.push("6. Extracting balance...");
 
   await page.goto(`${PORTAL_BASE}/cuentas/cuenta-corriente/saldos`, {
-    waitUntil: "networkidle2",
+    waitUntil: "networkidle",
     timeout: 30_000,
   });
   await delay(2000);
@@ -275,7 +275,7 @@ async function extractMovements(session: BrowserSession): Promise<BankMovement[]
   const allMovements: BankMovement[] = [];
 
   await page.goto(`${PORTAL_BASE}/cuentas/cuenta-corriente/saldos-ultimo-movimiento`, {
-    waitUntil: "networkidle2",
+    waitUntil: "networkidle",
     timeout: 30_000,
   });
   await delay(2000);
@@ -361,7 +361,7 @@ async function extractMovements(session: BrowserSession): Promise<BankMovement[]
 
     // Wait for page reload (WPS does full page reloads)
     try {
-      await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15_000 });
+      await page.waitForNavigation({ waitUntil: "networkidle", timeout: 15_000 });
     } catch {
       await delay(3000);
     }
@@ -386,7 +386,7 @@ async function extractCreditCardData(session: BrowserSession): Promise<{
   // Navigate to credit card summary (deuda) page
   try {
     await page.goto(`${PORTAL_BASE}/tarjeta-credito/resumen/deuda`, {
-      waitUntil: "networkidle2",
+      waitUntil: "networkidle",
       timeout: 30_000,
     });
   } catch {
@@ -504,7 +504,7 @@ async function extractCreditCardData(session: BrowserSession): Promise<{
   // Navigate to billed movements (cuenta-nacional)
   try {
     await page.goto(`${PORTAL_BASE}/tarjeta-credito/resumen/cuenta-nacional`, {
-      waitUntil: "networkidle2",
+      waitUntil: "networkidle",
       timeout: 30_000,
     });
     await delay(2000);

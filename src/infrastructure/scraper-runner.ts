@@ -14,7 +14,7 @@ export type ScrapeFn = (
  * 3. Launch browser
  * 4. Run bank-specific scrapeFn
  * 5. Logout + close browser
- * 6. Catch errors → return ScrapeResult
+ * 6. Catch errors -> return ScrapeResult
  */
 export async function runScraper(
   bankId: string,
@@ -53,7 +53,8 @@ export async function runScraper(
   } finally {
     if (session?.browser) {
       try {
-        const pages = await session.browser.pages();
+        // In Playwright, pages belong to the context, not the browser
+        const pages = session.context.pages();
         if (pages.length > 0) await logout(pages[pages.length - 1], session.debugLog);
       } catch { /* best effort */ }
       await session.browser.close().catch(() => {});

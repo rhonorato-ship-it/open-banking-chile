@@ -34,7 +34,7 @@
     "finanzas",
     "banking",
     "scraper",
-    "puppeteer",
+    "playwright",
     "banco-falabella",
     "banco-chile",
     "santander",
@@ -56,7 +56,7 @@
     "dotenv": "^17.3.1",
     "exceljs": "^4.4.0",
     "googleapis": "^146.0.0",
-    "puppeteer-core": "^24.0.0"
+    "playwright-core": "^1.58.2"
   },
   "devDependencies": {
     "@types/node": "^20",

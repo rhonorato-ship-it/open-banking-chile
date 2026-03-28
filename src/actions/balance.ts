@@ -1,4 +1,4 @@
-import type { Page } from "puppeteer-core";
+import type { Page } from "playwright-core";
 
 /** Default regex patterns to find balance text on page */
 const DEFAULT_PATTERNS = [
@@ -30,7 +30,7 @@ export async function extractBalance(
   const selectors = customSelectors || DEFAULT_SELECTORS;
 
   return await page.evaluate(
-    (pats: Array<{ source: string; flags: string }>, sels: string[]) => {
+    ({ pats, sels }: { pats: Array<{ source: string; flags: string }>; sels: string[] }) => {
       const text = document.body?.innerText || "";
 
       for (const pat of pats) {
@@ -54,7 +54,6 @@ export async function extractBalance(
 
       return undefined;
     },
-    patterns,
-    selectors,
+    { pats: patterns, sels: selectors },
   );
 }

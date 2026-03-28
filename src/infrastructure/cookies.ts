@@ -5,7 +5,7 @@
  * so that subsequent runs reuse an existing authenticated session,
  * avoiding 2FA challenges on banks that use device-recognition (e.g. MercadoPago).
  *
- * On Vercel / serverless the cache dir lives in /tmp (ephemeral) — cookies are
+ * On Vercel / serverless the cache dir lives in /tmp (ephemeral) -- cookies are
  * available within a warm function instance but not across cold starts.
  */
 
@@ -13,7 +13,7 @@ import { readFile, writeFile, mkdir } from "fs/promises";
 import { existsSync } from "fs";
 import { join } from "path";
 import { homedir, tmpdir } from "os";
-import type { Page } from "puppeteer-core";
+import type { BrowserContext } from "playwright-core";
 
 function getCookieDir(): string {
   // Vercel / Lambda: /tmp is the only writable directory
@@ -27,28 +27,28 @@ function cookiePath(bankId: string): string {
   return join(getCookieDir(), `${bankId}.json`);
 }
 
-export async function loadCookies(page: Page, bankId: string): Promise<boolean> {
+export async function loadCookies(context: BrowserContext, bankId: string): Promise<boolean> {
   const path = cookiePath(bankId);
   if (!existsSync(path)) return false;
   try {
     const raw = await readFile(path, "utf-8");
     const cookies = JSON.parse(raw);
     if (!Array.isArray(cookies) || cookies.length === 0) return false;
-    await page.setCookie(...cookies);
+    await context.addCookies(cookies);
     return true;
   } catch {
     return false;
   }
 }
 
-export async function saveCookies(page: Page, bankId: string): Promise<void> {
+export async function saveCookies(context: BrowserContext, bankId: string): Promise<void> {
   try {
     const dir = getCookieDir();
     await mkdir(dir, { recursive: true });
-    const cookies = await page.cookies();
+    const cookies = await context.cookies();
     await writeFile(cookiePath(bankId), JSON.stringify(cookies, null, 2), "utf-8");
   } catch {
-    // Non-fatal — cookie saving is best-effort
+    // Non-fatal -- cookie saving is best-effort
   }
 }
 

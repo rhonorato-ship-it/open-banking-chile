@@ -15,7 +15,7 @@
     "next": "^15.3.0",
     "next-auth": "^5.0.0-beta.28",
     "open-banking-chile": "file:..",
-    "puppeteer-core": "^24.0.0",
+    "playwright-core": "^1.52.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "recharts": "^3.8.0",

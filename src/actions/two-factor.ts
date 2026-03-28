@@ -1,4 +1,4 @@
-import type { Frame, Page } from "puppeteer-core";
+import type { Frame, Page } from "playwright-core";
 import { delay } from "../utils.js";
 
 export interface TwoFactorConfig {

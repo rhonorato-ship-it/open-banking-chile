@@ -126,7 +126,7 @@ export interface BankScraper {
   /** URL del portal web del banco */
   url: string;
   /**
-   * Scraper mode: "api" uses direct HTTP calls (no browser), "browser" uses Puppeteer.
+   * Scraper mode: "api" uses direct HTTP calls (no browser), "browser" uses Playwright.
    * Default: "browser" (backward compatible).
    */
   mode?: "api" | "browser";

@@ -40,7 +40,7 @@ async function biceLogin(
   // Step 1: Navigate to portal — triggers Keycloak redirect
   debugLog.push("1. Navigating to portal (triggers Keycloak redirect)...");
   progress("Abriendo portal BICE...");
-  await page.goto(PORTAL_URL, { waitUntil: "networkidle2", timeout: 45_000 });
+  await page.goto(PORTAL_URL, { waitUntil: "domcontentloaded", timeout: 45_000 });
   await delay(2000);
   await doSave(page, "bice-01-after-navigate");
 
@@ -52,7 +52,7 @@ async function biceLogin(
     // The portal might not have redirected yet — try waiting
     debugLog.push("  Not on Keycloak yet, waiting for redirect...");
     try {
-      await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 10_000 });
+      await page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 10_000 });
     } catch {
       // May already be there
     }
@@ -78,13 +78,58 @@ async function biceLogin(
   await doSave(page, "bice-02-keycloak-page");
   debugLog.push("2. On Keycloak login page");
 
-  // Step 2: Fill Keycloak login form
+  // Step 2a: Handle Cloudflare Turnstile challenge if present
+  const hasTurnstile = await page.evaluate(() => {
+    const text = document.body?.innerText || "";
+    return text.includes("Verifica que eres") || text.includes("Verify you are") || text.includes("Estamos verificando") || !!document.querySelector("iframe[src*='challenges.cloudflare.com']");
+  });
+
+  if (hasTurnstile) {
+    debugLog.push("  Cloudflare Turnstile detected — attempting to solve...");
+    progress("Verificando identidad (Cloudflare)...");
+
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const frames = page.frames();
+        for (const frame of frames) {
+          if (frame.url().includes("challenges.cloudflare.com") || frame.url().includes("turnstile")) {
+            const checkbox = await frame.$("input[type='checkbox']").catch(() => null)
+              || await frame.$(".cb-i").catch(() => null)
+              || await frame.$("#challenge-stage").catch(() => null);
+            if (checkbox) {
+              await checkbox.click();
+              debugLog.push(`  Clicked Turnstile checkbox (attempt ${attempt + 1})`);
+            } else {
+              await frame.click("body").catch(() => {});
+              debugLog.push(`  Clicked Turnstile iframe body (attempt ${attempt + 1})`);
+            }
+            break;
+          }
+        }
+      } catch { debugLog.push(`  Turnstile attempt ${attempt + 1} failed`); }
+
+      await delay(3000);
+
+      const stillBlocked = await page.evaluate(() => {
+        const text = document.body?.innerText || "";
+        return text.includes("Verifica que eres") || text.includes("Verify you are") || text.includes("Estamos verificando");
+      });
+
+      if (!stillBlocked) {
+        debugLog.push("  Turnstile passed!");
+        await delay(2000);
+        break;
+      }
+    }
+  }
+
+  // Step 2b: Fill Keycloak login form
   debugLog.push("3. Entering credentials...");
   progress("Ingresando credenciales...");
 
-  // Wait for the username field
+  // Wait for the username field (extra time after potential Turnstile)
   try {
-    await page.waitForSelector("#username", { timeout: 15_000 });
+    await page.waitForSelector("#username", { timeout: 20_000 });
   } catch {
     // Fallback: try looking for input by name or type
     const hasInput = await page.evaluate(() => {
@@ -155,7 +200,7 @@ async function biceLogin(
 
   // Step 4: Wait for response (redirect back to portal, error, or 2FA)
   try {
-    await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 30_000 });
+    await page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 30_000 });
   } catch {
     // Navigation might already have completed or be slow
     await delay(5000);
@@ -219,7 +264,7 @@ async function biceLogin(
       });
 
       try {
-        await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 30_000 });
+        await page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 30_000 });
       } catch {
         await delay(5000);
       }
@@ -286,7 +331,7 @@ async function biceLogin(
 
   if (!portalLoaded) {
     // Check for new tabs — BICE sometimes opens the banking portal in a new tab
-    const pages = await session.browser.pages();
+    const pages = session.context.pages();
     for (const p of pages) {
       const pUrl = p.url();
       if (pUrl.includes("portalpersonas.bice.cl") && pUrl !== page.url()) {
@@ -432,7 +477,7 @@ async function bffPostViaBrowser<T>(
 ): Promise<T | null> {
   const { page, debugLog } = session;
   const result = await page.evaluate(
-    async (fetchUrl: string, fetchBody: string) => {
+    async ({ fetchUrl, fetchBody }: { fetchUrl: string; fetchBody: string }) => {
       try {
         const res = await fetch(fetchUrl, {
           method: "POST",
@@ -448,8 +493,7 @@ async function bffPostViaBrowser<T>(
         return { __error: true, message: String(err) };
       }
     },
-    url,
-    JSON.stringify(body),
+    { fetchUrl: url, fetchBody: JSON.stringify(body) },
   );
 
   if (result && typeof result === "object" && "__error" in result) {
