@@ -83,25 +83,31 @@ async function biceLogin(
   debugLog.push("1. Navigating to portal (triggers Keycloak redirect)...");
   progress("Abriendo portal BICE...");
   await page.goto(PORTAL_URL, { waitUntil: "domcontentloaded", timeout: 45_000 });
-  await delay(2000);
-  await doSave(page, "bice-01-after-navigate");
 
-  const landingUrl = page.url();
-  debugLog.push(`  Landed on: ${landingUrl}`);
-
-  // Check if we're on Keycloak (auth.bice.cl)
-  if (!landingUrl.includes("auth.bice.cl")) {
-    // The portal might not have redirected yet — try waiting
-    debugLog.push("  Not on Keycloak yet, waiting for redirect...");
-    try {
-      await page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 10_000 });
-    } catch {
-      // May already be there
+  // Poll for Keycloak redirect — the Angular SPA redirects client-side
+  let onKeycloak = false;
+  for (let i = 0; i < 15; i++) {
+    await delay(2000);
+    const url = page.url();
+    if (url.includes("auth.bice.cl")) {
+      onKeycloak = true;
+      debugLog.push(`  Redirected to Keycloak after ${(i + 1) * 2}s`);
+      break;
     }
-    const currentUrl = page.url();
-    debugLog.push(`  Current URL: ${currentUrl}`);
+    // Check if login form appeared (might already be on Keycloak)
+    const hasLogin = await page.$("#username");
+    if (hasLogin) {
+      onKeycloak = true;
+      debugLog.push(`  Login form found after ${(i + 1) * 2}s`);
+      break;
+    }
+  }
 
-    if (!currentUrl.includes("auth.bice.cl")) {
+  await doSave(page, "bice-01-after-navigate");
+  const currentUrl = page.url();
+  debugLog.push(`  Landed on: ${currentUrl}`);
+
+  if (!onKeycloak) {
       const pageText = await page.innerText("body").catch(() => "");
       if (pageText.toLowerCase().includes("403") || pageText.toLowerCase().includes("forbidden")) {
         return {
@@ -113,7 +119,6 @@ async function biceLogin(
         success: false,
         error: `No se redirigió a Keycloak (auth.bice.cl). URL actual: ${currentUrl}`,
       };
-    }
   }
 
   await doSave(page, "bice-02-keycloak-page");
