@@ -51,14 +51,14 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
       keepaliveInterval = setInterval(keepalive, 20_000);
 
       try {
-        // Auto-release stale locks older than 5 minutes (from crashed/timed-out functions)
+        // Force-release any stuck sync lock for this bank (from crashed/timed-out functions).
+        // This is safe because we're about to start a new sync anyway.
         await supabase
           .from("bank_credentials")
           .update({ is_syncing: false })
           .eq("user_id", userId)
           .eq("bank_id", bankId)
-          .eq("is_syncing", true)
-          .lt("last_synced_at", new Date(Date.now() - 5 * 60_000).toISOString());
+          .eq("is_syncing", true);
 
         // Atomically acquire sync lock via RPC
         const { data: acquired, error: lockError } = await supabase.rpc("acquire_sync_lock", {
@@ -67,7 +67,7 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
         });
 
         if (lockError || !acquired) {
-          send({ phase: 1, error: true, message: "Ya hay una sincronización en curso para este banco." });
+          send({ phase: 1, error: true, message: "Ya hay una sincronización en curso para este banco. Reintenta en unos segundos." });
           controller.close();
           return;
         }
