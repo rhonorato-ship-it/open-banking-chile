@@ -1,311 +1,82 @@
 import type { BankMovement, BankScraper, ScrapeResult, ScraperOptions } from "../types.js";
 import { MOVEMENT_SOURCE } from "../types.js";
 import { formatRut, normalizeDate, deduplicateMovements, delay } from "../utils.js";
-import { runScraper } from "../infrastructure/scraper-runner.js";
-import type { BrowserSession } from "../infrastructure/browser.js";
-import type { Page, Response } from "playwright-core";
+import { runApiScraper } from "../infrastructure/api-runner.js";
 
 // ─── BICE constants ─────────────────────────────────────────────
 //
 // Auth: Keycloak OIDC at auth.bice.cl/realms/personas
 // Gateway: gw.bice.cl (OAuth agent proxy + BFF endpoints)
 //
-// Architecture: Hybrid browser + response interception
-//   1. Browser login (Playwright) — navigate to portal, fill Keycloak form
-//   2. Register response interception BEFORE navigation to capture API calls
-//   3. Navigate to movements page — Angular SPA calls BFF endpoints
-//   4. Read intercepted responses (balance, transactions, products)
-//
-// Why response interception instead of page.evaluate(fetch(...))?
-// The gw.bice.cl endpoints return 401 when called via page.evaluate(fetch(...))
-// because cross-origin cookies aren't sent. But the Angular SPA itself calls
-// these endpoints successfully. By intercepting the SPA's own responses, we
-// capture the data the app already fetched.
+// Architecture: API-first with browser fallback for login
+//   1. Try HTTP login to Keycloak (may be blocked by Cloudflare)
+//   2. If blocked, fall back to browser login via remoteCDP or local Chrome
+//   3. After login, use pure HTTP calls to gw.bice.cl BFF endpoints
+//   4. POST /products to list accounts
+//   5. POST /transactions for movements (paginated, 40 per page)
+//   6. POST /balance for account balance
 
-const PORTAL_URL = "https://portalpersonas.bice.cl";
-// Go directly to Keycloak — bypasses Cloudflare challenge on the portal
-const KEYCLOAK_AUTH_URL = "https://auth.bice.cl/realms/personas/protocol/openid-connect/auth?client_id=portal-personas&redirect_uri=https%3A%2F%2Fportalpersonas.bice.cl%2F&response_type=code&scope=openid+profile";
-const MOVEMENTS_URL = "https://portalpersonas.bice.cl/movimientos-cc";
-const GW_PREFIX = "gw.bice.cl";
+const KEYCLOAK_AUTH_URL =
+  "https://auth.bice.cl/realms/personas/protocol/openid-connect/auth?" +
+  "client_id=portal-personas" +
+  "&redirect_uri=https%3A%2F%2Fportalpersonas.bice.cl%2F" +
+  "&response_type=code" +
+  "&scope=openid+profile";
 
-const TWO_FACTOR_KEYWORDS = ["otp", "two-factor", "segundo factor", "verificaci", "authenticator", "kc-form-otp"];
+const GW_BASE = "https://gw.bice.cl";
+const OAUTH_AGENT = `${GW_BASE}/oauth-agent-personas`;
+const BFF_BASE = `${GW_BASE}/portalpersonas`;
+const PORTAL_ORIGIN = "https://portalpersonas.bice.cl";
 
-// ─── Response interception ──────────────────────────────────────
+const UA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
-/** Key extracted from a gw.bice.cl URL by stripping the base path and query string. */
-function responseKey(url: string): string {
-  const withoutQuery = url.split("?")[0];
-  const idx = withoutQuery.indexOf("/portalpersonas/");
-  if (idx >= 0) return withoutQuery.slice(idx + "/portalpersonas/".length);
-  return withoutQuery;
+const TRANSACTIONS_PAGE_SIZE = 40;
+const MAX_TRANSACTION_PAGES = 25;
+
+// ─── Cookie jar ──────────────────────────────────────────────────
+
+interface CookieJar {
+  cookies: Map<string, string>;
+  set(raw: string): void;
+  setAll(headers: Headers): void;
+  header(): string;
+  toJSON(): string;
 }
 
-function setupResponseInterception(page: Page, apiResponses: Map<string, unknown>, debugLog: string[]): void {
-  page.on("response", async (res: Response) => {
-    const url = res.url();
-    if (!url.includes(GW_PREFIX) || res.status() !== 200) return;
-    try {
-      const contentType = res.headers()["content-type"] || "";
-      if (!contentType.includes("application/json")) return;
-      const body = await res.json();
-      const key = responseKey(url);
-      apiResponses.set(key, body);
-      debugLog.push(`  [intercept] ${key} (${res.status()})`);
-    } catch {
-      // Response body may not be available (e.g. redirect or stream error)
-    }
-  });
+function createCookieJar(initial?: Record<string, string>): CookieJar {
+  const cookies = new Map<string, string>(
+    initial ? Object.entries(initial) : [],
+  );
+  return {
+    cookies,
+    set(raw: string) {
+      const [nameValue] = raw.split(";");
+      const eqIdx = nameValue.indexOf("=");
+      if (eqIdx > 0)
+        cookies.set(
+          nameValue.slice(0, eqIdx).trim(),
+          nameValue.slice(eqIdx + 1).trim(),
+        );
+    },
+    setAll(headers: Headers) {
+      const setCookies = headers.getSetCookie?.() ?? [];
+      for (const raw of setCookies) this.set(raw);
+    },
+    header() {
+      return Array.from(cookies.entries())
+        .map(([k, v]) => `${k}=${v}`)
+        .join("; ");
+    },
+    toJSON() {
+      return JSON.stringify(Object.fromEntries(cookies));
+    },
+  };
 }
 
-// ─── Login via browser (Keycloak) ────────────────────────────────
+// ─── API types ───────────────────────────────────────────────────
 
-/**
- * Polls for a selector to appear, tolerating Cloudflare challenge pages
- * that may load before the actual Keycloak form.
- */
-async function waitForSelectorPolling(page: Page, selector: string, timeoutMs: number): Promise<boolean> {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const found = await page.$(selector);
-    if (found) return true;
-    await delay(2000);
-  }
-  return false;
-}
-
-async function biceLogin(
-  session: BrowserSession,
-  options: ScraperOptions,
-): Promise<{ success: true } | { success: false; error: string }> {
-  const { page, debugLog, screenshot: doSave } = session;
-  const { rut, password, onProgress, onTwoFactorCode } = options;
-  const progress = onProgress || (() => {});
-
-  // Step 1: Navigate to portal — triggers Keycloak redirect
-  // Navigate directly to Keycloak auth URL — bypasses Cloudflare on the portal
-  debugLog.push("1. Navigating directly to Keycloak (bypasses Cloudflare)...");
-  progress("Abriendo portal BICE...");
-  await page.goto(KEYCLOAK_AUTH_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
-  await delay(1000);
-
-  await doSave(page, "bice-02-keycloak-page");
-  debugLog.push("2. On Keycloak login page");
-
-  // Step 2: Wait for the #username field with polling (handles Cloudflare challenge)
-  // Cloudflare may show a challenge page before the Keycloak form loads.
-  // Polling avoids a hard timeout on waitForSelector when the challenge is active.
-  debugLog.push("  Waiting for #username field (polling, handles Cloudflare)...");
-  const usernameFound = await waitForSelectorPolling(page, "#username", 30_000);
-
-  if (!usernameFound) {
-    const hasInput = await page.$$("input[type='text'], input[name='username']").then(els => els.length > 0);
-    if (!hasInput) {
-      await doSave(page, "bice-03-no-username-field");
-      return {
-        success: false,
-        error: "No se encontro el campo de RUT (#username) en la pagina de Keycloak.",
-      };
-    }
-  }
-
-  // Step 3: Fill Keycloak login form
-  debugLog.push("3. Entering credentials...");
-  progress("Ingresando credenciales...");
-
-  // BICE Keycloak expects formatted RUT with dots (e.g. "17.599.449-1")
-  const formattedRut = formatRut(rut);
-  debugLog.push(`  Typing RUT: ${formattedRut.slice(0, 6)}...`);
-  await page.type("#username", formattedRut, { delay: 60 });
-  await delay(300);
-
-  // Wait for and fill password field
-  try {
-    await page.waitForSelector("#password", { timeout: 5_000 });
-  } catch {
-    await doSave(page, "bice-04-no-password-field");
-    return {
-      success: false,
-      error: "No se encontro el campo de clave (#password).",
-    };
-  }
-
-  await page.type("#password", password, { delay: 60 });
-  await delay(300);
-  await doSave(page, "bice-05-credentials-filled");
-
-  // Step 4: Click the login button
-  debugLog.push("4. Clicking login button...");
-  progress("Autenticando...");
-
-  // Try clicking #kc-login first (standard Keycloak submit button)
-  const kcLoginBtn = await page.$("#kc-login");
-  if (kcLoginBtn) {
-    await kcLoginBtn.click();
-    debugLog.push("  Clicked: kc-login");
-  } else {
-    // Fallback: look for "Ingresar" / "Login" button
-    const allButtons = await page.$$("button, input[type='submit']");
-    let clicked = false;
-    for (const btn of allButtons) {
-      const text = await btn.innerText().catch(() => "");
-      const value = await btn.getAttribute("value") || "";
-      const lower = (text + " " + value).toLowerCase();
-      if (lower.includes("ingresar") || lower.includes("login")) {
-        await btn.click();
-        debugLog.push("  Clicked: fallback-btn");
-        clicked = true;
-        break;
-      }
-    }
-    if (!clicked) {
-      await page.keyboard.press("Enter");
-      debugLog.push("  Pressed Enter (no login button found)");
-    }
-  }
-
-  // Step 5: Wait for response (redirect back to portal, error, or 2FA)
-  try {
-    await page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 30_000 });
-  } catch {
-    // Navigation might already have completed or be slow
-    await delay(5000);
-  }
-  await doSave(page, "bice-06-after-login-submit");
-
-  const postLoginUrl = page.url();
-  debugLog.push(`  Post-login URL: ${postLoginUrl}`);
-
-  // Still on Keycloak? Check for errors or 2FA
-  if (postLoginUrl.includes("auth.bice.cl")) {
-    const pageHtml = await page.content();
-    const pageLower = pageHtml.toLowerCase();
-
-    // Check for 2FA
-    if (TWO_FACTOR_KEYWORDS.some(kw => pageLower.includes(kw))) {
-      debugLog.push("  2FA detected on Keycloak page");
-      progress("Esperando codigo de verificacion...");
-      await doSave(page, "bice-07-2fa-detected");
-
-      if (!onTwoFactorCode) {
-        return {
-          success: false,
-          error: "Se requiere codigo 2FA pero no hay callback configurado.",
-        };
-      }
-
-      const code = await onTwoFactorCode();
-      if (!code) {
-        return { success: false, error: "No se recibio codigo 2FA." };
-      }
-
-      debugLog.push("  Submitting 2FA code...");
-
-      // Try typing into OTP field
-      const otpInput = await page.$("#otp")
-        || await page.$("input[name='otp']")
-        || await page.$("input[name='totp']");
-
-      if (otpInput) {
-        await otpInput.fill(code);
-      } else {
-        // Fallback: type into the first visible text input
-        const inputs = await page.$$("input[type='text'], input[type='number'], input:not([type])");
-        if (inputs.length > 0) {
-          await inputs[0].type(code, { delay: 60 });
-        }
-      }
-
-      // Click submit button
-      const submitBtn = await page.$("#kc-login") || await page.$("input[type='submit']");
-      if (submitBtn) await submitBtn.click();
-
-      try {
-        await page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 30_000 });
-      } catch {
-        await delay(5000);
-      }
-
-      const post2faUrl = page.url();
-      debugLog.push(`  Post-2FA URL: ${post2faUrl}`);
-
-      if (post2faUrl.includes("auth.bice.cl")) {
-        const errorEl = await page.$(".kc-feedback-text, [class*='alert'], [class*='error']");
-        const errorText = errorEl ? await errorEl.innerText().catch(() => null) : null;
-        return {
-          success: false,
-          error: `Error 2FA: ${errorText || "Codigo incorrecto o expirado."}`,
-        };
-      }
-    } else {
-      // Check for login errors (still on Keycloak but not 2FA)
-      const errorEl = await page.$(".kc-feedback-text, [class*='alert'], [class*='error']");
-      const errorText = errorEl ? await errorEl.innerText().catch(() => null) : null;
-      if (errorText) {
-        return {
-          success: false,
-          error: `Credenciales incorrectas: ${errorText}`,
-        };
-      }
-      return {
-        success: false,
-        error: "Credenciales incorrectas (RUT o clave invalida).",
-      };
-    }
-  }
-
-  // Step 6: Wait for the portal to fully load (Angular SPA)
-  debugLog.push("5. Waiting for portal to load...");
-  progress("Sesion iniciada, cargando portal...");
-
-  const portalLoadStart = Date.now();
-  const MAX_PORTAL_WAIT = 30_000;
-  let portalLoaded = false;
-
-  while (Date.now() - portalLoadStart < MAX_PORTAL_WAIT) {
-    const currentUrl = page.url();
-    if (currentUrl.includes("portalpersonas.bice.cl") && !currentUrl.includes("auth.bice.cl")) {
-      const bodyText = await page.innerText("body").catch(() => "");
-      if (bodyText.includes("Resumen") || bodyText.includes("Cuenta") || bodyText.includes("Saldo") || bodyText.length > 500) {
-        portalLoaded = true;
-        break;
-      }
-    }
-    await delay(2000);
-  }
-
-  if (!portalLoaded) {
-    // Check for new tabs — BICE sometimes opens the banking portal in a new tab
-    const pages = session.context.pages();
-    for (const p of pages) {
-      const pUrl = p.url();
-      if (pUrl.includes("portalpersonas.bice.cl") && pUrl !== page.url()) {
-        debugLog.push(`  Found portal in another tab: ${pUrl}`);
-        const hasContent = await p.innerText("body").then(
-          text => text.includes("Resumen") || text.includes("Cuenta") || text.length > 500
-        ).catch(() => false);
-        if (hasContent) {
-          portalLoaded = true;
-          break;
-        }
-      }
-    }
-  }
-
-  await doSave(page, "bice-08-portal-loaded");
-
-  if (!portalLoaded) {
-    const finalUrl = page.url();
-    debugLog.push(`  Portal did not fully load. URL: ${finalUrl}`);
-    debugLog.push("  Proceeding regardless...");
-  }
-
-  debugLog.push("6. Login OK!");
-  return { success: true };
-}
-
-// ─── Intercepted data parsing ────────────────────────────────────
-
-interface BiceInterceptedTransaction {
+interface BiceTransaction {
   fecha?: string;
   fechaSinFormato?: string;
   fechacontable?: string;
@@ -317,12 +88,18 @@ interface BiceInterceptedTransaction {
   [key: string]: unknown;
 }
 
-interface BiceInterceptedTransactionsResponse {
-  movimientos?: BiceInterceptedTransaction[];
+interface BiceTransactionsResponse {
+  movimientos?: BiceTransaction[];
+  paginacion?: {
+    paginaActual?: number;
+    totalPaginas?: number;
+    totalRegistros?: number;
+    tamanioPagina?: number;
+  };
   [key: string]: unknown;
 }
 
-interface BiceInterceptedBalanceResponse {
+interface BiceBalanceResponse {
   titulo?: string;
   monto?: string;
   saldoDisponibleMonto?: string;
@@ -331,7 +108,19 @@ interface BiceInterceptedBalanceResponse {
   [key: string]: unknown;
 }
 
-function parseInterceptedTransaction(tx: BiceInterceptedTransaction): BankMovement | null {
+interface BiceProductsResponse {
+  productos?: Array<{
+    tipo?: string;
+    numero?: string;
+    nombre?: string;
+    [key: string]: unknown;
+  }>;
+  [key: string]: unknown;
+}
+
+// ─── Transaction parsing ─────────────────────────────────────────
+
+function parseTransaction(tx: BiceTransaction): BankMovement | null {
   // Date: prefer fechaSinFormato "20260326" -> "26-03-2026", fallback to fecha "26 mar 2026"
   let dateStr = "";
   if (tx.fechaSinFormato && /^\d{8}$/.test(tx.fechaSinFormato)) {
@@ -365,48 +154,520 @@ function parseInterceptedTransaction(tx: BiceInterceptedTransaction): BankMoveme
   };
 }
 
-// ─── DOM fallback extraction ─────────────────────────────────────
+// ─── HTTP helpers ────────────────────────────────────────────────
 
-async function extractMovementsFromDom(page: Page, debugLog: string[]): Promise<BankMovement[]> {
-  debugLog.push("  Attempting DOM fallback extraction...");
-  const movements: BankMovement[] = [];
+/** Build common headers for gw.bice.cl requests */
+function gwHeaders(jar: CookieJar): Record<string, string> {
+  return {
+    "User-Agent": UA,
+    Accept: "application/json",
+    "Content-Type": "application/json",
+    Cookie: jar.header(),
+    Origin: PORTAL_ORIGIN,
+    Referer: `${PORTAL_ORIGIN}/`,
+  };
+}
+
+/** POST to a BFF endpoint on gw.bice.cl */
+async function bffPost<T>(
+  jar: CookieJar,
+  path: string,
+  body: unknown = {},
+  debugLog: string[],
+): Promise<T> {
+  const url = `${BFF_BASE}/${path}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: gwHeaders(jar),
+    body: JSON.stringify(body),
+    redirect: "follow",
+  });
+  jar.setAll(res.headers);
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    debugLog.push(`  BFF POST ${path} -> ${res.status}: ${text.slice(0, 200)}`);
+    throw new Error(`BFF POST ${path} -> ${res.status}`);
+  }
+
+  return res.json() as Promise<T>;
+}
+
+// ─── Keycloak HTTP login ─────────────────────────────────────────
+//
+// Attempts a pure HTTP login to Keycloak. This may fail if Cloudflare
+// is actively challenging requests (403 with cf-mitigated header).
+// In that case, the caller falls back to browser-based login.
+
+async function keycloakHttpLogin(
+  rut: string,
+  password: string,
+  debugLog: string[],
+): Promise<
+  | { success: true; jar: CookieJar }
+  | { success: false; error: string; cloudflareBlocked?: boolean }
+> {
+  const jar = createCookieJar();
+  const formattedRut = formatRut(rut);
+
+  // Step 1: GET the Keycloak auth URL to get the login form
+  debugLog.push("1. Fetching Keycloak login page via HTTP...");
+  const authRes = await fetch(KEYCLOAK_AUTH_URL, {
+    headers: { "User-Agent": UA, Accept: "text/html" },
+    redirect: "follow",
+  });
+  jar.setAll(authRes.headers);
+
+  // Check for Cloudflare challenge
+  const cfMitigated = authRes.headers.get("cf-mitigated");
+  if (cfMitigated === "challenge" || authRes.status === 403) {
+    debugLog.push(`  Cloudflare challenge detected (status=${authRes.status}, cf-mitigated=${cfMitigated})`);
+    return { success: false, error: "Cloudflare challenge", cloudflareBlocked: true };
+  }
+
+  if (!authRes.ok) {
+    debugLog.push(`  Keycloak page returned ${authRes.status}`);
+    return { success: false, error: `Keycloak page returned ${authRes.status}` };
+  }
+
+  const html = await authRes.text();
+  debugLog.push(`  Status: ${authRes.status}, HTML length: ${html.length}`);
+
+  // Step 2: Parse the Keycloak form action URL and hidden fields
+  // Keycloak renders a standard HTML form with action URL containing session codes
+  const actionMatch = html.match(/action="([^"]+)"/);
+  if (!actionMatch) {
+    // Check if this is a Cloudflare challenge page disguised as 200
+    if (html.includes("cf-challenge") || html.includes("turnstile") || html.includes("ray ID")) {
+      debugLog.push("  Cloudflare challenge page (no form action found)");
+      return { success: false, error: "Cloudflare challenge page", cloudflareBlocked: true };
+    }
+    debugLog.push("  No form action found in Keycloak HTML");
+    return { success: false, error: "No form action found in Keycloak page" };
+  }
+
+  // Keycloak HTML-encodes the action URL (e.g. &amp; -> &)
+  const formAction = actionMatch[1].replace(/&amp;/g, "&");
+  debugLog.push(`  Form action: ${formAction.slice(0, 80)}...`);
+
+  // Step 3: POST credentials to the Keycloak form
+  debugLog.push("2. Submitting credentials to Keycloak...");
+  const formBody = new URLSearchParams({
+    username: formattedRut,
+    password: password,
+  });
+
+  const loginRes = await fetch(formAction, {
+    method: "POST",
+    headers: {
+      "User-Agent": UA,
+      "Content-Type": "application/x-www-form-urlencoded",
+      Cookie: jar.header(),
+      Referer: authRes.url,
+    },
+    body: formBody.toString(),
+    redirect: "manual", // We need to follow redirects manually to capture cookies
+  });
+  jar.setAll(loginRes.headers);
+
+  debugLog.push(`  Login response: ${loginRes.status}`);
+
+  // Check for login error (Keycloak returns 200 with error message on bad credentials)
+  if (loginRes.status === 200) {
+    const errorHtml = await loginRes.text();
+    if (
+      errorHtml.includes("kc-feedback-text") ||
+      errorHtml.includes("Invalid username or password") ||
+      errorHtml.includes("invalid_grant") ||
+      errorHtml.includes("credenciales")
+    ) {
+      return { success: false, error: "Credenciales incorrectas (RUT o clave invalida)." };
+    }
+    // Check for 2FA page
+    if (
+      errorHtml.includes("otp") ||
+      errorHtml.includes("two-factor") ||
+      errorHtml.includes("segundo factor") ||
+      errorHtml.includes("kc-form-otp")
+    ) {
+      return { success: false, error: "Se requiere 2FA. Use modo browser para autenticacion con 2FA." };
+    }
+    debugLog.push("  Unexpected 200 response after login POST");
+    return { success: false, error: "Respuesta inesperada del servidor de autenticacion." };
+  }
+
+  // Step 4: Follow the redirect chain (Keycloak -> portal with ?code=xxx)
+  // Keycloak returns 302 -> portalpersonas.bice.cl/?code=xxx&session_state=xxx
+  if (loginRes.status !== 302 && loginRes.status !== 303) {
+    debugLog.push(`  Unexpected status: ${loginRes.status}`);
+    return { success: false, error: `Keycloak returned unexpected status ${loginRes.status}` };
+  }
+
+  let location = loginRes.headers.get("location") || "";
+  debugLog.push(`  Redirect to: ${location.slice(0, 100)}...`);
+
+  // Follow redirects manually to collect all cookies
+  let redirectCount = 0;
+  while (location && redirectCount < 10) {
+    redirectCount++;
+    const redirectRes = await fetch(location, {
+      headers: {
+        "User-Agent": UA,
+        Cookie: jar.header(),
+      },
+      redirect: "manual",
+    });
+    jar.setAll(redirectRes.headers);
+
+    const nextLocation = redirectRes.headers.get("location") || "";
+    debugLog.push(`  Redirect ${redirectCount}: ${redirectRes.status} -> ${nextLocation.slice(0, 80)}`);
+
+    if (!nextLocation || redirectRes.status < 300 || redirectRes.status >= 400) {
+      // We've reached the final destination or a non-redirect response
+      break;
+    }
+    location = nextLocation;
+  }
+
+  // Step 5: Extract the auth code from the final redirect URL
+  // The portal redirect URL contains ?code=xxx which we need for oauth-agent
+  const codeMatch = location.match(/[?&]code=([^&]+)/);
+  if (!codeMatch) {
+    // Try to find it in the redirect chain we already followed
+    debugLog.push("  No auth code found in redirect chain, checking jar...");
+    // The oauth-agent might have already set session cookies during the redirect
+    // Check if we have session cookies from gw.bice.cl
+    const hasSessionCookie = [...jar.cookies.keys()].some(
+      (k) => k.includes("AT") || k.includes("RT") || k.includes("session"),
+    );
+    if (hasSessionCookie) {
+      debugLog.push("  Found session cookies (oauth-agent may have already processed the code)");
+      debugLog.push(`3. Login OK via HTTP! Cookies: ${[...jar.cookies.keys()].join(", ")}`);
+      return { success: true, jar };
+    }
+    debugLog.push("  No auth code and no session cookies found");
+    return { success: false, error: "No se obtuvo codigo de autorizacion de Keycloak." };
+  }
+
+  const authCode = codeMatch[1];
+  debugLog.push(`  Auth code obtained: ${authCode.slice(0, 10)}...`);
+
+  // Step 6: Exchange the code via the OAuth agent
+  // POST /oauth-agent-personas/login/start initiates the session
+  debugLog.push("3. Calling oauth-agent login/start...");
+  const startRes = await fetch(`${OAUTH_AGENT}/login/start`, {
+    method: "POST",
+    headers: {
+      "User-Agent": UA,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      Cookie: jar.header(),
+      Origin: PORTAL_ORIGIN,
+      Referer: `${PORTAL_ORIGIN}/`,
+    },
+    body: JSON.stringify({
+      pageUrl: `${PORTAL_ORIGIN}/?code=${authCode}`,
+    }),
+    redirect: "follow",
+  });
+  jar.setAll(startRes.headers);
+  debugLog.push(`  login/start: ${startRes.status}`);
+
+  if (!startRes.ok) {
+    const errText = await startRes.text().catch(() => "");
+    debugLog.push(`  login/start error: ${errText.slice(0, 200)}`);
+    return { success: false, error: `oauth-agent login/start failed: ${startRes.status}` };
+  }
+
+  // Step 7: Complete the session
+  // POST /oauth-agent-personas/login/end sets HTTP-only session cookies
+  debugLog.push("4. Calling oauth-agent login/end...");
+  const endRes = await fetch(`${OAUTH_AGENT}/login/end`, {
+    method: "POST",
+    headers: {
+      "User-Agent": UA,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      Cookie: jar.header(),
+      Origin: PORTAL_ORIGIN,
+      Referer: `${PORTAL_ORIGIN}/`,
+    },
+    body: JSON.stringify({}),
+    redirect: "follow",
+  });
+  jar.setAll(endRes.headers);
+  debugLog.push(`  login/end: ${endRes.status}`);
+
+  if (!endRes.ok) {
+    const errText = await endRes.text().catch(() => "");
+    debugLog.push(`  login/end error: ${errText.slice(0, 200)}`);
+    return { success: false, error: `oauth-agent login/end failed: ${endRes.status}` };
+  }
+
+  // Step 8: Verify session by calling userInfo
+  debugLog.push("5. Verifying session via userInfo...");
+  const userInfoRes = await fetch(`${OAUTH_AGENT}/userInfo`, {
+    headers: {
+      "User-Agent": UA,
+      Accept: "application/json",
+      Cookie: jar.header(),
+      Origin: PORTAL_ORIGIN,
+      Referer: `${PORTAL_ORIGIN}/`,
+    },
+  });
+  jar.setAll(userInfoRes.headers);
+
+  if (userInfoRes.ok) {
+    const userInfo = (await userInfoRes.json()) as Record<string, unknown>;
+    debugLog.push(`  userInfo: ${JSON.stringify(userInfo).slice(0, 200)}`);
+  } else {
+    debugLog.push(`  userInfo: ${userInfoRes.status} (non-fatal)`);
+  }
+
+  debugLog.push(`6. Login OK via HTTP! Cookies: ${[...jar.cookies.keys()].join(", ")}`);
+  return { success: true, jar };
+}
+
+// ─── Browser fallback login ──────────────────────────────────────
+//
+// When Cloudflare blocks the HTTP login, we use a browser to get through
+// the challenge, then extract the session cookies for pure HTTP data calls.
+
+async function browserFallbackLogin(
+  options: ScraperOptions,
+  debugLog: string[],
+): Promise<
+  | { success: true; jar: CookieJar }
+  | { success: false; error: string }
+> {
+  debugLog.push("--- Browser fallback login (Cloudflare blocked HTTP) ---");
+
+  // Dynamically import browser infrastructure (avoid top-level heavy import)
+  const { launchBrowser } = await import("../infrastructure/browser.js");
+
+  const { rut, password, chromePath, headful, launchArgs, userDataDir, remoteCDP, onProgress, onTwoFactorCode } = options;
+  const progress = onProgress || (() => {});
+  const formattedRut = formatRut(rut);
+
+  progress("Usando navegador para autenticacion (Cloudflare)...");
+
+  const session = await launchBrowser(
+    { chromePath, headful, launchArgs, userDataDir, remoteCDP },
+    !!options.saveScreenshots,
+  );
 
   try {
-    const rows = await page.$$("table tbody tr");
+    const { page } = session;
 
-    for (const row of rows) {
-      const cells = await row.$$("td");
-      if (cells.length < 3) continue;
+    // Navigate to Keycloak directly
+    debugLog.push("B1. Navigating to Keycloak...");
+    await page.goto(KEYCLOAK_AUTH_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
+    await delay(1000);
 
-      const cellTexts: string[] = [];
-      for (const cell of cells) {
-        const text = await cell.innerText().catch(() => "");
-        cellTexts.push(text.trim());
+    // Wait for the login form
+    debugLog.push("B2. Waiting for #username field...");
+    const usernameField = await page.waitForSelector("#username", { timeout: 30_000 }).catch(() => null);
+    if (!usernameField) {
+      // Try to wait longer (Cloudflare challenge may take time)
+      const start = Date.now();
+      let found = false;
+      while (Date.now() - start < 30_000) {
+        const el = await page.$("#username");
+        if (el) { found = true; break; }
+        await delay(2000);
       }
-
-      const date = cellTexts[0];
-      const description = cellTexts[1];
-      const cargo = cellTexts[2] ? parseInt(cellTexts[2].replace(/[^0-9]/g, ""), 10) || 0 : 0;
-      const abono = cellTexts[3] ? parseInt(cellTexts[3].replace(/[^0-9]/g, ""), 10) || 0 : 0;
-      const balance = cellTexts[4] ? parseInt(cellTexts[4].replace(/[^0-9]/g, ""), 10) || 0 : 0;
-
-      if (!date || !description) continue;
-
-      const amount = abono > 0 ? abono : cargo > 0 ? -cargo : 0;
-      if (amount === 0) continue;
-
-      movements.push({
-        date: normalizeDate(date),
-        description,
-        amount,
-        balance,
-        source: MOVEMENT_SOURCE.account,
-      });
+      if (!found) {
+        return { success: false, error: "No se encontro el campo de login en Keycloak (navegador)." };
+      }
     }
 
-    debugLog.push(`  DOM fallback: ${movements.length} movements`);
+    // Fill credentials
+    debugLog.push("B3. Entering credentials...");
+    progress("Ingresando credenciales...");
+    await page.type("#username", formattedRut, { delay: 60 });
+    await delay(300);
+
+    await page.waitForSelector("#password", { timeout: 5_000 });
+    await page.type("#password", password, { delay: 60 });
+    await delay(300);
+
+    // Submit
+    debugLog.push("B4. Submitting login...");
+    progress("Autenticando...");
+    const kcLoginBtn = await page.$("#kc-login");
+    if (kcLoginBtn) {
+      await kcLoginBtn.click();
+    } else {
+      await page.keyboard.press("Enter");
+    }
+
+    // Wait for navigation
+    try {
+      await page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 30_000 });
+    } catch {
+      await delay(5000);
+    }
+
+    const postLoginUrl = page.url();
+    debugLog.push(`  Post-login URL: ${postLoginUrl}`);
+
+    // Check for 2FA
+    if (postLoginUrl.includes("auth.bice.cl")) {
+      const pageHtml = await page.content();
+      const pageLower = pageHtml.toLowerCase();
+      const twoFactorKeywords = ["otp", "two-factor", "segundo factor", "verificaci", "authenticator", "kc-form-otp"];
+
+      if (twoFactorKeywords.some((kw) => pageLower.includes(kw))) {
+        debugLog.push("  2FA detected");
+        progress("Esperando codigo de verificacion...");
+
+        if (!onTwoFactorCode) {
+          return { success: false, error: "Se requiere codigo 2FA pero no hay callback configurado." };
+        }
+
+        const code = await onTwoFactorCode();
+        if (!code) {
+          return { success: false, error: "No se recibio codigo 2FA." };
+        }
+
+        const otpInput =
+          (await page.$("#otp")) ||
+          (await page.$("input[name='otp']")) ||
+          (await page.$("input[name='totp']"));
+        if (otpInput) {
+          await otpInput.fill(code);
+        } else {
+          const inputs = await page.$$("input[type='text'], input[type='number'], input:not([type])");
+          if (inputs.length > 0) await inputs[0].type(code, { delay: 60 });
+        }
+
+        const submitBtn = (await page.$("#kc-login")) || (await page.$("input[type='submit']"));
+        if (submitBtn) await submitBtn.click();
+
+        try {
+          await page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 30_000 });
+        } catch {
+          await delay(5000);
+        }
+
+        if (page.url().includes("auth.bice.cl")) {
+          return { success: false, error: "Codigo 2FA incorrecto o expirado." };
+        }
+      } else {
+        // Login error
+        const errorEl = await page.$(".kc-feedback-text, [class*='alert'], [class*='error']");
+        const errorText = errorEl ? await errorEl.innerText().catch(() => null) : null;
+        return { success: false, error: `Credenciales incorrectas: ${errorText || "RUT o clave invalida."}` };
+      }
+    }
+
+    // Wait for portal to load and oauth-agent to set cookies
+    debugLog.push("B5. Waiting for portal to complete OAuth agent flow...");
+    progress("Completando autenticacion...");
+    await delay(3000);
+
+    // Extract cookies from the browser context
+    // The oauth-agent sets HTTP-only cookies on gw.bice.cl during the redirect
+    const browserCookies = await session.context.cookies(["https://gw.bice.cl", "https://portalpersonas.bice.cl"]);
+    debugLog.push(`  Browser cookies: ${browserCookies.map((c) => c.name).join(", ")}`);
+
+    const jar = createCookieJar();
+    for (const cookie of browserCookies) {
+      jar.cookies.set(cookie.name, cookie.value);
+    }
+
+    if (jar.cookies.size === 0) {
+      return { success: false, error: "No se obtuvieron cookies de sesion del navegador." };
+    }
+
+    debugLog.push(`B6. Browser login OK! Cookies: ${[...jar.cookies.keys()].join(", ")}`);
+    return { success: true, jar };
+  } finally {
+    // Always close the browser — we only need the cookies
+    await session.browser.close().catch(() => {});
+  }
+}
+
+// ─── Data fetching ───────────────────────────────────────────────
+
+async function fetchProducts(
+  jar: CookieJar,
+  debugLog: string[],
+): Promise<BiceProductsResponse> {
+  debugLog.push("  Fetching products...");
+  return bffPost<BiceProductsResponse>(
+    jar,
+    "bff-portal-hbp/v1/products",
+    {},
+    debugLog,
+  );
+}
+
+async function fetchBalance(
+  jar: CookieJar,
+  debugLog: string[],
+): Promise<number | undefined> {
+  debugLog.push("  Fetching balance...");
+  try {
+    const balanceData = await bffPost<BiceBalanceResponse>(
+      jar,
+      "bff-checking-account-transactions-100/v1/balance",
+      {},
+      debugLog,
+    );
+    const rawBalance = balanceData?.saldoDisponibleMonto || balanceData?.monto;
+    if (rawBalance) {
+      const balance = parseInt(rawBalance, 10);
+      debugLog.push(`  Balance: $${balance.toLocaleString("es-CL")}`);
+      return balance;
+    }
+    debugLog.push(`  Balance response but no monto: ${JSON.stringify(balanceData).slice(0, 200)}`);
   } catch (err) {
-    debugLog.push(`  DOM fallback failed: ${err}`);
+    debugLog.push(`  Balance fetch failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return undefined;
+}
+
+async function fetchTransactions(
+  jar: CookieJar,
+  debugLog: string[],
+): Promise<BankMovement[]> {
+  const movements: BankMovement[] = [];
+
+  debugLog.push("  Fetching transactions (paginated)...");
+
+  for (let pageNum = 1; pageNum <= MAX_TRANSACTION_PAGES; pageNum++) {
+    try {
+      const txData = await bffPost<BiceTransactionsResponse>(
+        jar,
+        "bff-checking-account-transactions-100/v1/transactions",
+        { pagina: pageNum, tamanioPagina: TRANSACTIONS_PAGE_SIZE },
+        debugLog,
+      );
+
+      const rawMovimientos = txData?.movimientos || [];
+      debugLog.push(`  Page ${pageNum}: ${rawMovimientos.length} raw transactions`);
+
+      if (rawMovimientos.length === 0) break;
+
+      for (const tx of rawMovimientos) {
+        const mov = parseTransaction(tx);
+        if (mov) movements.push(mov);
+      }
+
+      // Check if there are more pages
+      const pagination = txData?.paginacion;
+      if (pagination) {
+        const totalPages = pagination.totalPaginas || 1;
+        if (pageNum >= totalPages) break;
+      } else {
+        // No pagination info — if we got fewer than page size, assume last page
+        if (rawMovimientos.length < TRANSACTIONS_PAGE_SIZE) break;
+      }
+    } catch (err) {
+      debugLog.push(`  Page ${pageNum} error: ${err instanceof Error ? err.message : String(err)}`);
+      break;
+    }
   }
 
   return movements;
@@ -415,21 +676,46 @@ async function extractMovementsFromDom(page: Page, debugLog: string[]): Promise<
 // ─── Main scrape function ────────────────────────────────────────
 
 async function scrapeBice(
-  session: BrowserSession,
   options: ScraperOptions,
+  debugLog: string[],
 ): Promise<ScrapeResult> {
-  const { debugLog, screenshot: doSave, page } = session;
-  const { onProgress } = options;
+  const { rut, password, onProgress } = options;
   const bank = "bice";
   const progress = onProgress || (() => {});
 
-  // Set up response interception BEFORE any navigation
-  // This captures all gw.bice.cl API responses that the Angular SPA makes
-  const apiResponses = new Map<string, unknown>();
-  setupResponseInterception(page, apiResponses, debugLog);
+  // 1. Login
+  progress("Conectando con BICE API...");
 
-  // 1. Login via browser (Keycloak)
-  const loginResult = await biceLogin(session, options);
+  // Try HTTP login first (fast, no browser needed)
+  let loginResult = await keycloakHttpLogin(rut, password, debugLog);
+
+  // If Cloudflare blocked the HTTP login, fall back to browser
+  if (!loginResult.success && "cloudflareBlocked" in loginResult && loginResult.cloudflareBlocked) {
+    debugLog.push("--- Cloudflare blocked HTTP login, falling back to browser ---");
+    progress("Cloudflare detectado, usando navegador...");
+
+    // Check if we have a way to use a browser
+    if (!options.remoteCDP && !options.chromePath && !options.headful) {
+      // Try to import findChrome to check if Chrome is available
+      const { findChrome } = await import("../utils.js");
+      const chromePath = findChrome();
+      if (!chromePath) {
+        return {
+          success: false,
+          bank,
+          movements: [],
+          error:
+            "Cloudflare bloquea el acceso HTTP a BICE. " +
+            "Se necesita un navegador para la autenticacion, pero no se encontro Chrome. " +
+            "Instala Chrome o configura remoteCDP.",
+          debug: debugLog.join("\n"),
+        };
+      }
+    }
+
+    loginResult = await browserFallbackLogin(options, debugLog);
+  }
+
   if (!loginResult.success) {
     return {
       success: false,
@@ -440,124 +726,44 @@ async function scrapeBice(
     };
   }
 
+  const { jar } = loginResult;
   progress("Sesion iniciada correctamente");
 
-  // 2. Navigate to movements page — the Angular SPA will call BFF endpoints
-  debugLog.push("7. Navigating to movements page...");
-  progress("Cargando movimientos...");
-
-  // Also set up interception on any new pages (BICE may open a new tab)
-  const allPages = session.context.pages();
-  for (const p of allPages) {
-    if (p !== page) {
-      setupResponseInterception(p, apiResponses, debugLog);
-    }
-  }
-
-  // Find the right page to use (BICE sometimes opens portal in a new tab)
-  let activePage = page;
-  for (const p of allPages) {
-    if (p.url().includes("portalpersonas.bice.cl") && p !== page) {
-      activePage = p;
-      debugLog.push(`  Using portal page from tab: ${p.url()}`);
-      break;
-    }
-  }
-
+  // 2. Fetch products (to identify accounts)
+  debugLog.push("7. Fetching products and data via API...");
+  progress("Obteniendo productos...");
   try {
-    await activePage.goto(MOVEMENTS_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
-  } catch {
-    debugLog.push("  Navigation to movements page timed out, continuing...");
+    const products = await fetchProducts(jar, debugLog);
+    debugLog.push(`  Products: ${JSON.stringify(products).slice(0, 300)}`);
+  } catch (err) {
+    debugLog.push(`  Products fetch failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  // Wait for the SPA to load data (API calls happen after Angular bootstraps)
-  debugLog.push("  Waiting for SPA to fetch data...");
-  const dataWaitStart = Date.now();
-  const MAX_DATA_WAIT = 15_000;
+  // 3. Fetch balance and transactions in parallel
+  debugLog.push("8. Fetching balance and transactions...");
+  progress("Extrayendo movimientos...");
 
-  while (Date.now() - dataWaitStart < MAX_DATA_WAIT) {
-    // Check if we got the transactions response
-    const hasTransactions = [...apiResponses.keys()].some(k =>
-      k.includes("bff-checking-account-transactions-100/v1/transactions")
-    );
-    if (hasTransactions) {
-      debugLog.push("  Transactions response intercepted!");
-      // Wait a bit more for balance to arrive too
-      await delay(2000);
-      break;
-    }
-    await delay(2000);
-  }
+  const [balance, movements] = await Promise.all([
+    fetchBalance(jar, debugLog),
+    fetchTransactions(jar, debugLog),
+  ]);
 
-  await doSave(activePage, "bice-09-movements-page");
-
-  // 3. Extract data from intercepted responses
-  debugLog.push("8. Extracting data from intercepted API responses...");
-  debugLog.push(`  Intercepted keys: ${[...apiResponses.keys()].join(", ")}`);
-
-  // --- Balance ---
-  let balance: number | undefined;
-  const balanceKey = [...apiResponses.keys()].find(k =>
-    k.includes("bff-checking-account-transactions-100/v1/balance")
-  );
-  if (balanceKey) {
-    const balanceData = apiResponses.get(balanceKey) as BiceInterceptedBalanceResponse;
-    const rawBalance = balanceData?.saldoDisponibleMonto || balanceData?.monto;
-    if (rawBalance) {
-      balance = parseInt(rawBalance, 10);
-      debugLog.push(`  Balance: $${balance.toLocaleString("es-CL")}`);
-    } else {
-      debugLog.push(`  Balance response found but no saldoDisponibleMonto: ${JSON.stringify(balanceData).slice(0, 200)}`);
-    }
-  } else {
-    debugLog.push("  No balance response intercepted");
-  }
-
-  // --- Transactions ---
-  let movements: BankMovement[] = [];
-  const txKey = [...apiResponses.keys()].find(k =>
-    k.includes("bff-checking-account-transactions-100/v1/transactions")
-  );
-  if (txKey) {
-    const txData = apiResponses.get(txKey) as BiceInterceptedTransactionsResponse;
-    const rawMovimientos = txData?.movimientos || [];
-    debugLog.push(`  Raw transactions: ${rawMovimientos.length}`);
-
-    for (const tx of rawMovimientos) {
-      const mov = parseInterceptedTransaction(tx);
-      if (mov) movements.push(mov);
-    }
-    debugLog.push(`  Parsed movements: ${movements.length}`);
-  } else {
-    debugLog.push("  No transactions response intercepted");
-  }
-
-  // --- Products (log for debugging) ---
-  const productsKey = [...apiResponses.keys()].find(k =>
-    k.includes("bff-portal-hbp/v1/products")
-  );
-  if (productsKey) {
-    const productsData = apiResponses.get(productsKey) as Record<string, unknown>;
-    debugLog.push(`  Products intercepted: ${JSON.stringify(productsData).slice(0, 300)}`);
-  }
-
-  // 4. Fallback: if interception missed transactions, try DOM extraction
-  if (movements.length === 0) {
-    debugLog.push("  No intercepted transactions -- trying DOM fallback...");
-    movements = await extractMovementsFromDom(activePage, debugLog);
-  }
+  debugLog.push(`  Balance: ${balance !== undefined ? `$${balance.toLocaleString("es-CL")}` : "N/A"}`);
+  debugLog.push(`  Raw movements: ${movements.length}`);
 
   const deduplicated = deduplicateMovements(movements);
   debugLog.push(`9. Total: ${deduplicated.length} unique movements`);
-  progress(`Listo -- ${deduplicated.length} movimientos totales`);
+  progress(`Listo - ${deduplicated.length} movimientos totales`);
 
-  await doSave(activePage, "bice-10-done");
+  // Persist cookies for session reuse
+  const sessionCookies = jar.toJSON();
 
   return {
     success: true,
     bank,
     movements: deduplicated,
     balance,
+    sessionCookies,
     debug: debugLog.join("\n"),
   };
 }
@@ -567,11 +773,9 @@ async function scrapeBice(
 const bice: BankScraper = {
   id: "bice",
   name: "Banco BICE",
-  url: PORTAL_URL,
-  // Hybrid browser mode: browser login (Keycloak) + response interception for data.
-  // The portal at portalpersonas.bice.cl returns 403 to Node.js fetch() (Cloudflare WAF).
-  // Once logged in via browser, we intercept the Angular SPA's own API responses from gw.bice.cl.
-  scrape: (options) => runScraper("bice", options, {}, scrapeBice),
+  url: PORTAL_ORIGIN,
+  mode: "api",
+  scrape: (options) => runApiScraper("bice", options, scrapeBice, 60_000),
 };
 
 export default bice;
