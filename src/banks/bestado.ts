@@ -1,380 +1,609 @@
-import type { Page } from "puppeteer-core";
 import type { BankMovement, BankScraper, ScrapeResult, ScraperOptions } from "../types.js";
 import { MOVEMENT_SOURCE } from "../types.js";
-import { closePopups, delay, parseChileanAmount, normalizeDate, deduplicateMovements } from "../utils.js";
-import { runScraper } from "../infrastructure/scraper-runner.js";
-import type { BrowserSession } from "../infrastructure/browser.js";
-import { clickByText } from "../actions/navigation.js";
+import { normalizeDate, deduplicateMovements } from "../utils.js";
+import { runApiScraper } from "../infrastructure/api-runner.js";
 
-// ─── Bestado-specific constants ──────────────────────────────────
+// ─── BancoEstado constants ──────────────────────────────────────
+//
+// Auth: Angular SPA login at bancoestado.cl, backed by an API POST
+// Data: REST API behind Akamai WAF (TLS fingerprinting)
+// Risk: Highest probability of Akamai blocking Node.js fetch()
+//
+// If Akamai blocks the initial GET, we return an informative error
+// directing the user to use browser mode with --profile.
 
-const LOGIN_URL = "https://www.bancoestado.cl/content/bancoestado-public/cl/es/home/home.html#/login";
+const LOGIN_PAGE = "https://www.bancoestado.cl/content/bancoestado-public/cl/es/home/home.html";
+const LOGIN_POST_CANDIDATES = [
+  "https://www.bancoestado.cl/api/auth/login",
+  "https://www.bancoestado.cl/api/login",
+  "https://login.bancoestado.cl/api/auth/login",
+  "https://login.bancoestado.cl/api/login",
+  "https://www.bancoestado.cl/content/bancoestado-public/cl/es/home/home.html/j_security_check",
+];
+const API_BASE_CANDIDATES = [
+  "https://www.bancoestado.cl/api",
+  "https://api.bancoestado.cl",
+  "https://www.bancoestado.cl/content/bancoestado-public/api",
+];
+const BALANCE_PATHS = [
+  "cuentas/saldos",
+  "productos/cuentas/saldos",
+  "cuentarut/saldo",
+  "cuentas/cuentarut/saldo",
+];
+const MOVEMENTS_PATHS = [
+  "cuentas/movimientos",
+  "cuentarut/movimientos",
+  "movimientos/cartola",
+  "cuentas/cartola",
+];
 
-// ─── Bestado-specific helpers ────────────────────────────────────
+const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
-async function fillRut(page: Page, rut: string): Promise<boolean> {
-  const rutInput = await page.$("#rut");
-  if (!rutInput) return false;
+const AKAMAI_ERROR = [
+  "BancoEstado bloqueado por Akamai (proteccion anti-bot).",
+  "El servidor detecto que la conexion no proviene de un navegador real.",
+  "Solucion: usa el modo browser con tu perfil de Chrome:",
+  "  node dist/cli.js --bank bestado --headful --profile",
+  "Esto usa tu sesion real de Chrome y evita el bloqueo de Akamai.",
+].join("\n");
 
-  await rutInput.click();
-  await delay(500);
+// ─── API response types (best-effort, no credentials to confirm) ─
 
-  // Angular removes readonly on focus — force-remove if still present
-  const isReadonly = await page.evaluate(() => {
-    const input = document.querySelector("#rut") as HTMLInputElement;
-    if (input?.hasAttribute("readonly")) {
-      input.removeAttribute("readonly");
-      input.focus();
-      return true;
-    }
-    return false;
-  });
-  if (isReadonly) await delay(300);
-
-  await rutInput.click({ clickCount: 3 });
-  const cleanRut = rut.replace(/[.\-]/g, "");
-  await rutInput.type(cleanRut, { delay: 80 });
-
-  // Trigger Angular change detection
-  await page.evaluate(() => {
-    const input = document.querySelector("#rut") as HTMLInputElement;
-    if (input) {
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-      input.dispatchEvent(new Event("change", { bubbles: true }));
-    }
-  });
-
-  return true;
+interface ApiMovement {
+  fecha?: string;
+  fechaContable?: string;
+  fechaTransaccion?: string;
+  descripcion?: string;
+  glosa?: string;
+  detalle?: string;
+  monto?: number;
+  cargo?: number;
+  abono?: number;
+  saldo?: number;
+  tipo?: string;
 }
 
-async function fillPassword(page: Page, password: string): Promise<boolean> {
-  const passInput = await page.$("#pass");
-  if (!passInput) return false;
+interface ApiBalanceResponse {
+  saldoDisponible?: number;
+  saldo?: number;
+  disponible?: number;
+  cuentas?: Array<{ saldo?: number; disponible?: number; tipo?: string; producto?: string }>;
+}
 
-  await passInput.click({ clickCount: 3 });
-  await passInput.type(password, { delay: 80 });
+interface ApiMovementsResponse {
+  movimientos?: ApiMovement[];
+  cartola?: ApiMovement[];
+  data?: ApiMovement[];
+  totalPaginas?: number;
+  paginaActual?: number;
+  masPaginas?: boolean;
+  hasMore?: boolean;
+}
 
-  await page.evaluate(() => {
-    const input = document.querySelector("#pass") as HTMLInputElement;
-    if (input) {
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-      input.dispatchEvent(new Event("change", { bubbles: true }));
+// ─── Cookie jar ──────────────────────────────────────────────────
+
+interface CookieJar {
+  cookies: Map<string, string>;
+  set(raw: string): void;
+  setAll(headers: Headers): void;
+  header(): string;
+  get(name: string): string | undefined;
+}
+
+function createCookieJar(): CookieJar {
+  const cookies = new Map<string, string>();
+  return {
+    cookies,
+    set(raw: string) {
+      const [nameValue] = raw.split(";");
+      const eqIdx = nameValue.indexOf("=");
+      if (eqIdx > 0) cookies.set(nameValue.slice(0, eqIdx).trim(), nameValue.slice(eqIdx + 1).trim());
+    },
+    setAll(headers: Headers) {
+      const setCookies = headers.getSetCookie?.() ?? [];
+      for (const raw of setCookies) this.set(raw);
+    },
+    header() {
+      return Array.from(cookies.entries()).map(([k, v]) => `${k}=${v}`).join("; ");
+    },
+    get(name: string) {
+      return cookies.get(name);
+    },
+  };
+}
+
+// ─── Akamai detection ────────────────────────────────────────────
+
+function isAkamaiBlock(status: number, body: string): boolean {
+  if (status === 403) return true;
+  if (status === 429) return true;
+  // Akamai challenge pages contain specific markers
+  const akamaiMarkers = [
+    "akamai",
+    "access denied",
+    "reference #",
+    "bot manager",
+    "javascript is required",
+    "_abck",
+    "ak_bmsc",
+    "challenge-platform",
+  ];
+  const lower = body.toLowerCase();
+  return akamaiMarkers.some(marker => lower.includes(marker));
+}
+
+// ─── Login ───────────────────────────────────────────────────────
+
+async function bestadoLogin(
+  rut: string,
+  password: string,
+  debugLog: string[],
+): Promise<{ success: true; jar: CookieJar; apiBase: string } | { success: false; error: string }> {
+  const jar = createCookieJar();
+  const cleanRut = rut.replace(/[.\-]/g, "");
+
+  // Step 1: GET login page to collect cookies and detect Akamai
+  debugLog.push("1. Fetching BancoEstado login page...");
+  let loginPageBody: string;
+  try {
+    const loginPageRes = await fetch(LOGIN_PAGE, {
+      headers: {
+        "User-Agent": UA,
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "es-CL,es;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        Connection: "keep-alive",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+      },
+      redirect: "follow",
+    });
+    jar.setAll(loginPageRes.headers);
+    loginPageBody = await loginPageRes.text();
+    debugLog.push(`  Status: ${loginPageRes.status}, cookies: ${jar.cookies.size}`);
+
+    if (isAkamaiBlock(loginPageRes.status, loginPageBody)) {
+      debugLog.push("  BLOCKED: Akamai detected on initial page load");
+      return { success: false, error: AKAMAI_ERROR };
     }
-  });
-
-  const typed = await page.evaluate((expectedLen: number) => {
-    const input = document.querySelector("#pass") as HTMLInputElement | null;
-    return !!input && input.value.length === expectedLen;
-  }, password.length);
-
-  if (!typed) {
-    const forced = await page.evaluate((pwd: string) => {
-      const input = document.querySelector("#pass") as HTMLInputElement | null;
-      if (!input) return false;
-      input.focus();
-      input.value = pwd;
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-      input.dispatchEvent(new Event("change", { bubbles: true }));
-      return input.value.length === pwd.length;
-    }, password);
-
-    if (!forced) return false;
+  } catch (err) {
+    debugLog.push(`  Network error: ${err instanceof Error ? err.message : String(err)}`);
+    return { success: false, error: `No se pudo conectar a BancoEstado: ${err instanceof Error ? err.message : String(err)}` };
   }
 
-  return true;
+  // Step 2: Try to discover the login endpoint from the Angular SPA
+  debugLog.push("2. Attempting API login...");
+
+  // Extract any CSRF/XSRF tokens from cookies or page
+  const xsrf = jar.get("XSRF-TOKEN") ? decodeURIComponent(jar.get("XSRF-TOKEN")!) : undefined;
+  const csrfFromPage = loginPageBody.match(/name="csrf[^"]*"\s+(?:value|content)="([^"]+)"/i)?.[1]
+    || loginPageBody.match(/csrf[_-]?token['"]\s*[:=]\s*['"]([^'"]+)/i)?.[1];
+  const csrfToken = xsrf || csrfFromPage;
+
+  // Build login payloads — try JSON first, then form-encoded
+  const jsonPayload = JSON.stringify({ rut: cleanRut, password, clave: password });
+  const formPayload = new URLSearchParams({
+    rut: cleanRut,
+    password,
+    ...(csrfToken ? { _csrf: csrfToken } : {}),
+  }).toString();
+
+  let loginSuccess = false;
+  let discoveredApiBase = "";
+
+  for (const loginUrl of LOGIN_POST_CANDIDATES) {
+    // Try JSON
+    try {
+      debugLog.push(`  Trying POST ${loginUrl} (JSON)...`);
+      const res = await fetch(loginUrl, {
+        method: "POST",
+        headers: {
+          "User-Agent": UA,
+          "Content-Type": "application/json",
+          Accept: "application/json, text/plain, */*",
+          Cookie: jar.header(),
+          Referer: LOGIN_PAGE,
+          Origin: "https://www.bancoestado.cl",
+          ...(csrfToken ? { "X-XSRF-TOKEN": csrfToken, "X-CSRF-TOKEN": csrfToken } : {}),
+        },
+        body: jsonPayload,
+        redirect: "manual",
+      });
+      jar.setAll(res.headers);
+      const body = await res.text();
+      debugLog.push(`    Status: ${res.status}`);
+
+      if (isAkamaiBlock(res.status, body)) {
+        debugLog.push("    BLOCKED: Akamai on login POST");
+        return { success: false, error: AKAMAI_ERROR };
+      }
+
+      // 2xx or 3xx redirect = potentially successful
+      if (res.status >= 200 && res.status < 400) {
+        // Check if the response indicates success
+        try {
+          const json = JSON.parse(body);
+          if (json.error || json.mensaje?.toLowerCase().includes("incorrecto") || json.mensaje?.toLowerCase().includes("invalido")) {
+            debugLog.push(`    Login rejected: ${json.error || json.mensaje}`);
+            return { success: false, error: `Credenciales incorrectas: ${json.error || json.mensaje}` };
+          }
+        } catch { /* not JSON, check redirect */ }
+
+        const location = res.headers.get("location") || "";
+        if (location && !location.includes("/login")) {
+          loginSuccess = true;
+          // Derive API base from login URL
+          const urlObj = new URL(loginUrl);
+          discoveredApiBase = `${urlObj.origin}/api`;
+          debugLog.push(`    Login appears successful (redirect: ${location})`);
+
+          // Follow redirect
+          if (location) {
+            try {
+              const redirectUrl = location.startsWith("http") ? location : `${urlObj.origin}${location}`;
+              const rRes = await fetch(redirectUrl, {
+                headers: { "User-Agent": UA, Cookie: jar.header() },
+                redirect: "follow",
+              });
+              jar.setAll(rRes.headers);
+            } catch { /* ignore redirect errors */ }
+          }
+          break;
+        }
+
+        // If 200 with body that looks like a token or session
+        if (res.status === 200 && body.length > 0 && body.length < 5000) {
+          try {
+            const json = JSON.parse(body);
+            if (json.token || json.access_token || json.sessionId || json.success) {
+              loginSuccess = true;
+              const urlObj = new URL(loginUrl);
+              discoveredApiBase = `${urlObj.origin}/api`;
+              if (json.token) jar.cookies.set("Authorization", `Bearer ${json.token}`);
+              if (json.access_token) jar.cookies.set("Authorization", `Bearer ${json.access_token}`);
+              debugLog.push("    Login successful (token received)");
+              break;
+            }
+          } catch { /* not JSON */ }
+        }
+      }
+    } catch { /* network error, try next */ }
+
+    // Try form-encoded
+    try {
+      debugLog.push(`  Trying POST ${loginUrl} (form)...`);
+      const res = await fetch(loginUrl, {
+        method: "POST",
+        headers: {
+          "User-Agent": UA,
+          "Content-Type": "application/x-www-form-urlencoded",
+          Accept: "text/html,application/json,*/*",
+          Cookie: jar.header(),
+          Referer: LOGIN_PAGE,
+          Origin: "https://www.bancoestado.cl",
+          ...(csrfToken ? { "X-XSRF-TOKEN": csrfToken, "X-CSRF-TOKEN": csrfToken } : {}),
+        },
+        body: formPayload,
+        redirect: "manual",
+      });
+      jar.setAll(res.headers);
+      const body = await res.text();
+      debugLog.push(`    Status: ${res.status}`);
+
+      if (isAkamaiBlock(res.status, body)) {
+        debugLog.push("    BLOCKED: Akamai on login POST");
+        return { success: false, error: AKAMAI_ERROR };
+      }
+
+      const location = res.headers.get("location") || "";
+      if (res.status >= 300 && res.status < 400 && location && !location.includes("/login")) {
+        loginSuccess = true;
+        const urlObj = new URL(loginUrl);
+        discoveredApiBase = `${urlObj.origin}/api`;
+        debugLog.push(`    Login appears successful (redirect: ${location})`);
+
+        try {
+          const redirectUrl = location.startsWith("http") ? location : `${urlObj.origin}${location}`;
+          const rRes = await fetch(redirectUrl, {
+            headers: { "User-Agent": UA, Cookie: jar.header() },
+            redirect: "follow",
+          });
+          jar.setAll(rRes.headers);
+        } catch { /* ignore */ }
+        break;
+      }
+    } catch { /* network error, try next */ }
+  }
+
+  if (!loginSuccess) {
+    debugLog.push("  All login endpoints failed or were blocked");
+    return {
+      success: false,
+      error: [
+        "No se pudo autenticar con BancoEstado via API.",
+        "Los endpoints de login conocidos no respondieron correctamente.",
+        "Posibles causas:",
+        "  - Akamai bloquea conexiones que no provienen de un navegador real",
+        "  - Los endpoints de login han cambiado",
+        "Solucion: usa el modo browser con tu perfil de Chrome:",
+        "  node dist/cli.js --bank bestado --headful --profile",
+      ].join("\n"),
+    };
+  }
+
+  // Determine working API base
+  if (!discoveredApiBase) discoveredApiBase = API_BASE_CANDIDATES[0];
+  debugLog.push(`3. Login OK, API base: ${discoveredApiBase}, cookies: ${jar.cookies.size}`);
+
+  return { success: true, jar, apiBase: discoveredApiBase };
 }
 
-async function extractBalanceFromDashboard(page: Page, debugLog: string[]): Promise<number | undefined> {
-  const balance = await page.evaluate(() => {
-    const productCards = document.querySelectorAll('[class*="product"], [class*="card"], [class*="cuenta"]');
-    for (const card of productCards) {
-      const text = (card as HTMLElement).innerText || "";
-      if (text.toLowerCase().includes("cuentarut") || text.toLowerCase().includes("cuenta rut")) {
-        const amountMatch = text.match(/\$\s*([\d.,]+)/);
-        if (amountMatch) return amountMatch[1];
-      }
-    }
-    const bodyText = document.body?.innerText || "";
-    const patterns = [
-      /cuentarut[^$]*\$\s*([\d.,]+)/i,
-      /cuenta\s*rut[^$]*\$\s*([\d.,]+)/i,
-      /saldo\s*disponible[:\s]*\$?\s*([\d.,]+)/i,
-    ];
-    for (const pattern of patterns) {
-      const match = bodyText.match(pattern);
-      if (match) return match[1];
-    }
-    return null;
-  });
+// ─── API helpers ─────────────────────────────────────────────────
 
-  if (balance) {
-    const parsed = parseChileanAmount(balance);
-    debugLog.push(`  CuentaRUT balance: $${parsed.toLocaleString("es-CL")}`);
-    return parsed;
+async function apiGet<T>(jar: CookieJar, url: string): Promise<T> {
+  const xsrf = jar.get("XSRF-TOKEN") ? decodeURIComponent(jar.get("XSRF-TOKEN")!) : undefined;
+  const authCookie = jar.get("Authorization");
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": UA,
+      Accept: "application/json",
+      Cookie: jar.header(),
+      Referer: "https://www.bancoestado.cl/",
+      Origin: "https://www.bancoestado.cl",
+      ...(xsrf ? { "X-XSRF-TOKEN": xsrf } : {}),
+      ...(authCookie ? { Authorization: authCookie } : {}),
+    },
+  });
+  jar.setAll(res.headers);
+  if (!res.ok) throw new Error(`API GET ${url} -> ${res.status}`);
+  return res.json() as Promise<T>;
+}
+
+async function apiPost<T>(jar: CookieJar, url: string, body: unknown = {}): Promise<T> {
+  const xsrf = jar.get("XSRF-TOKEN") ? decodeURIComponent(jar.get("XSRF-TOKEN")!) : undefined;
+  const authCookie = jar.get("Authorization");
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "User-Agent": UA,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      Cookie: jar.header(),
+      Referer: "https://www.bancoestado.cl/",
+      Origin: "https://www.bancoestado.cl",
+      ...(xsrf ? { "X-XSRF-TOKEN": xsrf } : {}),
+      ...(authCookie ? { Authorization: authCookie } : {}),
+    },
+    body: JSON.stringify(body),
+  });
+  jar.setAll(res.headers);
+  if (!res.ok) throw new Error(`API POST ${url} -> ${res.status}`);
+  return res.json() as Promise<T>;
+}
+
+// ─── Data extraction ─────────────────────────────────────────────
+
+function parseApiMovement(mov: ApiMovement): BankMovement | null {
+  const dateRaw = mov.fecha || mov.fechaContable || mov.fechaTransaccion;
+  if (!dateRaw) return null;
+
+  const description = (mov.descripcion || mov.glosa || mov.detalle || "").trim();
+  if (!description) return null;
+
+  let amount: number;
+  if (mov.monto !== undefined) {
+    // If tipo indicates cargo (debit), make negative
+    amount = mov.tipo === "cargo" || mov.tipo === "debito" ? -Math.abs(mov.monto) : Math.abs(mov.monto);
+  } else if (mov.cargo !== undefined && mov.cargo !== 0) {
+    amount = -Math.abs(mov.cargo);
+  } else if (mov.abono !== undefined && mov.abono !== 0) {
+    amount = Math.abs(mov.abono);
+  } else {
+    return null;
+  }
+
+  return {
+    date: normalizeDate(dateRaw),
+    description,
+    amount,
+    balance: mov.saldo ?? 0,
+    source: MOVEMENT_SOURCE.account,
+  };
+}
+
+// ─── Balance fetching ────────────────────────────────────────────
+
+async function fetchBalance(
+  jar: CookieJar,
+  apiBase: string,
+  debugLog: string[],
+): Promise<number | undefined> {
+  for (const path of BALANCE_PATHS) {
+    const url = `${apiBase}/${path}`;
+    try {
+      // Try GET first
+      const data = await apiGet<ApiBalanceResponse>(jar, url);
+      if (data.saldoDisponible !== undefined) return data.saldoDisponible;
+      if (data.disponible !== undefined) return data.disponible;
+      if (data.saldo !== undefined) return data.saldo;
+      if (data.cuentas?.length) {
+        const cuentaRut = data.cuentas.find(c =>
+          c.tipo?.toLowerCase().includes("cuentarut") ||
+          c.producto?.toLowerCase().includes("cuentarut") ||
+          c.tipo?.toLowerCase().includes("cuenta rut"),
+        );
+        const acct = cuentaRut || data.cuentas[0];
+        return acct.disponible ?? acct.saldo;
+      }
+      debugLog.push(`  Balance from ${path}: found data but no recognized fields`);
+    } catch {
+      // Try POST as fallback
+      try {
+        const data = await apiPost<ApiBalanceResponse>(jar, url, {});
+        if (data.saldoDisponible !== undefined) return data.saldoDisponible;
+        if (data.disponible !== undefined) return data.disponible;
+        if (data.saldo !== undefined) return data.saldo;
+      } catch { /* try next path */ }
+    }
   }
   return undefined;
 }
 
-async function extractMovements(page: Page): Promise<BankMovement[]> {
-  const raw = await page.evaluate(() => {
-    const results: Array<{ date: string; description: string; amount: string; balance: string }> = [];
+// ─── Movements fetching ──────────────────────────────────────────
 
-    // Strategy 1: Table with headers
-    const tables = document.querySelectorAll("table");
-    for (const table of tables) {
-      const rows = Array.from(table.querySelectorAll("tr"));
-      if (rows.length < 2) continue;
+async function fetchMovements(
+  jar: CookieJar,
+  apiBase: string,
+  debugLog: string[],
+): Promise<BankMovement[]> {
+  const allMovements: BankMovement[] = [];
 
-      let dateIdx = -1, descIdx = -1, amountIdx = -1, saldoIdx = -1;
-      let cargoIdx = -1, abonoIdx = -1;
-      for (const row of rows) {
-        const ths = row.querySelectorAll("th");
-        if (ths.length >= 3) {
-          const headers = Array.from(ths).map(h => (h as HTMLElement).innerText?.trim().toLowerCase());
-          dateIdx = headers.findIndex(h => h.includes("fecha"));
-          descIdx = headers.findIndex(h => h.includes("descripci") || h.includes("detalle") || h.includes("glosa"));
-          saldoIdx = headers.findIndex(h => h.includes("saldo"));
-          amountIdx = headers.findIndex(h => (h.includes("abono") && h.includes("cargo")) || h.includes("monto") || h.includes("importe"));
-          if (amountIdx < 0) {
-            cargoIdx = headers.findIndex(h => h === "cargo" || h === "cargos" || h.includes("débito"));
-            abonoIdx = headers.findIndex(h => h === "abono" || h === "abonos" || h.includes("crédito") || h.includes("depósito"));
+  for (const path of MOVEMENTS_PATHS) {
+    const url = `${apiBase}/${path}`;
+    try {
+      // Try GET first
+      let data: ApiMovementsResponse;
+      try {
+        data = await apiGet<ApiMovementsResponse>(jar, url);
+      } catch {
+        // Try POST with empty body or pagination params
+        data = await apiPost<ApiMovementsResponse>(jar, url, { pagina: 1, cantidad: 50 });
+      }
+
+      const movList = data.movimientos || data.cartola || data.data || [];
+      if (movList.length === 0) continue;
+
+      debugLog.push(`  Found ${movList.length} movements from ${path}`);
+      for (const mov of movList) {
+        const parsed = parseApiMovement(mov);
+        if (parsed) allMovements.push(parsed);
+      }
+
+      // Pagination
+      let hasMore = data.masPaginas ?? data.hasMore ?? ((data.totalPaginas ?? 1) > (data.paginaActual ?? 1));
+      let page = 2;
+      while (hasMore && page <= 25) {
+        try {
+          const nextData = await apiPost<ApiMovementsResponse>(jar, url, { pagina: page, cantidad: 50 });
+          const nextList = nextData.movimientos || nextData.cartola || nextData.data || [];
+          if (nextList.length === 0) break;
+
+          debugLog.push(`  Page ${page}: ${nextList.length} movements`);
+          for (const mov of nextList) {
+            const parsed = parseApiMovement(mov);
+            if (parsed) allMovements.push(parsed);
           }
-          if (dateIdx >= 0) break;
+
+          hasMore = nextData.masPaginas ?? nextData.hasMore ?? ((nextData.totalPaginas ?? 1) > page);
+          page++;
+        } catch {
+          hasMore = false;
         }
       }
 
-      if (dateIdx < 0) continue;
+      // If we got movements from this path, stop trying others
+      break;
+    } catch { /* try next path */ }
+  }
 
-      for (const row of rows) {
-        const cells = row.querySelectorAll("td");
-        if (cells.length < 3) continue;
-        const texts = Array.from(cells).map(c => (c as HTMLElement).innerText?.trim());
-        const dateText = texts[dateIdx] || "";
-        if (!/\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4}/.test(dateText)) continue;
-
-        let amount = "";
-        if (amountIdx >= 0) {
-          amount = texts[amountIdx] || "";
-        } else if (cargoIdx >= 0 || abonoIdx >= 0) {
-          const cargo = cargoIdx >= 0 ? texts[cargoIdx] || "" : "";
-          const abono = abonoIdx >= 0 ? texts[abonoIdx] || "" : "";
-          if (cargo && cargo !== "$0" && cargo !== "0") amount = `-${cargo}`;
-          else if (abono) amount = abono;
-        }
-
-        results.push({
-          date: dateText,
-          description: texts[descIdx >= 0 ? descIdx : 1] || "",
-          amount,
-          balance: saldoIdx >= 0 ? texts[saldoIdx] || "" : "",
-        });
-      }
-    }
-
-    // Strategy 2: Dashboard movement cards
-    if (results.length === 0) {
-      const movRows = document.querySelectorAll('[class*="movimiento"], [class*="movement"], [class*="transaction"]');
-      for (const el of movRows) {
-        const text = (el as HTMLElement).innerText || "";
-        const dateMatch = text.match(/(\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4})/);
-        const amountMatch = text.match(/[+\-]?\$[\d.,]+/g);
-        if (dateMatch && amountMatch) {
-          const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
-          const descLine = lines.find(l => !l.match(/^[+\-]?\$/) && !l.match(/^\d{1,2}[\/.\-]/) && l.length > 2);
-          results.push({
-            date: dateMatch[1],
-            description: descLine || "",
-            amount: amountMatch[0],
-            balance: amountMatch.length > 1 ? amountMatch[amountMatch.length - 1] : "",
-          });
-        }
-      }
-    }
-
-    return results;
-  });
-
-  return raw
-    .map(r => {
-      const amount = parseChileanAmount(r.amount);
-      if (amount === 0) return null;
-      return {
-        date: normalizeDate(r.date),
-        description: r.description,
-        amount,
-        balance: r.balance ? parseChileanAmount(r.balance) : 0,
-        source: MOVEMENT_SOURCE.account,
-      } as BankMovement;
-    })
-    .filter(Boolean) as BankMovement[];
+  return allMovements;
 }
 
 // ─── Main scrape function ────────────────────────────────────────
 
-async function scrapeBestado(
-  session: BrowserSession,
-  options: ScraperOptions,
-): Promise<ScrapeResult> {
-  const { rut, password, saveScreenshots: doScreenshots } = options;
-  const { onProgress } = options;
-  const { page, debugLog, screenshot: doSave } = session;
+async function scrapeBestado(options: ScraperOptions, debugLog: string[]): Promise<ScrapeResult> {
+  const { rut, password, onProgress } = options;
   const bank = "bestado";
   const progress = onProgress || (() => {});
 
-  // 1. Navigate
-  debugLog.push("1. Navigating to BancoEstado login...");
-  progress("Abriendo sitio del banco...");
-  await page.goto(LOGIN_URL, { waitUntil: "networkidle2", timeout: 30000 });
-  await delay(3000);
-  await closePopups(page);
-  await doSave(page, "01-homepage");
+  // Step 1: Login
+  progress("Conectando con BancoEstado API...");
+  const loginResult = await bestadoLogin(rut, password, debugLog);
+  if (!loginResult.success) {
+    return { success: false, bank, movements: [], error: loginResult.error, debug: debugLog.join("\n") };
+  }
 
-  // 2. Wait for login form
-  debugLog.push("2. Waiting for login offcanvas...");
+  const { jar, apiBase } = loginResult;
+  progress("Sesion iniciada correctamente");
+
+  // Step 2: Fetch balance
+  debugLog.push("4. Fetching CuentaRUT balance...");
+  progress("Obteniendo saldo CuentaRUT...");
+  let balance: number | undefined;
   try {
-    await page.waitForSelector(".msd-custom-sidenav__container #rut", { visible: true, timeout: 15000 });
-  } catch {
-    await clickByText(page, ["ingresar", "banca en línea", "login"]);
-    await delay(3000);
-    await page.waitForSelector("#rut", { visible: true, timeout: 10000 });
-  }
-  await doSave(page, "02-login-form");
-
-  // 3-4. Fill credentials
-  debugLog.push("3. Filling RUT...");
-  progress("Ingresando RUT...");
-  if (!(await fillRut(page, rut))) {
-    const ss = await page.screenshot({ encoding: "base64" });
-    return { success: false, bank, movements: [], error: "No se pudo llenar el RUT", screenshot: ss as string, debug: debugLog.join("\n") };
-  }
-
-  debugLog.push("4. Filling password...");
-  progress("Ingresando clave...");
-  if (!(await fillPassword(page, password))) {
-    const ss = await page.screenshot({ encoding: "base64" });
-    return { success: false, bank, movements: [], error: "No se pudo llenar la clave", screenshot: ss as string, debug: debugLog.join("\n") };
-  }
-  await doSave(page, "03-credentials");
-
-  // 5. Submit
-  debugLog.push("5. Submitting login...");
-  progress("Iniciando sesión...");
-  const submitBtn = await page.$("#btnLogin");
-  if (submitBtn) {
-    await submitBtn.click();
-  } else {
-    await page.evaluate(() => {
-      const form = document.querySelector("form");
-      if (form) form.dispatchEvent(new Event("submit", { bubbles: true }));
-    });
-  }
-
-  try { await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 30000 }); } catch { await delay(5000); }
-  await delay(3000);
-  await closePopups(page);
-  await doSave(page, "04-post-login");
-
-  // Check login errors
-  const loginError = await page.evaluate(() => {
-    const errorKeywords = ["contraseña", "clave incorrecta", "rut inválido", "credenciales", "bloqueado", "intente nuevamente", "reintente"];
-    const errorEls = document.querySelectorAll('[class*="error"], [class*="alert"], .input-messages');
-    for (const el of errorEls) {
-      const text = (el as HTMLElement).innerText?.trim().toLowerCase();
-      if (text && errorKeywords.some(kw => text.includes(kw))) return (el as HTMLElement).innerText?.trim();
+    balance = await fetchBalance(jar, apiBase, debugLog);
+    if (balance !== undefined) {
+      debugLog.push(`  CuentaRUT balance: $${balance.toLocaleString("es-CL")}`);
+    } else {
+      debugLog.push("  Could not find balance from any endpoint");
     }
-    return null;
-  });
-  if (loginError) {
-    const ss = await page.screenshot({ encoding: "base64" });
-    return { success: false, bank, movements: [], error: `Login fallido: ${loginError}`, screenshot: ss as string, debug: debugLog.join("\n") };
+  } catch (err) {
+    debugLog.push(`  Balance error: ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  // Dismiss promo modals
-  await page.evaluate(() => {
-    const btns = document.querySelectorAll("button, a");
-    for (const btn of btns) {
-      const text = (btn as HTMLElement).innerText?.trim().toLowerCase();
-      if (text === "no por ahora" || text === "cerrar" || text === "×") { (btn as HTMLElement).click(); break; }
-    }
-  });
-  await delay(1000);
-
-  const postLoginUrl = new URL(page.url());
-  debugLog.push(`  Login OK! URL: ${postLoginUrl.origin}${postLoginUrl.pathname}`);
-  progress("Sesión iniciada correctamente");
-
-  // 6. Balance
-  debugLog.push("6. Extracting CuentaRUT balance...");
-  progress("Extrayendo saldo CuentaRUT...");
-  const balance = await extractBalanceFromDashboard(page, debugLog);
-  await doSave(page, "05-dashboard");
-
-  // 7. Navigate to movements
-  debugLog.push("7. Navigating to CuentaRUT movements...");
-  progress("Navegando a movimientos CuentaRUT...");
-  let navigated = await page.evaluate(() => {
-    const links = document.querySelectorAll("a, button");
-    for (const el of links) {
-      const text = (el as HTMLElement).innerText?.trim().toLowerCase();
-      if (text === "ir a movimientos" || text === "ver movimientos" || text === "ver más movimientos") {
-        (el as HTMLElement).click();
-        return text;
-      }
-    }
-    return null;
-  });
-
-  if (navigated) {
-    debugLog.push(`  Clicked: "${navigated}"`);
-    await delay(5000);
-    await closePopups(page);
-  } else {
-    // Sidebar fallback
-    const sidebarClicked = await clickByText(page, ["cuentas"]);
-    if (sidebarClicked) {
-      await delay(2000);
-      await clickByText(page, ["cuentarut", "cuenta rut", "movimientos", "cartola"]);
-      await delay(5000);
-      await closePopups(page);
-    }
-  }
-
-  await doSave(page, "06-movements-page");
-
-  // 8. Extract movements with pagination
-  debugLog.push("8. Extracting movements...");
-  progress("Extrayendo movimientos...");
-  let movements = await extractMovements(page);
-
-  for (let i = 0; i < 10; i++) {
-    const hasMore = await page.evaluate(() => {
-      const btns = document.querySelectorAll("button, a");
-      for (const btn of btns) {
-        const text = (btn as HTMLElement).innerText?.trim().toLowerCase();
-        const el = btn as HTMLButtonElement;
-        if ((text === "siguiente" || text === "ver más" || text === "cargar más" || text.includes("›")) && !el.disabled) {
-          el.click();
-          return true;
+  // Also try alternate API bases if primary didn't yield balance
+  if (balance === undefined) {
+    for (const altBase of API_BASE_CANDIDATES) {
+      if (altBase === apiBase) continue;
+      try {
+        balance = await fetchBalance(jar, altBase, debugLog);
+        if (balance !== undefined) {
+          debugLog.push(`  Balance found via alternate base: ${altBase}`);
+          break;
         }
-      }
-      return false;
-    });
-    if (!hasMore) break;
-    debugLog.push(`  Pagination: page ${i + 2}`);
-    await delay(3000);
-    const more = await extractMovements(page);
-    if (more.length === 0) break;
-    movements.push(...more);
+      } catch { /* try next */ }
+    }
   }
 
+  // Step 3: Fetch movements
+  debugLog.push("5. Fetching CuentaRUT movements...");
+  progress("Extrayendo movimientos CuentaRUT...");
+  let movements: BankMovement[] = [];
+  try {
+    movements = await fetchMovements(jar, apiBase, debugLog);
+  } catch (err) {
+    debugLog.push(`  Movements error: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // Try alternate API bases if no movements found
+  if (movements.length === 0) {
+    for (const altBase of API_BASE_CANDIDATES) {
+      if (altBase === apiBase) continue;
+      try {
+        movements = await fetchMovements(jar, altBase, debugLog);
+        if (movements.length > 0) {
+          debugLog.push(`  Movements found via alternate base: ${altBase}`);
+          break;
+        }
+      } catch { /* try next */ }
+    }
+  }
+
+  // Deduplicate
   const deduplicated = deduplicateMovements(movements);
-  debugLog.push(`  Total: ${deduplicated.length} unique movements`);
-  progress(`Listo — ${deduplicated.length} movimientos totales`);
+  debugLog.push(`6. Total: ${deduplicated.length} unique movements`);
+  progress(`Listo -- ${deduplicated.length} movimientos totales`);
 
-  await doSave(page, "07-final");
-  const ss = doScreenshots ? await page.screenshot({ encoding: "base64" }) as string : undefined;
+  // Derive balance from first movement if not found via API
+  if (balance === undefined && deduplicated.length > 0) {
+    const withBalance = deduplicated.find(m => m.balance !== 0);
+    if (withBalance) {
+      balance = withBalance.balance;
+      debugLog.push(`  Balance derived from movements: $${balance.toLocaleString("es-CL")}`);
+    }
+  }
 
-  return { success: true, bank, movements: deduplicated, balance, screenshot: ss, debug: debugLog.join("\n") };
+  return {
+    success: true,
+    bank,
+    movements: deduplicated,
+    balance,
+    debug: debugLog.join("\n"),
+  };
 }
 
 // ─── Export ──────────────────────────────────────────────────────
@@ -383,7 +612,8 @@ const bestado: BankScraper = {
   id: "bestado",
   name: "Banco Estado",
   url: "https://www.bancoestado.cl",
-  scrape: (options) => runScraper("bestado", options, { forceHeadful: true }, scrapeBestado),
+  mode: "api",
+  scrape: (options) => runApiScraper("bestado", options, scrapeBestado),
 };
 
 export default bestado;
