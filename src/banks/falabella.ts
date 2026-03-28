@@ -1,366 +1,659 @@
-import type { Page } from "puppeteer-core";
-import type { BankMovement, BankScraper, CardOwner, CreditCardBalance, ScrapeResult, ScraperOptions } from "../types.js";
+import type { BankMovement, BankScraper, CreditCardBalance, ScrapeResult, ScraperOptions } from "../types.js";
 import { MOVEMENT_SOURCE } from "../types.js";
-import { closePopups, delay, deduplicateMovements, normalizeDate, normalizeOwner, normalizeInstallments, parseChileanAmount } from "../utils.js";
-import { runScraper } from "../infrastructure/scraper-runner.js";
-import type { BrowserSession } from "../infrastructure/browser.js";
-import { fillRut, fillPassword, clickSubmit } from "../actions/login.js";
-import { clickByText, dismissBanners } from "../actions/navigation.js";
-import { extractAccountMovements } from "../actions/extraction.js";
-import { paginateAndExtract } from "../actions/pagination.js";
+import { normalizeDate, deduplicateMovements, normalizeInstallments, normalizeOwner } from "../utils.js";
+import { runApiScraper } from "../infrastructure/api-runner.js";
 
-// ─── Falabella-specific constants ────────────────────────────────
+// ─── Banco Falabella constants ──────────────────────────────────
+//
+// Auth: Angular SPA with session-cookie auth
+// Data: REST API behind the authenticated portal
+// 2FA: SMS-based second factor
+//
+// No browser needed — this scraper uses fetch() exclusively.
 
 const BANK_URL = "https://www.bancofalabella.cl";
-const SHADOW_HOST = "credit-card-movements";
+const LOGIN_PAGE = "https://www.bancofalabella.cl/personas";
+const API_BASE = "https://www.bancofalabella.cl/api";
 
-// ─── Falabella-specific helpers ──────────────────────────────────
+// Candidate login endpoints (Angular SPA — exact path requires network inspection)
+const LOGIN_ENDPOINTS = [
+  "/api/auth/login",
+  "/api/login",
+  "/personas/api/auth",
+  "/api/v1/auth/login",
+];
 
-async function tryExpandDateRange(page: Page, debugLog: string[]): Promise<void> {
-  try {
-    const selectInfo = await page.evaluate(() => {
-      const selects = Array.from(document.querySelectorAll("select"));
-      return selects.map((sel, i) => ({
-        index: i, name: sel.name || sel.id || `select-${i}`,
-        options: Array.from(sel.querySelectorAll("option")).map((o) => ({ text: o.text.trim(), value: o.value })),
-      }));
-    });
-    for (const sel of selectInfo) {
-      for (const opt of sel.options) {
-        const text = opt.text.toLowerCase();
-        if (text.includes("todos") || text.includes("último mes") || text.includes("30 día") || text.includes("mes anterior")) {
-          await page.evaluate((selIdx: number, optValue: string) => {
-            const selects = document.querySelectorAll("select");
-            const select = selects[selIdx] as HTMLSelectElement;
-            if (select) { select.value = optValue; select.dispatchEvent(new Event("change", { bubbles: true })); }
-          }, sel.index, opt.value);
-          debugLog.push(`  Changed [${sel.name}] to "${opt.text}"`);
-          await delay(3000);
-          break;
-        }
-      }
-    }
-    const clickedSearch = await page.evaluate(() => {
-      const buttons = Array.from(document.querySelectorAll("button, input[type='submit']"));
-      for (const btn of buttons) {
-        const text = (btn as HTMLElement).innerText?.trim().toLowerCase();
-        if (text === "buscar" || text === "consultar" || text === "filtrar") { (btn as HTMLElement).click(); return text; }
-      }
-      return null;
-    });
-    if (clickedSearch) { debugLog.push(`  Clicked "${clickedSearch}"`); await delay(3000); }
-  } catch { /* ignore */ }
+// Candidate form-login fallback
+const FORM_LOGIN = "/personas/login";
+
+const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+// ─── API types ───────────────────────────────────────────────────
+
+interface ApiAccountProduct {
+  id: string;
+  number: string;
+  type: string;
+  currency: string;
+  label: string;
+  balance?: number;
 }
 
-async function clickNavTarget(page: Page, debugLog: string[]): Promise<boolean> {
-  const targets = [
-    { text: "cartola", exact: false },
-    { text: "últimos movimientos", exact: false },
-    { text: "movimientos", exact: true },
-    { text: "estado de cuenta", exact: false },
+interface ApiAccountMovement {
+  date: string;
+  description: string;
+  amount: number;
+  balance: number;
+  type: string; // "cargo" | "abono"
+}
+
+interface ApiCreditCard {
+  id: string;
+  number: string;
+  brand: string;
+  type: string;
+  holder: string;
+}
+
+interface ApiCardBalance {
+  totalNational: number;
+  usedNational: number;
+  availableNational: number;
+  totalInternational?: number;
+  usedInternational?: number;
+  availableInternational?: number;
+}
+
+interface ApiUnbilledMovement {
+  date: string;
+  description: string;
+  amount: number;
+  installments?: string;
+  owner?: string;
+}
+
+interface ApiBilledMovement {
+  date: string;
+  description: string;
+  amount: number;
+  installments?: string;
+  owner?: string;
+  group?: string;
+}
+
+// ─── Cookie jar ──────────────────────────────────────────────────
+
+interface CookieJar {
+  cookies: Map<string, string>;
+  set(raw: string): void;
+  setAll(headers: Headers): void;
+  header(): string;
+  get(name: string): string | undefined;
+}
+
+function createCookieJar(): CookieJar {
+  const cookies = new Map<string, string>();
+  return {
+    cookies,
+    set(raw: string) {
+      const [nameValue] = raw.split(";");
+      const eqIdx = nameValue.indexOf("=");
+      if (eqIdx > 0) cookies.set(nameValue.slice(0, eqIdx).trim(), nameValue.slice(eqIdx + 1).trim());
+    },
+    setAll(headers: Headers) {
+      const setCookies = headers.getSetCookie?.() ?? [];
+      for (const raw of setCookies) this.set(raw);
+    },
+    header() {
+      return Array.from(cookies.entries()).map(([k, v]) => `${k}=${v}`).join("; ");
+    },
+    get(name: string) {
+      return cookies.get(name);
+    },
+  };
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────
+
+function cleanRut(rut: string): string {
+  return rut.replace(/[.\-\s]/g, "");
+}
+
+function commonHeaders(jar: CookieJar): Record<string, string> {
+  const headers: Record<string, string> = {
+    "User-Agent": UA,
+    Accept: "application/json, text/plain, */*",
+    Cookie: jar.header(),
+    Referer: LOGIN_PAGE,
+    Origin: BANK_URL,
+  };
+  // Include CSRF/XSRF tokens if present
+  const xsrf = jar.get("XSRF-TOKEN");
+  if (xsrf) headers["X-XSRF-TOKEN"] = decodeURIComponent(xsrf);
+  const csrf = jar.get("csrf-token");
+  if (csrf) headers["X-CSRF-TOKEN"] = decodeURIComponent(csrf);
+  return headers;
+}
+
+// ─── Login ───────────────────────────────────────────────────────
+
+async function falabellaLogin(
+  rut: string,
+  password: string,
+  debugLog: string[],
+  onTwoFactorCode?: () => Promise<string>,
+): Promise<{ success: true; jar: CookieJar } | { success: false; error: string }> {
+  const jar = createCookieJar();
+  const cleanedRut = cleanRut(rut);
+
+  // Step 1: GET homepage to collect initial cookies
+  debugLog.push("1. Fetching bank homepage for cookies...");
+  const homepageRes = await fetch(BANK_URL, {
+    headers: { "User-Agent": UA },
+    redirect: "follow",
+  });
+  jar.setAll(homepageRes.headers);
+  debugLog.push(`   Status: ${homepageRes.status}, cookies: ${jar.cookies.size}`);
+
+  // Also fetch login page if different
+  const loginPageRes = await fetch(LOGIN_PAGE, {
+    headers: { "User-Agent": UA, Cookie: jar.header() },
+    redirect: "follow",
+  });
+  jar.setAll(loginPageRes.headers);
+  debugLog.push(`   Login page status: ${loginPageRes.status}, cookies: ${jar.cookies.size}`);
+
+  // Step 2: Try JSON login endpoints
+  debugLog.push("2. Attempting JSON login...");
+  let loginSuccess = false;
+
+  for (const endpoint of LOGIN_ENDPOINTS) {
+    const url = `${BANK_URL}${endpoint}`;
+    debugLog.push(`   Trying: ${endpoint}`);
+
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          ...commonHeaders(jar),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ rut: cleanedRut, password }),
+        redirect: "manual",
+      });
+      jar.setAll(res.headers);
+
+      if (res.status === 401 || res.status === 403) {
+        const body = await res.text().catch(() => "");
+        if (body.toLowerCase().includes("clave") || body.toLowerCase().includes("invalid") || body.toLowerCase().includes("incorrec")) {
+          return { success: false, error: "Credenciales incorrectas (RUT o clave inválida)." };
+        }
+        debugLog.push(`     → ${res.status} (trying next)`);
+        continue;
+      }
+
+      if (res.status === 404 || res.status === 405) {
+        debugLog.push(`     → ${res.status} (endpoint not found)`);
+        continue;
+      }
+
+      // Check for 2FA requirement
+      if (res.status === 200 || res.status === 302) {
+        const body = await res.text().catch(() => "");
+
+        if (body.includes("segundo factor") || body.includes("clave dinámica") || body.includes("sms") || body.includes("2fa") || body.includes("otp")) {
+          debugLog.push("   2FA required - sending code...");
+
+          if (!onTwoFactorCode) {
+            return { success: false, error: "El banco pide clave dinámica (2FA) pero no se proporcionó handler." };
+          }
+
+          const code = await onTwoFactorCode();
+          const twoFaEndpoints = [
+            `${endpoint}/2fa`,
+            `${endpoint}/verify`,
+            "/api/auth/2fa",
+            "/api/auth/verify-otp",
+          ];
+
+          let twoFaSuccess = false;
+          for (const tfEndpoint of twoFaEndpoints) {
+            try {
+              const tfUrl = `${BANK_URL}${tfEndpoint}`;
+              const tfRes = await fetch(tfUrl, {
+                method: "POST",
+                headers: {
+                  ...commonHeaders(jar),
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({ code, otp: code }),
+                redirect: "manual",
+              });
+              jar.setAll(tfRes.headers);
+
+              if (tfRes.status === 200 || tfRes.status === 302) {
+                twoFaSuccess = true;
+                debugLog.push(`     2FA verified via ${tfEndpoint}`);
+                break;
+              }
+            } catch {
+              continue;
+            }
+          }
+
+          if (!twoFaSuccess) {
+            return { success: false, error: "No se pudo verificar el código 2FA." };
+          }
+        }
+
+        loginSuccess = true;
+        debugLog.push(`     → Login OK via ${endpoint} (status: ${res.status})`);
+        break;
+      }
+    } catch {
+      debugLog.push(`     → Error connecting to ${endpoint}`);
+      continue;
+    }
+  }
+
+  // Step 3: Fallback — form-urlencoded POST
+  if (!loginSuccess) {
+    debugLog.push("3. Trying form-urlencoded fallback...");
+    try {
+      const formBody = new URLSearchParams({
+        rut: cleanedRut,
+        password,
+      });
+
+      // Add CSRF if present
+      const xsrf = jar.get("XSRF-TOKEN");
+      if (xsrf) formBody.set("_csrf", decodeURIComponent(xsrf));
+
+      const res = await fetch(`${BANK_URL}${FORM_LOGIN}`, {
+        method: "POST",
+        headers: {
+          ...commonHeaders(jar),
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: formBody.toString(),
+        redirect: "follow",
+      });
+      jar.setAll(res.headers);
+
+      const responseUrl = res.url;
+      const bodyText = await res.text().catch(() => "");
+
+      // Check for login failure indicators
+      if (bodyText.toLowerCase().includes("error") && bodyText.toLowerCase().includes("clave")) {
+        return { success: false, error: "Credenciales incorrectas (RUT o clave inválida)." };
+      }
+
+      // Check for 2FA
+      if (bodyText.includes("segundo factor") || bodyText.includes("clave dinámica")) {
+        if (!onTwoFactorCode) {
+          return { success: false, error: "El banco pide clave dinámica (2FA) pero no se proporcionó handler." };
+        }
+        return { success: false, error: "El banco pide clave dinámica (2FA). Flujo form-login 2FA no implementado." };
+      }
+
+      // Check for successful redirect to dashboard
+      if (res.status === 200 && !responseUrl.includes("/login")) {
+        loginSuccess = true;
+        debugLog.push(`   Form login OK (redirected to ${responseUrl})`);
+      } else {
+        debugLog.push(`   Form login response: ${res.status}, url: ${responseUrl}`);
+      }
+    } catch (err) {
+      debugLog.push(`   Form login error: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  if (!loginSuccess) {
+    return { success: false, error: "No se pudo autenticar. Ningún endpoint de login respondió exitosamente." };
+  }
+
+  debugLog.push(`4. Login complete. Cookies: ${Array.from(jar.cookies.keys()).join(", ")}`);
+  return { success: true, jar };
+}
+
+// ─── API helpers ─────────────────────────────────────────────────
+
+async function apiGet<T>(jar: CookieJar, path: string, debugLog: string[]): Promise<T> {
+  const url = path.startsWith("http") ? path : `${API_BASE}/${path}`;
+  const res = await fetch(url, {
+    headers: commonHeaders(jar),
+  });
+  jar.setAll(res.headers);
+  if (!res.ok) throw new Error(`API GET ${path} -> ${res.status}`);
+  return res.json() as Promise<T>;
+}
+
+async function apiPost<T>(jar: CookieJar, path: string, body: unknown = {}, debugLog: string[]): Promise<T> {
+  const url = path.startsWith("http") ? path : `${API_BASE}/${path}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      ...commonHeaders(jar),
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  jar.setAll(res.headers);
+  if (!res.ok) throw new Error(`API POST ${path} -> ${res.status}`);
+  return res.json() as Promise<T>;
+}
+
+// Try multiple candidate endpoints, return first successful response
+async function tryEndpoints<T>(jar: CookieJar, endpoints: string[], method: "GET" | "POST", body: unknown | undefined, debugLog: string[]): Promise<{ data: T; endpoint: string } | null> {
+  for (const ep of endpoints) {
+    try {
+      const data = method === "GET"
+        ? await apiGet<T>(jar, ep, debugLog)
+        : await apiPost<T>(jar, ep, body, debugLog);
+      debugLog.push(`   Found data at ${ep}`);
+      return { data, endpoint: ep };
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+// ─── Data extraction ─────────────────────────────────────────────
+
+function toAccountMovement(mov: ApiAccountMovement): BankMovement {
+  const amount = mov.type === "cargo" ? -Math.abs(mov.amount) : Math.abs(mov.amount);
+  return {
+    date: normalizeDate(mov.date),
+    description: mov.description.trim(),
+    amount,
+    balance: mov.balance,
+    source: MOVEMENT_SOURCE.account,
+  };
+}
+
+function toUnbilledMovement(mov: ApiUnbilledMovement): BankMovement {
+  // Credit card purchases are negative (charges)
+  const amount = mov.amount < 0 ? Math.abs(mov.amount) : -Math.abs(mov.amount);
+  return {
+    date: normalizeDate(mov.date),
+    description: mov.description.trim(),
+    amount,
+    balance: 0,
+    source: MOVEMENT_SOURCE.credit_card_unbilled,
+    owner: normalizeOwner(mov.owner),
+    installments: normalizeInstallments(mov.installments),
+  };
+}
+
+function toBilledMovement(mov: ApiBilledMovement): BankMovement {
+  const amount = mov.group === "pagos" ? Math.abs(mov.amount) : -Math.abs(mov.amount);
+  return {
+    date: normalizeDate(mov.date),
+    description: mov.description.trim(),
+    amount,
+    balance: 0,
+    source: MOVEMENT_SOURCE.credit_card_billed,
+    owner: normalizeOwner(mov.owner),
+    installments: normalizeInstallments(mov.installments),
+  };
+}
+
+// ─── Fetch account movements ─────────────────────────────────────
+
+async function fetchAccountMovements(jar: CookieJar, debugLog: string[]): Promise<{ movements: BankMovement[]; balance?: number }> {
+  const movements: BankMovement[] = [];
+  let balance: number | undefined;
+
+  // Try to get account products
+  const productEndpoints = [
+    "products",
+    "accounts",
+    "v1/accounts",
+    "cuentas",
+    "productos",
+    "v1/productos",
   ];
-  for (const target of targets) {
-    const result = await page.evaluate((t: { text: string; exact: boolean }) => {
-      const elements = Array.from(document.querySelectorAll("a, button, [role='tab'], [role='menuitem'], li, span"));
-      for (const el of elements) {
-        const text = (el as HTMLElement).innerText?.trim().toLowerCase() || "";
-        const href = (el as HTMLAnchorElement).href || "";
-        if (href.includes("cc-nuevos") || href.includes("comenzar")) continue;
-        if (text.includes("historial de transferencia")) continue;
-        const match = t.exact ? text === t.text : text.includes(t.text);
-        if (match && text.length < 50) { (el as HTMLElement).click(); return `Clicked: "${text}"`; }
-      }
-      return null;
-    }, target);
-    if (result) { debugLog.push(`  ${result}`); await delay(4000); return true; }
+
+  const productsResult = await tryEndpoints<ApiAccountProduct[] | { accounts: ApiAccountProduct[]; productos: ApiAccountProduct[] }>(
+    jar, productEndpoints, "GET", undefined, debugLog,
+  );
+
+  if (!productsResult) {
+    debugLog.push("   No account products found");
+    return { movements, balance };
   }
-  return false;
-}
 
-// ─── CMR Shadow DOM helpers ──────────────────────────────────────
+  const rawProducts = productsResult.data;
+  const accounts: ApiAccountProduct[] = Array.isArray(rawProducts)
+    ? rawProducts
+    : (rawProducts as { accounts?: ApiAccountProduct[] }).accounts ?? (rawProducts as { productos?: ApiAccountProduct[] }).productos ?? [];
 
-async function waitForCmrMovements(page: Page, timeoutMs = 30000): Promise<void> {
-  try {
-    await page.waitForFunction((host: string) => {
-      const el = document.querySelector(host);
-      if (!el?.shadowRoot) return false;
-      return el.shadowRoot.querySelectorAll("table tbody tr td").length > 0;
-    }, { timeout: timeoutMs }, SHADOW_HOST);
-  } catch { /* timeout */ }
-  await delay(500);
-}
+  debugLog.push(`   Found ${accounts.length} account(s)`);
 
-async function extractCupos(page: Page, debugLog: string[]): Promise<CreditCardBalance | null> {
-  try {
-    const cupoData = await page.evaluate(() => {
-      const text = document.body?.innerText || "";
-      const labelMatch = text.match(/(CMR\s+\w+(?:\s+\w+)?)\s*\n?\s*[•·*\s]+\s*(\d{4})/i);
-      const label = labelMatch ? `${labelMatch[1]} ****${labelMatch[2]}` : "";
-      const cupoMatch = text.match(/\$([\d.,]+)\s*\n?\s*Cupo de compras/i);
-      const usadoMatch = text.match(/\$([\d.,]+)\s*\n?\s*Cupo utilizado/i);
-      const disponibleMatch = text.match(/\$([\d.,]+)\s*\n?\s*Cupo disponible/i);
-      return { label, cupo: cupoMatch?.[1], usado: usadoMatch?.[1], disponible: disponibleMatch?.[1] };
-    });
-    if (!cupoData.cupo && !cupoData.disponible) return null;
-    const total = cupoData.cupo ? parseChileanAmount(cupoData.cupo) : 0;
-    const used = cupoData.usado ? parseChileanAmount(cupoData.usado) : 0;
-    const available = cupoData.disponible ? parseChileanAmount(cupoData.disponible) : 0;
-    debugLog.push(`  CMR cupos: total=$${total}, used=$${used}, available=$${available}`);
-    return { label: cupoData.label || "CMR", national: { total, used, available } };
-  } catch { return null; }
-}
+  if (accounts.length > 0 && accounts[0].balance !== undefined) {
+    balance = accounts[0].balance;
+  }
 
-const TAB_IDS: Record<string, string> = {
-  "últimos movimientos": "last-movements",
-  "movimientos facturados": "invoicedMovements",
-};
+  // Fetch movements for each account
+  const movementEndpoints = [
+    "movements",
+    "accounts/{id}/movements",
+    "v1/accounts/{id}/movements",
+    "cuentas/{id}/movimientos",
+    "movimientos",
+    "cartola",
+  ];
 
-async function clickCmrTab(page: Page, tabText: string, debugLog: string[]): Promise<boolean> {
-  const tabId = TAB_IDS[tabText.toLowerCase()] || "";
-  const clicked = await page.evaluate((text: string, host: string, radioId: string) => {
-    const shadowEl = document.querySelector(host);
-    const roots: Array<Document | ShadowRoot> = [];
-    if (shadowEl?.shadowRoot) roots.push(shadowEl.shadowRoot);
-    roots.push(document);
-    for (const root of roots) {
-      if (radioId) {
-        const radio = root.querySelector(`#${radioId}`) as HTMLInputElement | null;
-        if (radio) { radio.checked = true; radio.dispatchEvent(new Event("change", { bubbles: true })); radio.click(); return true; }
+  for (const account of accounts) {
+    const endpointsForAccount = movementEndpoints.map(ep => ep.replace("{id}", account.id || account.number));
+    debugLog.push(`   Fetching movements for account ${account.number || account.id}`);
+
+    const result = await tryEndpoints<ApiAccountMovement[] | { movements: ApiAccountMovement[]; movimientos: ApiAccountMovement[] }>(
+      jar, endpointsForAccount, "GET", undefined, debugLog,
+    );
+
+    if (result) {
+      const rawMovs = result.data;
+      const movs: ApiAccountMovement[] = Array.isArray(rawMovs)
+        ? rawMovs
+        : (rawMovs as { movements?: ApiAccountMovement[] }).movements ?? (rawMovs as { movimientos?: ApiAccountMovement[] }).movimientos ?? [];
+
+      for (const mov of movs) {
+        movements.push(toAccountMovement(mov));
       }
-      const labels = Array.from(root.querySelectorAll("label"));
-      for (const label of labels) {
-        if (label.innerText?.trim().toLowerCase().includes(text.toLowerCase())) { label.click(); return true; }
+
+      // Update balance from first movement if not set
+      if (balance === undefined && movs.length > 0 && movs[0].balance !== undefined) {
+        balance = movs[0].balance;
       }
     }
-    return false;
-  }, tabText, SHADOW_HOST, tabId);
-  if (clicked) debugLog.push(`  CMR: Clicked tab "${tabText}"`);
-  return clicked;
+  }
+
+  return { movements, balance };
 }
 
-async function extractCmrMovementsFromTable(page: Page): Promise<BankMovement[]> {
-  return await page.evaluate((host: string) => {
-    const movements: BankMovement[] = [];
-    const shadowEl = document.querySelector(host);
-    const root = shadowEl?.shadowRoot || document;
-    for (const table of root.querySelectorAll("table")) {
-      for (const row of Array.from(table.querySelectorAll("tbody tr"))) {
-        const cells = row.querySelectorAll("td");
-        if (cells.length < 4) continue;
-        const texts = Array.from(cells).map(c => (c as HTMLElement).innerText?.trim() || "");
-        const dateMatch = texts[0]?.match(/(\d{1,2}\/\d{1,2}\/\d{2,4})/);
-        const pendingImg = row.querySelector("td:first-child img[alt*='pendiente'], td:first-child .td-time-img");
-        if (!dateMatch && !pendingImg && texts[0] !== "") continue;
-        const date = dateMatch ? dateMatch[1].replace(/\//g, "-") : "pendiente";
-        const description = texts[1] || "";
-        const montoText = texts[3] || "";
-        const isNeg = montoText.includes("-$");
-        const amountMatch = montoText.match(/\$\s*([\d.,]+)/);
-        let amount = 0;
-        if (amountMatch) {
-          const value = parseInt(amountMatch[1].replace(/\./g, "").replace(",", "."), 10) || 0;
-          amount = isNeg ? value : -value;
-        }
-        if (description && amount !== 0)
-          movements.push({ date, description, amount, balance: 0, source: "credit_card_unbilled", owner: (texts[2] || undefined) as CardOwner | undefined, installments: texts[4] || undefined });
+// ─── Fetch credit card data ──────────────────────────────────────
+
+async function fetchCreditCardData(
+  jar: CookieJar,
+  owner: "T" | "A" | "B",
+  debugLog: string[],
+): Promise<{ movements: BankMovement[]; creditCards: CreditCardBalance[] }> {
+  const movements: BankMovement[] = [];
+  const creditCards: CreditCardBalance[] = [];
+
+  // Try to get credit cards
+  const cardEndpoints = [
+    "credit-cards",
+    "tarjetas",
+    "v1/credit-cards",
+    "tarjetas-credito",
+    "cmr/cards",
+    "cards",
+  ];
+
+  const cardsResult = await tryEndpoints<ApiCreditCard[] | { cards: ApiCreditCard[]; tarjetas: ApiCreditCard[] }>(
+    jar, cardEndpoints, "GET", undefined, debugLog,
+  );
+
+  if (!cardsResult) {
+    debugLog.push("   No credit cards found");
+    return { movements, creditCards };
+  }
+
+  const rawCards = cardsResult.data;
+  const cards: ApiCreditCard[] = Array.isArray(rawCards)
+    ? rawCards
+    : (rawCards as { cards?: ApiCreditCard[] }).cards ?? (rawCards as { tarjetas?: ApiCreditCard[] }).tarjetas ?? [];
+
+  debugLog.push(`   Found ${cards.length} credit card(s)`);
+
+  for (const card of cards) {
+    const cardLabel = `${card.brand || "CMR"} ${card.type || ""} ****${(card.number || "").slice(-4)}`.trim();
+    const cardBody: Record<string, string> = { cardId: card.id, cardNumber: card.number };
+
+    // Owner filter
+    if (owner !== "B") {
+      cardBody.ownership = owner;
+      cardBody.owner = owner;
+    }
+
+    // Fetch card balance (cupos)
+    const balanceEndpoints = [
+      "credit-cards/balance",
+      "tarjetas/saldo",
+      `credit-cards/${card.id}/balance`,
+      `tarjetas/${card.id}/saldo`,
+      "cmr/balance",
+      "cupos",
+    ];
+
+    const balanceResult = await tryEndpoints<ApiCardBalance | Record<string, number>>(
+      jar, balanceEndpoints, "POST", cardBody, debugLog,
+    );
+
+    if (balanceResult) {
+      const b = balanceResult.data as ApiCardBalance;
+      const ccEntry: CreditCardBalance = {
+        label: cardLabel,
+        national: {
+          total: b.totalNational ?? 0,
+          used: b.usedNational ?? 0,
+          available: b.availableNational ?? 0,
+        },
+      };
+      if (b.totalInternational !== undefined) {
+        ccEntry.international = {
+          total: b.totalInternational,
+          used: b.usedInternational ?? 0,
+          available: b.availableInternational ?? 0,
+          currency: "USD",
+        };
+      }
+      creditCards.push(ccEntry);
+    } else {
+      creditCards.push({ label: cardLabel });
+    }
+
+    // Fetch unbilled movements (movimientos no facturados / ultimos movimientos)
+    const unbilledEndpoints = [
+      "credit-cards/unbilled",
+      "tarjetas/no-facturados",
+      `credit-cards/${card.id}/unbilled`,
+      `tarjetas/${card.id}/movimientos-no-facturados`,
+      "cmr/unbilled-movements",
+      "movimientos-no-facturados",
+    ];
+
+    const unbilledResult = await tryEndpoints<ApiUnbilledMovement[] | { movements: ApiUnbilledMovement[] }>(
+      jar, unbilledEndpoints, "POST", cardBody, debugLog,
+    );
+
+    if (unbilledResult) {
+      const rawUnbilled = unbilledResult.data;
+      const unbilledMovs: ApiUnbilledMovement[] = Array.isArray(rawUnbilled)
+        ? rawUnbilled
+        : (rawUnbilled as { movements: ApiUnbilledMovement[] }).movements ?? [];
+
+      for (const mov of unbilledMovs) {
+        movements.push(toUnbilledMovement(mov));
       }
     }
-    return movements;
-  }, SHADOW_HOST);
-}
 
-async function paginateCmrMovements(page: Page, debugLog: string[]): Promise<BankMovement[]> {
-  const all: BankMovement[] = [];
-  for (let i = 0; i < 20; i++) {
-    all.push(...await extractCmrMovementsFromTable(page));
-    const hasNext = await page.evaluate((host: string) => {
-      const root = (document.querySelector(host) as Element & { shadowRoot?: ShadowRoot })?.shadowRoot || document;
-      for (const btn of Array.from(root.querySelectorAll(".btn-pagination"))) {
-        const el = btn as HTMLButtonElement;
-        const img = el.querySelector("img");
-        if (!img) continue;
-        const alt = (img.getAttribute("alt") || "").toLowerCase();
-        const src = img.getAttribute("src") || "";
-        if ((alt.includes("avanzar") || alt.includes("siguiente") || alt.includes("next") || src.includes("right-arrow")) && !el.disabled) { el.click(); return true; }
+    // Fetch billed movements (movimientos facturados)
+    const billedEndpoints = [
+      "credit-cards/billed",
+      "tarjetas/facturados",
+      `credit-cards/${card.id}/billed`,
+      `tarjetas/${card.id}/movimientos-facturados`,
+      "cmr/billed-movements",
+      "movimientos-facturados",
+    ];
+
+    const billedResult = await tryEndpoints<ApiBilledMovement[] | { movements: ApiBilledMovement[] }>(
+      jar, billedEndpoints, "POST", cardBody, debugLog,
+    );
+
+    if (billedResult) {
+      const rawBilled = billedResult.data;
+      const billedMovs: ApiBilledMovement[] = Array.isArray(rawBilled)
+        ? rawBilled
+        : (rawBilled as { movements: ApiBilledMovement[] }).movements ?? [];
+
+      for (const mov of billedMovs) {
+        if (mov.group === "totales") continue;
+        movements.push(toBilledMovement(mov));
       }
-      return false;
-    }, SHADOW_HOST);
-    if (!hasNext) break;
-    await waitForCmrMovements(page);
+    }
   }
-  return deduplicateMovements(all.map(m => ({ ...m, date: normalizeDate(m.date), owner: normalizeOwner(m.owner), installments: normalizeInstallments(m.installments) })));
+
+  return { movements, creditCards };
 }
 
 // ─── Main scrape function ────────────────────────────────────────
 
-async function scrapeFalabella(session: BrowserSession, options: ScraperOptions): Promise<ScrapeResult> {
-  const { rut, password, saveScreenshots: doScreenshots, owner = "B" } = options;
-  const { onProgress } = options;
-  const progress = onProgress || (() => {});
-  const { page, debugLog, screenshot: doSave } = session;
+async function scrapeFalabella(options: ScraperOptions, debugLog: string[]): Promise<ScrapeResult> {
+  const { rut, password, owner = "B", onProgress, onTwoFactorCode } = options;
   const bank = "falabella";
+  const progress = onProgress || (() => {});
 
-  // 1. Navigate
-  debugLog.push("1. Navigating to bank homepage...");
-  progress("Abriendo sitio del banco...");
-  await page.goto(BANK_URL, { waitUntil: "networkidle2", timeout: 30000 });
-  await delay(2000);
-  await dismissBanners(page);
-  await doSave(page, "01-homepage");
-
-  // 2. Click "Mi cuenta"
-  debugLog.push("2. Clicking 'Mi cuenta'...");
-  progress("Ingresando a Mi cuenta...");
-  if (!(await clickByText(page, ["Mi cuenta"], "a, button"))) {
-    const ss = await page.screenshot({ encoding: "base64" });
-    return { success: false, bank, movements: [], error: "No se encontró 'Mi cuenta'", screenshot: ss as string, debug: debugLog.join("\n") };
-  }
-  await delay(4000);
-  await doSave(page, "02-login-form");
-
-  // 3-5. Login
-  debugLog.push("3. Filling RUT...");
-  progress("Ingresando RUT...");
-  if (!(await fillRut(page, rut))) {
-    const ss = await page.screenshot({ encoding: "base64" });
-    return { success: false, bank, movements: [], error: "No se encontró campo de RUT", screenshot: ss as string, debug: debugLog.join("\n") };
-  }
-  await delay(1500);
-
-  debugLog.push("4. Filling password...");
-  progress("Ingresando clave...");
-  let passOk = await fillPassword(page, password);
-  if (!passOk) { await page.keyboard.press("Enter"); await delay(3000); passOk = await fillPassword(page, password); }
-  if (!passOk) {
-    const ss = await page.screenshot({ encoding: "base64" });
-    return { success: false, bank, movements: [], error: "No se encontró campo de clave", screenshot: ss as string, debug: debugLog.join("\n") };
-  }
-  await delay(1000);
-
-  debugLog.push("5. Submitting login...");
-  progress("Iniciando sesión...");
-  await clickSubmit(page, page);
-  await delay(8000);
-  await doSave(page, "03-after-login");
-
-  // 2FA check
-  const pageContent = (await page.content()).toLowerCase();
-  if (pageContent.includes("clave dinámica") || pageContent.includes("segundo factor")) {
-    const ss = await page.screenshot({ encoding: "base64" });
-    return { success: false, bank, movements: [], error: "El banco pide clave dinámica (2FA).", screenshot: ss as string, debug: debugLog.join("\n") };
+  // Login
+  progress("Conectando con Banco Falabella API...");
+  const loginResult = await falabellaLogin(rut, password, debugLog, onTwoFactorCode);
+  if (!loginResult.success) {
+    return { success: false, bank, movements: [], error: loginResult.error, debug: debugLog.join("\n") };
   }
 
-  // Login error check
-  const errorCheck = await page.evaluate(() => {
-    const els = document.querySelectorAll('[class*="error"], [class*="alert"], [role="alert"]');
-    for (const el of els) { const t = (el as HTMLElement).innerText?.trim(); if (t && t.length > 5 && t.length < 200) return t; }
-    return null;
-  });
-  if (errorCheck) {
-    const ss = await page.screenshot({ encoding: "base64" });
-    return { success: false, bank, movements: [], error: `Error del banco: ${errorCheck}`, screenshot: ss as string, debug: debugLog.join("\n") };
-  }
+  const { jar } = loginResult;
+  progress("Sesion iniciada correctamente");
 
-  debugLog.push("6. Login OK!");
-  progress("Sesión iniciada correctamente");
-  await closePopups(page);
-  const dashboardUrl = page.url();
+  // Fetch account movements
+  debugLog.push("5. Fetching account movements via API...");
+  progress("Obteniendo movimientos de cuenta...");
+  const acctResult = await fetchAccountMovements(jar, debugLog);
+  const balance = acctResult.balance;
+  debugLog.push(`   Account movements: ${acctResult.movements.length}`);
 
-  // ── Phase 1: Account movements ──
-  debugLog.push("7. [Cuenta] Looking for Cartola/Movimientos...");
-  progress("Buscando cartola de cuenta...");
-  let navigated = await clickNavTarget(page, debugLog);
-  if (!navigated) {
-    const clickedAccount = await page.evaluate(() => {
-      for (const el of Array.from(document.querySelectorAll("a, div, button, tr, li"))) {
-        const text = (el as HTMLElement).innerText?.trim() || "";
-        const href = (el as HTMLAnchorElement).href || "";
-        if (href.includes("cc-nuevos") || href.includes("comenzar")) continue;
-        if ((text.toLowerCase().includes("cuenta corriente") || text.toLowerCase().includes("cuenta vista")) && text.length < 100) {
-          (el as HTMLElement).click();
-          return true;
-        }
-      }
-      return false;
-    });
-    if (clickedAccount) { await delay(4000); navigated = await clickNavTarget(page, debugLog); }
-  }
+  // Fetch credit card data (CMR)
+  debugLog.push("6. Fetching CMR credit card data via API...");
+  progress("Obteniendo datos de tarjeta CMR...");
+  const ccResult = await fetchCreditCardData(jar, owner, debugLog);
+  debugLog.push(`   CC movements: ${ccResult.movements.length}`);
 
-  await tryExpandDateRange(page, debugLog);
-  progress("Extrayendo movimientos de cuenta...");
-  const accountMovements = await paginateAndExtract(page, extractAccountMovements, debugLog);
-  debugLog.push(`8. [Cuenta] ${accountMovements.length} movements`);
-  progress(`Cuenta: ${accountMovements.length} movimientos encontrados`);
-
-  let balance: number | undefined;
-  if (accountMovements.length > 0 && accountMovements[0].balance > 0) balance = accountMovements[0].balance;
-  if (balance === undefined) {
-    balance = await page.evaluate(() => {
-      const match = (document.body?.innerText || "").match(/Saldo disponible[\s\S]{0,50}\$\s*([\d.]+)/i);
-      if (match) return parseInt(match[1].replace(/[^0-9]/g, ""), 10);
-      return undefined;
-    });
-  }
-
-  // ── Phase 2: CMR credit card movements ──
-  debugLog.push("9. [CMR] Navigating back to dashboard...");
-  progress("Navegando a tarjeta de crédito...");
-  await page.goto(dashboardUrl, { waitUntil: "networkidle2", timeout: 30000 });
-  await delay(2000);
-  await closePopups(page);
-
-  const cmrBalance = await extractCupos(page, debugLog);
-  const creditCards: CreditCardBalance[] = cmrBalance ? [cmrBalance] : [];
-
-  debugLog.push("11. [CMR] Looking for CMR card...");
-  const cardClicked = await page.evaluate(() => {
-    for (const sel of ["#cardDetail0", "[id^='cardDetail']", "app-credit-cards .card", "[class*='credit-card'] .card", "[class*='creditCard']"]) {
-      const el = document.querySelector(sel);
-      if (el) { (el as HTMLElement).click(); return true; }
-    }
-    for (const el of Array.from(document.querySelectorAll("a, button, div, li, [role='button']"))) {
-      if ((el as HTMLElement).innerText?.trim().toLowerCase().includes("cmr") && (el as HTMLElement).innerText!.length < 100) { (el as HTMLElement).click(); return true; }
-    }
-    return false;
-  });
-  if (cardClicked) await waitForCmrMovements(page);
-
-  // Owner filter
-  if (owner !== "B") {
-    await page.evaluate((host: string, value: string) => {
-      const root = (document.querySelector(host) as Element & { shadowRoot?: ShadowRoot })?.shadowRoot || document;
-      const select = root.querySelector("select[name='searchownership']") as HTMLSelectElement | null;
-      if (select) { select.value = value; select.dispatchEvent(new Event("change", { bubbles: true })); }
-    }, SHADOW_HOST, owner);
-    await waitForCmrMovements(page);
-  }
-
-  debugLog.push("12. [CMR] Extracting TC por facturar...");
-  progress("Extrayendo movimientos TC por facturar...");
-  const recentMovements = await paginateCmrMovements(page, debugLog);
-  const taggedRecent = recentMovements.map(m => ({ ...m, source: MOVEMENT_SOURCE.credit_card_unbilled }));
-
-  debugLog.push("13. [CMR] Extracting TC facturados...");
-  progress("Extrayendo movimientos TC facturados...");
-  let taggedFacturados: BankMovement[] = [];
-  if (await clickCmrTab(page, "movimientos facturados", debugLog)) {
-    try { await page.waitForFunction((host: string) => {
-      const el = document.querySelector(host);
-      return el?.shadowRoot?.querySelector("app-invoiced-movements table tbody tr td") !== null;
-    }, { timeout: 30000 }, SHADOW_HOST); } catch { /* timeout */ }
-    await delay(1000);
-    taggedFacturados = (await paginateCmrMovements(page, debugLog)).map(m => ({ ...m, source: MOVEMENT_SOURCE.credit_card_billed }));
-  }
-
-  const tcMovements = deduplicateMovements([...taggedRecent, ...taggedFacturados]);
-  const allMovements = deduplicateMovements([...accountMovements, ...tcMovements]);
-  debugLog.push(`14. Total: ${allMovements.length} (account: ${accountMovements.length}, TC: ${tcMovements.length})`);
+  // Combine and deduplicate
+  const allMovements = deduplicateMovements([...acctResult.movements, ...ccResult.movements]);
+  debugLog.push(`7. Total: ${allMovements.length} unique movements`);
   progress(`Listo — ${allMovements.length} movimientos totales`);
 
-  await doSave(page, "08-final");
-  const ss = doScreenshots ? (await page.screenshot({ encoding: "base64", fullPage: true })) as string : undefined;
-
-  return { success: true, bank, movements: allMovements, balance: balance || undefined, creditCards: creditCards.length > 0 ? creditCards : undefined, screenshot: ss, debug: debugLog.join("\n") };
+  return {
+    success: true,
+    bank,
+    movements: allMovements,
+    balance,
+    creditCards: ccResult.creditCards.length > 0 ? ccResult.creditCards : undefined,
+    debug: debugLog.join("\n"),
+  };
 }
 
 // ─── Export ──────────────────────────────────────────────────────
@@ -369,7 +662,8 @@ const falabella: BankScraper = {
   id: "falabella",
   name: "Banco Falabella",
   url: BANK_URL,
-  scrape: (options) => runScraper("falabella", options, { extraArgs: ["--disable-notifications"] }, scrapeFalabella),
+  mode: "api",
+  scrape: (options) => runApiScraper("falabella", options, scrapeFalabella),
 };
 
 export default falabella;
