@@ -21,7 +21,6 @@ Banks:
 - Banco Edwards (`edwards`) — delegates to bchile (same portal: `portalpersonas.bancochile.cl`)
 - BCI (`bci`) — JSF form login with ViewState CSRF + HTML table parsing. Data endpoints need live testing.
 - BancoEstado (`bestado`) — cookie jar auth. Akamai TLS fingerprint may block Node.js fetch; returns helpful error if blocked.
-- BICE (`bice`) — Keycloak OIDC token exchange at `auth.bice.cl` + cookie jar. Data endpoints need live testing.
 - Citibank (`citi`) — cookie jar login (ioBlackBox sent empty). REST at `/US/REST/accountsPanel/getCustomerAccounts.jws` + CSV download.
 - Banco Falabella (`falabella`) — cookie jar auth + REST API for account and CMR credit card data. Endpoints need live testing.
 - Santander (`santander`) — cookie jar auth via login iframe endpoint + REST API. Multi-account + CC support.
@@ -38,6 +37,7 @@ WealthTech:
 **Browser mode** (requires Puppeteer):
 
 Banks:
+- BICE (`bice`) — Hybrid browser+API. Keycloak login at `auth.bice.cl` via Puppeteer (Cloudflare WAF blocks Node.js fetch). After login, BFF data fetched via `page.evaluate(fetch(...))` on `gw.bice.cl`.
 - Itaú (`itau`) — IBM WebSphere Portal (server-rendered HTML, no JSON APIs). Imperva blocks Node.js fetch(); requires real browser. 2FA via Itaú Key push notification.
 
 PayTech:
@@ -191,11 +191,17 @@ Use this section when debugging or extending any API-mode scraper. These details
 - **Next step**: Decompile APK to discover real endpoints and auth flow
 - **Credential mapping**: `rut` field = phone number or email, `password` field = PIN or password
 
-#### BICE (browser mode — migration candidate)
-- **Auth**: Keycloak OIDC at `auth.bice.cl/auth/realms/personas/protocol/openid-connect/auth`
-- **Direct portal**: `https://portalpersonas.bice.cl` triggers Keycloak redirect (skips homepage 403)
-- **Keycloak form**: `#username` + `#password` + `#kc-login` (standard Keycloak IDs)
-- **Migration path**: Keycloak token exchange via `POST /auth/realms/personas/protocol/openid-connect/token` could replace browser login
+#### BICE (hybrid browser+API)
+- **Auth**: Keycloak OIDC at `auth.bice.cl/auth/realms/personas/protocol/openid-connect/auth` — browser login required (Cloudflare WAF blocks Node.js fetch to `portalpersonas.bice.cl`)
+- **Portal URL**: `https://portalpersonas.bice.cl` triggers Keycloak redirect
+- **Keycloak form**: `#username` (formatted RUT with dots) + `#password` + `#kc-login` (standard Keycloak IDs)
+- **Post-login**: Angular SPA calls `oauth-agent-personas/login/start` + `login/end` on `gw.bice.cl` — sets session cookies automatically
+- **Data endpoints** (called via `page.evaluate(fetch(...))` with browser cookies):
+  - `POST https://gw.bice.cl/portalpersonas/bff-portal-hbp/v1/products` — account list
+  - `POST https://gw.bice.cl/portalpersonas/bff-checking-account-transactions-100/v1/balance` — balance
+  - `POST https://gw.bice.cl/portalpersonas/bff-checking-account-transactions-100/v1/transactions` — movements (paginated)
+- **2FA**: Keycloak may prompt for OTP — detected via page content keywords, code entered into `#otp` or equivalent input
+- **Migration path**: If Keycloak token exchange via `POST /auth/realms/personas/protocol/openid-connect/token` can bypass WAF, full API mode could be restored
 
 #### Citibank (browser mode — partially API)
 - **Has REST endpoints**: `POST /US/REST/accountsPanel/getCustomerAccounts.jws`, CSV download at `/US/NCSC/dcd/StatementDownload.do`
@@ -226,10 +232,11 @@ src/
     balance.ts             — Balance extraction (regex + CSS selector fallbacks)
     two-factor.ts          — 2FA detection and wait (configurable keywords/timeout)
   banks/
-    13 API-mode scrapers (fetch-only): bchile.ts, edwards.ts, fintual.ts,
-    mach.ts, racional.ts, tenpo.ts, bci.ts, bestado.ts, bice.ts,
+    12 API-mode scrapers (fetch-only): bchile.ts, edwards.ts, fintual.ts,
+    mach.ts, racional.ts, tenpo.ts, bci.ts, bestado.ts,
     citi.ts, falabella.ts, santander.ts, scotiabank.ts
-    2 browser-mode scrapers: itau.ts (IBM WebSphere, no JSON APIs),
+    3 browser-mode scrapers: bice.ts (hybrid: Keycloak browser login + API data via page.evaluate),
+    itau.ts (IBM WebSphere, no JSON APIs),
     mercadopago.ts (MercadoLibre login requires browser)
 
 web/                       — Next.js 15 multi-user dashboard (App Router), deployed on Vercel
