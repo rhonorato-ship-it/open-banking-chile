@@ -23,6 +23,8 @@ import type { Page, Response } from "playwright-core";
 // capture the data the app already fetched.
 
 const PORTAL_URL = "https://portalpersonas.bice.cl";
+// Go directly to Keycloak — bypasses Cloudflare challenge on the portal
+const KEYCLOAK_AUTH_URL = "https://auth.bice.cl/realms/personas/protocol/openid-connect/auth?client_id=portal-personas&redirect_uri=https%3A%2F%2Fportalpersonas.bice.cl%2F&response_type=code&scope=openid+profile";
 const MOVEMENTS_URL = "https://portalpersonas.bice.cl/movimientos-cc";
 const GW_PREFIX = "gw.bice.cl";
 
@@ -80,46 +82,11 @@ async function biceLogin(
   const progress = onProgress || (() => {});
 
   // Step 1: Navigate to portal — triggers Keycloak redirect
-  debugLog.push("1. Navigating to portal (triggers Keycloak redirect)...");
+  // Navigate directly to Keycloak auth URL — bypasses Cloudflare on the portal
+  debugLog.push("1. Navigating directly to Keycloak (bypasses Cloudflare)...");
   progress("Abriendo portal BICE...");
-  await page.goto(PORTAL_URL, { waitUntil: "domcontentloaded", timeout: 45_000 });
-
-  // Poll for Keycloak redirect — the Angular SPA redirects client-side
-  let onKeycloak = false;
-  for (let i = 0; i < 15; i++) {
-    await delay(2000);
-    const url = page.url();
-    if (url.includes("auth.bice.cl")) {
-      onKeycloak = true;
-      debugLog.push(`  Redirected to Keycloak after ${(i + 1) * 2}s`);
-      break;
-    }
-    // Check if login form appeared (might already be on Keycloak)
-    const hasLogin = await page.$("#username");
-    if (hasLogin) {
-      onKeycloak = true;
-      debugLog.push(`  Login form found after ${(i + 1) * 2}s`);
-      break;
-    }
-  }
-
-  await doSave(page, "bice-01-after-navigate");
-  const currentUrl = page.url();
-  debugLog.push(`  Landed on: ${currentUrl}`);
-
-  if (!onKeycloak) {
-      const pageText = await page.innerText("body").catch(() => "");
-      if (pageText.toLowerCase().includes("403") || pageText.toLowerCase().includes("forbidden")) {
-        return {
-          success: false,
-          error: "Portal BICE bloqueo el acceso (403 Forbidden). Usa --headful --profile.",
-        };
-      }
-      return {
-        success: false,
-        error: `No se redirigió a Keycloak (auth.bice.cl). URL actual: ${currentUrl}`,
-      };
-  }
+  await page.goto(KEYCLOAK_AUTH_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
+  await delay(1000);
 
   await doSave(page, "bice-02-keycloak-page");
   debugLog.push("2. On Keycloak login page");
