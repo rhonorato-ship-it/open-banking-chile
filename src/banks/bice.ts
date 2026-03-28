@@ -3,31 +3,73 @@ import { MOVEMENT_SOURCE } from "../types.js";
 import { formatRut, normalizeDate, deduplicateMovements, delay } from "../utils.js";
 import { runScraper } from "../infrastructure/scraper-runner.js";
 import type { BrowserSession } from "../infrastructure/browser.js";
+import type { Page, Response } from "playwright-core";
 
 // ─── BICE constants ─────────────────────────────────────────────
 //
 // Auth: Keycloak OIDC at auth.bice.cl/realms/personas
 // Gateway: gw.bice.cl (OAuth agent proxy + BFF endpoints)
 //
-// Architecture: Hybrid browser + API
-//   1. Browser login (Puppeteer) — navigate to portal, fill Keycloak form
-//   2. After login, browser has session cookies for gw.bice.cl
-//   3. Use page.evaluate(fetch(...)) to call BFF endpoints — cookies included automatically
+// Architecture: Hybrid browser + response interception
+//   1. Browser login (Playwright) — navigate to portal, fill Keycloak form
+//   2. Register response interception BEFORE navigation to capture API calls
+//   3. Navigate to movements page — Angular SPA calls BFF endpoints
+//   4. Read intercepted responses (balance, transactions, products)
 //
-// The portal at portalpersonas.bice.cl returns 403 to Node.js fetch()
-// (Cloudflare WAF). Keycloak login cannot complete without a browser.
-// However, once logged in, the gw.bice.cl BFF endpoints work via
-// page.evaluate(fetch(...)) with the browser's cookies.
+// Why response interception instead of page.evaluate(fetch(...))?
+// The gw.bice.cl endpoints return 401 when called via page.evaluate(fetch(...))
+// because cross-origin cookies aren't sent. But the Angular SPA itself calls
+// these endpoints successfully. By intercepting the SPA's own responses, we
+// capture the data the app already fetched.
 
 const PORTAL_URL = "https://portalpersonas.bice.cl";
-const GW_BASE = "https://gw.bice.cl";
-const BFF_PRODUCTS = `${GW_BASE}/portalpersonas/bff-portal-hbp/v1/products`;
-const BFF_BALANCE = `${GW_BASE}/portalpersonas/bff-checking-account-transactions-100/v1/balance`;
-const BFF_TRANSACTIONS = `${GW_BASE}/portalpersonas/bff-checking-account-transactions-100/v1/transactions`;
+const MOVEMENTS_URL = "https://portalpersonas.bice.cl/movimientos-cc";
+const GW_PREFIX = "gw.bice.cl";
 
 const TWO_FACTOR_KEYWORDS = ["otp", "two-factor", "segundo factor", "verificaci", "authenticator", "kc-form-otp"];
 
+// ─── Response interception ──────────────────────────────────────
+
+/** Key extracted from a gw.bice.cl URL by stripping the base path and query string. */
+function responseKey(url: string): string {
+  const withoutQuery = url.split("?")[0];
+  const idx = withoutQuery.indexOf("/portalpersonas/");
+  if (idx >= 0) return withoutQuery.slice(idx + "/portalpersonas/".length);
+  return withoutQuery;
+}
+
+function setupResponseInterception(page: Page, apiResponses: Map<string, unknown>, debugLog: string[]): void {
+  page.on("response", async (res: Response) => {
+    const url = res.url();
+    if (!url.includes(GW_PREFIX) || res.status() !== 200) return;
+    try {
+      const contentType = res.headers()["content-type"] || "";
+      if (!contentType.includes("application/json")) return;
+      const body = await res.json();
+      const key = responseKey(url);
+      apiResponses.set(key, body);
+      debugLog.push(`  [intercept] ${key} (${res.status()})`);
+    } catch {
+      // Response body may not be available (e.g. redirect or stream error)
+    }
+  });
+}
+
 // ─── Login via browser (Keycloak) ────────────────────────────────
+
+/**
+ * Polls for a selector to appear, tolerating Cloudflare challenge pages
+ * that may load before the actual Keycloak form.
+ */
+async function waitForSelectorPolling(page: Page, selector: string, timeoutMs: number): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const found = await page.$(selector);
+    if (found) return true;
+    await delay(2000);
+  }
+  return false;
+}
 
 async function biceLogin(
   session: BrowserSession,
@@ -60,8 +102,7 @@ async function biceLogin(
     debugLog.push(`  Current URL: ${currentUrl}`);
 
     if (!currentUrl.includes("auth.bice.cl")) {
-      // Check if there's a login button we need to click
-      const pageText = await page.evaluate(() => document.body?.innerText || "");
+      const pageText = await page.innerText("body").catch(() => "");
       if (pageText.toLowerCase().includes("403") || pageText.toLowerCase().includes("forbidden")) {
         return {
           success: false,
@@ -78,64 +119,14 @@ async function biceLogin(
   await doSave(page, "bice-02-keycloak-page");
   debugLog.push("2. On Keycloak login page");
 
-  // Step 2a: Handle Cloudflare Turnstile challenge if present
-  const hasTurnstile = await page.evaluate(() => {
-    const text = document.body?.innerText || "";
-    return text.includes("Verifica que eres") || text.includes("Verify you are") || text.includes("Estamos verificando") || !!document.querySelector("iframe[src*='challenges.cloudflare.com']");
-  });
+  // Step 2: Wait for the #username field with polling (handles Cloudflare challenge)
+  // Cloudflare may show a challenge page before the Keycloak form loads.
+  // Polling avoids a hard timeout on waitForSelector when the challenge is active.
+  debugLog.push("  Waiting for #username field (polling, handles Cloudflare)...");
+  const usernameFound = await waitForSelectorPolling(page, "#username", 30_000);
 
-  if (hasTurnstile) {
-    debugLog.push("  Cloudflare Turnstile detected — attempting to solve...");
-    progress("Verificando identidad (Cloudflare)...");
-
-    for (let attempt = 0; attempt < 5; attempt++) {
-      try {
-        const frames = page.frames();
-        for (const frame of frames) {
-          if (frame.url().includes("challenges.cloudflare.com") || frame.url().includes("turnstile")) {
-            const checkbox = await frame.$("input[type='checkbox']").catch(() => null)
-              || await frame.$(".cb-i").catch(() => null)
-              || await frame.$("#challenge-stage").catch(() => null);
-            if (checkbox) {
-              await checkbox.click();
-              debugLog.push(`  Clicked Turnstile checkbox (attempt ${attempt + 1})`);
-            } else {
-              await frame.click("body").catch(() => {});
-              debugLog.push(`  Clicked Turnstile iframe body (attempt ${attempt + 1})`);
-            }
-            break;
-          }
-        }
-      } catch { debugLog.push(`  Turnstile attempt ${attempt + 1} failed`); }
-
-      await delay(3000);
-
-      const stillBlocked = await page.evaluate(() => {
-        const text = document.body?.innerText || "";
-        return text.includes("Verifica que eres") || text.includes("Verify you are") || text.includes("Estamos verificando");
-      });
-
-      if (!stillBlocked) {
-        debugLog.push("  Turnstile passed!");
-        await delay(2000);
-        break;
-      }
-    }
-  }
-
-  // Step 2b: Fill Keycloak login form
-  debugLog.push("3. Entering credentials...");
-  progress("Ingresando credenciales...");
-
-  // Wait for the username field (extra time after potential Turnstile)
-  try {
-    await page.waitForSelector("#username", { timeout: 20_000 });
-  } catch {
-    // Fallback: try looking for input by name or type
-    const hasInput = await page.evaluate(() => {
-      const inputs = document.querySelectorAll("input[type='text'], input[name='username']");
-      return inputs.length > 0;
-    });
+  if (!usernameFound) {
+    const hasInput = await page.$$("input[type='text'], input[name='username']").then(els => els.length > 0);
     if (!hasInput) {
       await doSave(page, "bice-03-no-username-field");
       return {
@@ -144,6 +135,10 @@ async function biceLogin(
       };
     }
   }
+
+  // Step 3: Fill Keycloak login form
+  debugLog.push("3. Entering credentials...");
+  progress("Ingresando credenciales...");
 
   // BICE Keycloak expects formatted RUT with dots (e.g. "17.599.449-1")
   const formattedRut = formatRut(rut);
@@ -166,39 +161,37 @@ async function biceLogin(
   await delay(300);
   await doSave(page, "bice-05-credentials-filled");
 
-  // Step 3: Click the login button
+  // Step 4: Click the login button
   debugLog.push("4. Clicking login button...");
   progress("Autenticando...");
 
-  const loginClicked = await page.evaluate(() => {
-    // Primary: #kc-login (standard Keycloak submit)
-    const kcLogin = document.querySelector("#kc-login") as HTMLElement | null;
-    if (kcLogin) {
-      kcLogin.click();
-      return "kc-login";
-    }
-    // Fallback: button "Ingresar" or submit button
-    const buttons = Array.from(document.querySelectorAll("button, input[type='submit']"));
-    for (const btn of buttons) {
-      const text = (btn as HTMLElement).innerText?.trim().toLowerCase() || "";
-      const value = (btn as HTMLInputElement).value?.toLowerCase() || "";
-      if (text.includes("ingresar") || value.includes("ingresar") || text.includes("login") || value.includes("login")) {
-        (btn as HTMLElement).click();
-        return "fallback-btn";
+  // Try clicking #kc-login first (standard Keycloak submit button)
+  const kcLoginBtn = await page.$("#kc-login");
+  if (kcLoginBtn) {
+    await kcLoginBtn.click();
+    debugLog.push("  Clicked: kc-login");
+  } else {
+    // Fallback: look for "Ingresar" / "Login" button
+    const allButtons = await page.$$("button, input[type='submit']");
+    let clicked = false;
+    for (const btn of allButtons) {
+      const text = await btn.innerText().catch(() => "");
+      const value = await btn.getAttribute("value") || "";
+      const lower = (text + " " + value).toLowerCase();
+      if (lower.includes("ingresar") || lower.includes("login")) {
+        await btn.click();
+        debugLog.push("  Clicked: fallback-btn");
+        clicked = true;
+        break;
       }
     }
-    return null;
-  });
-
-  if (!loginClicked) {
-    // Last resort: press Enter
-    await page.keyboard.press("Enter");
-    debugLog.push("  Pressed Enter (no login button found)");
-  } else {
-    debugLog.push(`  Clicked: ${loginClicked}`);
+    if (!clicked) {
+      await page.keyboard.press("Enter");
+      debugLog.push("  Pressed Enter (no login button found)");
+    }
   }
 
-  // Step 4: Wait for response (redirect back to portal, error, or 2FA)
+  // Step 5: Wait for response (redirect back to portal, error, or 2FA)
   try {
     await page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 30_000 });
   } catch {
@@ -212,7 +205,7 @@ async function biceLogin(
 
   // Still on Keycloak? Check for errors or 2FA
   if (postLoginUrl.includes("auth.bice.cl")) {
-    const pageHtml = await page.evaluate(() => document.documentElement.outerHTML);
+    const pageHtml = await page.content();
     const pageLower = pageHtml.toLowerCase();
 
     // Check for 2FA
@@ -236,19 +229,13 @@ async function biceLogin(
       debugLog.push("  Submitting 2FA code...");
 
       // Try typing into OTP field
-      const otpTyped = await page.evaluate((c: string) => {
-        const otpInput = document.querySelector("#otp") as HTMLInputElement
-          || document.querySelector("input[name='otp']") as HTMLInputElement
-          || document.querySelector("input[name='totp']") as HTMLInputElement;
-        if (otpInput) {
-          otpInput.value = c;
-          otpInput.dispatchEvent(new Event("input", { bubbles: true }));
-          return true;
-        }
-        return false;
-      }, code);
+      const otpInput = await page.$("#otp")
+        || await page.$("input[name='otp']")
+        || await page.$("input[name='totp']");
 
-      if (!otpTyped) {
+      if (otpInput) {
+        await otpInput.fill(code);
+      } else {
         // Fallback: type into the first visible text input
         const inputs = await page.$$("input[type='text'], input[type='number'], input:not([type])");
         if (inputs.length > 0) {
@@ -257,11 +244,8 @@ async function biceLogin(
       }
 
       // Click submit button
-      await page.evaluate(() => {
-        const kcLogin = document.querySelector("#kc-login") as HTMLElement
-          || document.querySelector("input[type='submit']") as HTMLElement;
-        if (kcLogin) kcLogin.click();
-      });
+      const submitBtn = await page.$("#kc-login") || await page.$("input[type='submit']");
+      if (submitBtn) await submitBtn.click();
 
       try {
         await page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 30_000 });
@@ -273,10 +257,8 @@ async function biceLogin(
       debugLog.push(`  Post-2FA URL: ${post2faUrl}`);
 
       if (post2faUrl.includes("auth.bice.cl")) {
-        const errorText = await page.evaluate(() => {
-          const el = document.querySelector(".kc-feedback-text, [class*='alert'], [class*='error']");
-          return el ? (el as HTMLElement).innerText?.trim() : null;
-        });
+        const errorEl = await page.$(".kc-feedback-text, [class*='alert'], [class*='error']");
+        const errorText = errorEl ? await errorEl.innerText().catch(() => null) : null;
         return {
           success: false,
           error: `Error 2FA: ${errorText || "Codigo incorrecto o expirado."}`,
@@ -284,10 +266,8 @@ async function biceLogin(
       }
     } else {
       // Check for login errors (still on Keycloak but not 2FA)
-      const errorText = await page.evaluate(() => {
-        const el = document.querySelector(".kc-feedback-text, [class*='alert'], [class*='error']");
-        return el ? (el as HTMLElement).innerText?.trim() : null;
-      });
+      const errorEl = await page.$(".kc-feedback-text, [class*='alert'], [class*='error']");
+      const errorText = errorEl ? await errorEl.innerText().catch(() => null) : null;
       if (errorText) {
         return {
           success: false,
@@ -301,13 +281,10 @@ async function biceLogin(
     }
   }
 
-  // Step 5: Wait for the portal to fully load (Angular SPA)
-  // After Keycloak auth, the portal redirects back. The SPA calls
-  // login/start + login/end on gw.bice.cl to set up session cookies.
+  // Step 6: Wait for the portal to fully load (Angular SPA)
   debugLog.push("5. Waiting for portal to load...");
   progress("Sesion iniciada, cargando portal...");
 
-  // Wait for the portal URL to settle (may go through several redirects)
   const portalLoadStart = Date.now();
   const MAX_PORTAL_WAIT = 30_000;
   let portalLoaded = false;
@@ -315,13 +292,8 @@ async function biceLogin(
   while (Date.now() - portalLoadStart < MAX_PORTAL_WAIT) {
     const currentUrl = page.url();
     if (currentUrl.includes("portalpersonas.bice.cl") && !currentUrl.includes("auth.bice.cl")) {
-      // Wait for the Angular app to render something meaningful
-      const hasContent = await page.evaluate(() => {
-        const body = document.body?.innerText || "";
-        // The dashboard shows account info, "Resumen", or product names
-        return body.includes("Resumen") || body.includes("Cuenta") || body.includes("Saldo") || body.length > 500;
-      });
-      if (hasContent) {
+      const bodyText = await page.innerText("body").catch(() => "");
+      if (bodyText.includes("Resumen") || bodyText.includes("Cuenta") || bodyText.includes("Saldo") || bodyText.length > 500) {
         portalLoaded = true;
         break;
       }
@@ -336,12 +308,9 @@ async function biceLogin(
       const pUrl = p.url();
       if (pUrl.includes("portalpersonas.bice.cl") && pUrl !== page.url()) {
         debugLog.push(`  Found portal in another tab: ${pUrl}`);
-        // We'll use page.evaluate on the original page anyway,
-        // but let's check if this tab has content
-        const hasContent = await p.evaluate(() => {
-          const body = document.body?.innerText || "";
-          return body.includes("Resumen") || body.includes("Cuenta") || body.length > 500;
-        }).catch(() => false);
+        const hasContent = await p.innerText("body").then(
+          text => text.includes("Resumen") || text.includes("Cuenta") || text.length > 500
+        ).catch(() => false);
         if (hasContent) {
           portalLoaded = true;
           break;
@@ -355,265 +324,120 @@ async function biceLogin(
   if (!portalLoaded) {
     const finalUrl = page.url();
     debugLog.push(`  Portal did not fully load. URL: ${finalUrl}`);
-    // Continue anyway — the cookies might still be set even if the UI hasn't loaded
-    debugLog.push("  Proceeding with API calls regardless...");
+    debugLog.push("  Proceeding regardless...");
   }
-
-  // Give the OAuth agent login/start + login/end calls time to complete
-  // These are triggered by the Angular app on load and set the gw.bice.cl cookies
-  await delay(3000);
 
   debugLog.push("6. Login OK!");
   return { success: true };
 }
 
-// ─── API response types ──────────────────────────────────────────
+// ─── Intercepted data parsing ────────────────────────────────────
 
-interface BiceProduct {
-  id?: string;
-  accountNumber?: string;
-  productType?: string;
-  productName?: string;
-  currency?: string;
-  balance?: number;
-  availableBalance?: number;
-  [key: string]: unknown;
-}
-
-interface BiceProductsResponse {
-  products?: BiceProduct[];
-  accounts?: BiceProduct[];
-  data?: BiceProduct[];
-  [key: string]: unknown;
-}
-
-interface BiceTransaction {
-  date?: string;
+interface BiceInterceptedTransaction {
   fecha?: string;
-  transactionDate?: string;
-  description?: string;
+  fechaSinFormato?: string;
+  fechacontable?: string;
   descripcion?: string;
-  glosa?: string;
-  amount?: number;
-  monto?: number;
-  cargo?: number;
-  abono?: number;
-  balance?: number;
-  saldo?: number;
-  category?: string;
+  narrativa?: string;
+  monto?: string;
   tipo?: string;
-  type?: string;
+  codtrn?: string;
   [key: string]: unknown;
 }
 
-interface BiceTransactionsResponse {
-  transactions?: BiceTransaction[];
-  movimientos?: BiceTransaction[];
-  data?: BiceTransaction[];
-  content?: BiceTransaction[];
-  totalPages?: number;
-  totalElements?: number;
-  page?: number;
-  hasMore?: boolean;
+interface BiceInterceptedTransactionsResponse {
+  movimientos?: BiceInterceptedTransaction[];
   [key: string]: unknown;
 }
 
-// ─── Data extraction ─────────────────────────────────────────────
+interface BiceInterceptedBalanceResponse {
+  titulo?: string;
+  monto?: string;
+  saldoDisponibleMonto?: string;
+  saldoDisponibleDescripcion?: string;
+  saldoContableDescripcion?: string;
+  [key: string]: unknown;
+}
 
-function biceTransactionToMovement(tx: BiceTransaction): BankMovement | null {
-  // Extract date from various possible field names
-  const dateStr = tx.date || tx.fecha || tx.transactionDate || "";
+function parseInterceptedTransaction(tx: BiceInterceptedTransaction): BankMovement | null {
+  // Date: prefer fechaSinFormato "20260326" -> "26-03-2026", fallback to fecha "26 mar 2026"
+  let dateStr = "";
+  if (tx.fechaSinFormato && /^\d{8}$/.test(tx.fechaSinFormato)) {
+    const y = tx.fechaSinFormato.slice(0, 4);
+    const m = tx.fechaSinFormato.slice(4, 6);
+    const d = tx.fechaSinFormato.slice(6, 8);
+    dateStr = `${d}-${m}-${y}`;
+  } else if (tx.fecha) {
+    dateStr = normalizeDate(tx.fecha);
+  }
   if (!dateStr) return null;
 
-  // Extract description
-  const description = (tx.description || tx.descripcion || tx.glosa || "").trim();
+  // Description: prefer narrativa (full), fallback to descripcion
+  const description = (tx.narrativa || tx.descripcion || "").trim();
   if (!description) return null;
 
-  // Extract amount — BICE uses Cargos (negative) and Abonos (positive)
-  let amount: number;
-  if (tx.amount !== undefined && tx.amount !== null) {
-    amount = tx.amount;
-  } else if (tx.monto !== undefined && tx.monto !== null) {
-    amount = tx.monto;
-  } else if (tx.cargo !== undefined && Number(tx.cargo) > 0) {
-    amount = -Math.abs(Number(tx.cargo));
-  } else if (tx.abono !== undefined && Number(tx.abono) > 0) {
-    amount = Math.abs(Number(tx.abono));
-  } else {
-    return null;
-  }
+  // Amount: monto is a string without dots/commas (e.g. "2003")
+  const rawAmount = parseInt(tx.monto || "0", 10);
+  if (!rawAmount) return null;
 
-  // If category/type says "Cargos" and amount is positive, flip to negative
-  const category = (tx.category || tx.tipo || tx.type || "").toLowerCase();
-  if (category.includes("cargo") && amount > 0) {
-    amount = -amount;
-  }
-  // If category says "Abonos" and amount is negative, flip to positive
-  if (category.includes("abono") && amount < 0) {
-    amount = -amount;
-  }
-
-  const balance = tx.balance ?? tx.saldo ?? 0;
+  // tipo: "cargo" = negative (expense), "abono" = positive (income)
+  const tipo = (tx.tipo || "").toLowerCase();
+  const amount = tipo === "cargo" ? -Math.abs(rawAmount) : Math.abs(rawAmount);
 
   return {
-    date: normalizeDate(dateStr),
+    date: dateStr,
     description,
     amount,
-    balance: typeof balance === "number" ? balance : 0,
+    balance: 0, // BICE transactions API does not include running balance per movement
     source: MOVEMENT_SOURCE.account,
   };
 }
 
-// ─── BFF data fetching via page.evaluate(fetch(...)) ─────────────
+// ─── DOM fallback extraction ─────────────────────────────────────
 
-/**
- * Execute a POST to a BFF endpoint using the browser's fetch (includes cookies).
- * Returns the parsed JSON response or null on failure.
- */
-async function bffPostViaBrowser<T>(
-  session: BrowserSession,
-  url: string,
-  body: unknown = {},
-): Promise<T | null> {
-  const { page, debugLog } = session;
-  const result = await page.evaluate(
-    async ({ fetchUrl, fetchBody }: { fetchUrl: string; fetchBody: string }) => {
-      try {
-        const res = await fetch(fetchUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          credentials: "include",
-          body: fetchBody,
-        });
-        if (!res.ok) {
-          return { __error: true, status: res.status, statusText: res.statusText };
-        }
-        return await res.json();
-      } catch (err) {
-        return { __error: true, message: String(err) };
+async function extractMovementsFromDom(page: Page, debugLog: string[]): Promise<BankMovement[]> {
+  debugLog.push("  Attempting DOM fallback extraction...");
+  const movements: BankMovement[] = [];
+
+  try {
+    const rows = await page.$$("table tbody tr");
+
+    for (const row of rows) {
+      const cells = await row.$$("td");
+      if (cells.length < 3) continue;
+
+      const cellTexts: string[] = [];
+      for (const cell of cells) {
+        const text = await cell.innerText().catch(() => "");
+        cellTexts.push(text.trim());
       }
-    },
-    { fetchUrl: url, fetchBody: JSON.stringify(body) },
-  );
 
-  if (result && typeof result === "object" && "__error" in result) {
-    const errResult = result as { status?: number; statusText?: string; message?: string };
-    debugLog.push(`  BFF error: ${url} -> ${errResult.status || errResult.message}`);
-    return null;
-  }
+      const date = cellTexts[0];
+      const description = cellTexts[1];
+      const cargo = cellTexts[2] ? parseInt(cellTexts[2].replace(/[^0-9]/g, ""), 10) || 0 : 0;
+      const abono = cellTexts[3] ? parseInt(cellTexts[3].replace(/[^0-9]/g, ""), 10) || 0 : 0;
+      const balance = cellTexts[4] ? parseInt(cellTexts[4].replace(/[^0-9]/g, ""), 10) || 0 : 0;
 
-  return result as T;
-}
+      if (!date || !description) continue;
 
-async function fetchProducts(
-  session: BrowserSession,
-): Promise<BiceProduct[]> {
-  const { debugLog } = session;
-  debugLog.push("  Fetching products...");
+      const amount = abono > 0 ? abono : cargo > 0 ? -cargo : 0;
+      if (amount === 0) continue;
 
-  const res = await bffPostViaBrowser<BiceProductsResponse>(session, BFF_PRODUCTS);
-  if (!res) return [];
-
-  // Handle top-level array
-  if (Array.isArray(res)) {
-    debugLog.push(`  Products: ${(res as BiceProduct[]).length} (top-level array)`);
-    return res as BiceProduct[];
-  }
-
-  const products = res.products || res.accounts || res.data || [];
-  debugLog.push(`  Products: ${products.length}`);
-  return products;
-}
-
-async function fetchBalance(
-  session: BrowserSession,
-): Promise<number | undefined> {
-  const { debugLog } = session;
-  debugLog.push("  Fetching balance...");
-
-  const res = await bffPostViaBrowser<Record<string, unknown>>(session, BFF_BALANCE);
-  if (!res) return undefined;
-
-  const balance =
-    (res.balance as number) ??
-    (res.availableBalance as number) ??
-    (res.saldo as number) ??
-    (res.saldoDisponible as number);
-
-  if (balance !== undefined && typeof balance === "number") {
-    debugLog.push(`  Balance: $${balance.toLocaleString("es-CL")}`);
-    return balance;
-  }
-
-  debugLog.push(`  Balance response keys: ${Object.keys(res).join(", ")}`);
-  return undefined;
-}
-
-async function fetchTransactions(
-  session: BrowserSession,
-): Promise<BankMovement[]> {
-  const { debugLog } = session;
-  debugLog.push("  Fetching transactions...");
-  const allMovements: BankMovement[] = [];
-
-  // First page
-  let res = await bffPostViaBrowser<BiceTransactionsResponse>(session, BFF_TRANSACTIONS);
-  if (!res) return [];
-
-  let rawTxs: BiceTransaction[];
-  if (Array.isArray(res)) {
-    rawTxs = res as BiceTransaction[];
-  } else {
-    rawTxs = res.transactions || res.movimientos || res.data || res.content || [];
-  }
-
-  debugLog.push(`  Transactions page 1: ${rawTxs.length} items`);
-
-  for (const tx of rawTxs) {
-    const mov = biceTransactionToMovement(tx);
-    if (mov) allMovements.push(mov);
-  }
-
-  // Paginate if the API supports it
-  let pageNum = 2;
-  const MAX_PAGES = 20;
-  let hasMore = !Array.isArray(res) && (
-    res.hasMore === true ||
-    (res.totalPages !== undefined && pageNum <= res.totalPages)
-  );
-
-  while (hasMore && pageNum <= MAX_PAGES) {
-    const pageRes = await bffPostViaBrowser<BiceTransactionsResponse>(
-      session,
-      BFF_TRANSACTIONS,
-      { page: pageNum, pageSize: 50 },
-    );
-
-    if (!pageRes) break;
-
-    let pageTxs: BiceTransaction[];
-    if (Array.isArray(pageRes)) {
-      pageTxs = pageRes as BiceTransaction[];
-    } else {
-      pageTxs = pageRes.transactions || pageRes.movimientos || pageRes.data || pageRes.content || [];
+      movements.push({
+        date: normalizeDate(date),
+        description,
+        amount,
+        balance,
+        source: MOVEMENT_SOURCE.account,
+      });
     }
 
-    if (pageTxs.length === 0) break;
-
-    debugLog.push(`  Transactions page ${pageNum}: ${pageTxs.length} items`);
-    for (const tx of pageTxs) {
-      const mov = biceTransactionToMovement(tx);
-      if (mov) allMovements.push(mov);
-    }
-
-    pageNum++;
-    hasMore = !Array.isArray(pageRes) && (
-      pageRes.hasMore === true ||
-      (pageRes.totalPages !== undefined && pageNum <= pageRes.totalPages)
-    );
+    debugLog.push(`  DOM fallback: ${movements.length} movements`);
+  } catch (err) {
+    debugLog.push(`  DOM fallback failed: ${err}`);
   }
 
-  return allMovements;
+  return movements;
 }
 
 // ─── Main scrape function ────────────────────────────────────────
@@ -626,6 +450,11 @@ async function scrapeBice(
   const { onProgress } = options;
   const bank = "bice";
   const progress = onProgress || (() => {});
+
+  // Set up response interception BEFORE any navigation
+  // This captures all gw.bice.cl API responses that the Angular SPA makes
+  const apiResponses = new Map<string, unknown>();
+  setupResponseInterception(page, apiResponses, debugLog);
 
   // 1. Login via browser (Keycloak)
   const loginResult = await biceLogin(session, options);
@@ -641,34 +470,122 @@ async function scrapeBice(
 
   progress("Sesion iniciada correctamente");
 
-  // 2. Fetch data via BFF endpoints (using browser's session cookies)
-  debugLog.push("7. Fetching data via BFF endpoints (page.evaluate + fetch)...");
+  // 2. Navigate to movements page — the Angular SPA will call BFF endpoints
+  debugLog.push("7. Navigating to movements page...");
+  progress("Cargando movimientos...");
 
-  // Fetch products (account list)
-  progress("Obteniendo productos...");
-  const products = await fetchProducts(session);
-  debugLog.push(`  Found ${products.length} product(s)`);
+  // Also set up interception on any new pages (BICE may open a new tab)
+  const allPages = session.context.pages();
+  for (const p of allPages) {
+    if (p !== page) {
+      setupResponseInterception(p, apiResponses, debugLog);
+    }
+  }
 
-  // Fetch balance
-  progress("Obteniendo saldo...");
-  const balance = await fetchBalance(session);
+  // Find the right page to use (BICE sometimes opens portal in a new tab)
+  let activePage = page;
+  for (const p of allPages) {
+    if (p.url().includes("portalpersonas.bice.cl") && p !== page) {
+      activePage = p;
+      debugLog.push(`  Using portal page from tab: ${p.url()}`);
+      break;
+    }
+  }
 
-  // Fetch transactions (movements)
-  progress("Extrayendo movimientos...");
-  const movements = await fetchTransactions(session);
-  debugLog.push(`  Raw movements: ${movements.length}`);
+  try {
+    await activePage.goto(MOVEMENTS_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
+  } catch {
+    debugLog.push("  Navigation to movements page timed out, continuing...");
+  }
+
+  // Wait for the SPA to load data (API calls happen after Angular bootstraps)
+  debugLog.push("  Waiting for SPA to fetch data...");
+  const dataWaitStart = Date.now();
+  const MAX_DATA_WAIT = 15_000;
+
+  while (Date.now() - dataWaitStart < MAX_DATA_WAIT) {
+    // Check if we got the transactions response
+    const hasTransactions = [...apiResponses.keys()].some(k =>
+      k.includes("bff-checking-account-transactions-100/v1/transactions")
+    );
+    if (hasTransactions) {
+      debugLog.push("  Transactions response intercepted!");
+      // Wait a bit more for balance to arrive too
+      await delay(2000);
+      break;
+    }
+    await delay(2000);
+  }
+
+  await doSave(activePage, "bice-09-movements-page");
+
+  // 3. Extract data from intercepted responses
+  debugLog.push("8. Extracting data from intercepted API responses...");
+  debugLog.push(`  Intercepted keys: ${[...apiResponses.keys()].join(", ")}`);
+
+  // --- Balance ---
+  let balance: number | undefined;
+  const balanceKey = [...apiResponses.keys()].find(k =>
+    k.includes("bff-checking-account-transactions-100/v1/balance")
+  );
+  if (balanceKey) {
+    const balanceData = apiResponses.get(balanceKey) as BiceInterceptedBalanceResponse;
+    const rawBalance = balanceData?.saldoDisponibleMonto || balanceData?.monto;
+    if (rawBalance) {
+      balance = parseInt(rawBalance, 10);
+      debugLog.push(`  Balance: $${balance.toLocaleString("es-CL")}`);
+    } else {
+      debugLog.push(`  Balance response found but no saldoDisponibleMonto: ${JSON.stringify(balanceData).slice(0, 200)}`);
+    }
+  } else {
+    debugLog.push("  No balance response intercepted");
+  }
+
+  // --- Transactions ---
+  let movements: BankMovement[] = [];
+  const txKey = [...apiResponses.keys()].find(k =>
+    k.includes("bff-checking-account-transactions-100/v1/transactions")
+  );
+  if (txKey) {
+    const txData = apiResponses.get(txKey) as BiceInterceptedTransactionsResponse;
+    const rawMovimientos = txData?.movimientos || [];
+    debugLog.push(`  Raw transactions: ${rawMovimientos.length}`);
+
+    for (const tx of rawMovimientos) {
+      const mov = parseInterceptedTransaction(tx);
+      if (mov) movements.push(mov);
+    }
+    debugLog.push(`  Parsed movements: ${movements.length}`);
+  } else {
+    debugLog.push("  No transactions response intercepted");
+  }
+
+  // --- Products (log for debugging) ---
+  const productsKey = [...apiResponses.keys()].find(k =>
+    k.includes("bff-portal-hbp/v1/products")
+  );
+  if (productsKey) {
+    const productsData = apiResponses.get(productsKey) as Record<string, unknown>;
+    debugLog.push(`  Products intercepted: ${JSON.stringify(productsData).slice(0, 300)}`);
+  }
+
+  // 4. Fallback: if interception missed transactions, try DOM extraction
+  if (movements.length === 0) {
+    debugLog.push("  No intercepted transactions -- trying DOM fallback...");
+    movements = await extractMovementsFromDom(activePage, debugLog);
+  }
 
   const deduplicated = deduplicateMovements(movements);
-  debugLog.push(`8. Total: ${deduplicated.length} unique movements`);
+  debugLog.push(`9. Total: ${deduplicated.length} unique movements`);
   progress(`Listo -- ${deduplicated.length} movimientos totales`);
 
-  await doSave(page, "bice-09-done");
+  await doSave(activePage, "bice-10-done");
 
   return {
     success: true,
     bank,
     movements: deduplicated,
-    balance: balance ?? undefined,
+    balance,
     debug: debugLog.join("\n"),
   };
 }
@@ -679,9 +596,9 @@ const bice: BankScraper = {
   id: "bice",
   name: "Banco BICE",
   url: PORTAL_URL,
-  // No mode: "api" — this is browser mode (hybrid: browser login + API data via page.evaluate).
+  // Hybrid browser mode: browser login (Keycloak) + response interception for data.
   // The portal at portalpersonas.bice.cl returns 403 to Node.js fetch() (Cloudflare WAF).
-  // Once logged in via browser, gw.bice.cl BFF endpoints work via page.evaluate(fetch(...)).
+  // Once logged in via browser, we intercept the Angular SPA's own API responses from gw.bice.cl.
   scrape: (options) => runScraper("bice", options, {}, scrapeBice),
 };
 
