@@ -98,15 +98,28 @@ async function biceLogin(
 ): Promise<{ success: true; jar: CookieJar } | { success: false; error: string }> {
   const jar = createCookieJar();
 
-  // Step 1: GET portal — follows redirect to Keycloak login page
+  // Step 1: GET portal — manually follow redirects to collect cookies at each hop
   debugLog.push("1. Fetching portal (triggers Keycloak redirect)...");
-  const portalRes = await fetch(PORTAL_URL, {
-    headers: { "User-Agent": UA },
-    redirect: "follow",
-  });
-  jar.setAll(portalRes.headers);
-  const loginHtml = await portalRes.text();
-  debugLog.push(`  Status: ${portalRes.status}, URL: ${portalRes.url}, cookies: ${jar.cookies.size}`);
+  let currentUrl: string = PORTAL_URL;
+  let loginHtml = "";
+  let maxHops = 15;
+  while (maxHops-- > 0) {
+    const res = await fetch(currentUrl, {
+      headers: { "User-Agent": UA, "Cookie": jar.header() },
+      redirect: "manual",
+    });
+    jar.setAll(res.headers);
+    const location = res.headers.get("location");
+    if (location) {
+      currentUrl = location.startsWith("http") ? location : new URL(location, currentUrl).href;
+      debugLog.push(`  Redirect: ${currentUrl.slice(0, 80)}...`);
+      continue;
+    }
+    // Final destination — read HTML
+    loginHtml = await res.text();
+    debugLog.push(`  Landed: ${currentUrl.slice(0, 80)} (${res.status}), cookies: ${jar.cookies.size}`);
+    break;
+  }
 
   // Step 2: Parse Keycloak form action URL (contains session code)
   const formAction = parseKeycloakFormAction(loginHtml);
@@ -130,7 +143,7 @@ async function biceLogin(
       "User-Agent": UA,
       "Content-Type": "application/x-www-form-urlencoded",
       Cookie: jar.header(),
-      Referer: portalRes.url,
+      Referer: currentUrl,
       Origin: "https://auth.bice.cl",
     },
     body: body.toString(),
@@ -167,7 +180,7 @@ async function biceLogin(
           "User-Agent": UA,
           "Content-Type": "application/x-www-form-urlencoded",
           Cookie: jar.header(),
-          Referer: portalRes.url,
+          Referer: currentUrl,
           Origin: "https://auth.bice.cl",
         },
         body: otpBody.toString(),
