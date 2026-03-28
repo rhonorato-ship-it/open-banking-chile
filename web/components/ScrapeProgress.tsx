@@ -303,7 +303,7 @@ export default function ScrapeProgress({ bankId, bankName, agentic = false, onDo
         )}
 
         {/* Actions on error */}
-        {errorMsg && /invalid|incorrecta|credential|clave|password|usuario/i.test(errorMsg) && (
+        {errorMsg && /invalid|incorrecta|credential|clave|password|usuario|autenticaci/i.test(errorMsg) && (
           <div className="mt-2 space-y-2">
             <p className="text-xs text-slate-500 text-center">Las credenciales guardadas no funcionaron.</p>
             <Link
@@ -320,7 +320,7 @@ export default function ScrapeProgress({ bankId, bankName, agentic = false, onDo
             </button>
           </div>
         )}
-        {errorMsg && !/invalid|incorrecta|credential|clave|password|usuario/i.test(errorMsg) && (
+        {errorMsg && !/invalid|incorrecta|credential|clave|password|usuario|autenticaci/i.test(errorMsg) && (
           <div className="flex gap-2 mt-2">
             <button
               onClick={() => setRetryCount((c) => c + 1)}

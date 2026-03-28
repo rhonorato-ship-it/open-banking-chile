@@ -11,6 +11,7 @@ import { runApiScraper } from "../infrastructure/api-runner.js";
 // No browser needed — this scraper uses fetch() exclusively.
 
 const API_BASE = "https://fintual.cl/api";
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 // ─── API types ───────────────────────────────────────────────
 
@@ -50,7 +51,7 @@ async function fintualAuth(
 
   const res = await fetch(`${API_BASE}/access_tokens`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "User-Agent": UA },
     body: JSON.stringify({ user: { email, password } }),
   });
 
@@ -82,6 +83,7 @@ async function fetchGoals(
     headers: {
       "X-User-Email": email,
       "X-User-Token": token,
+      "User-Agent": UA,
     },
   });
 
