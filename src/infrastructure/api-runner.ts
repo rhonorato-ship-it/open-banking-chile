@@ -5,8 +5,8 @@ export type ApiScrapeFn = (
   debugLog: string[],
 ) => Promise<ScrapeResult>;
 
-/** Default timeout for API scrapers: 240s (leaves 60s headroom under Vercel's 300s limit) */
-const DEFAULT_TIMEOUT_MS = 240_000;
+/** Default timeout for API scrapers: 15s. API calls are fetch-only — if they're not done in 15s, something is wrong. */
+const DEFAULT_TIMEOUT_MS = 15_000;
 
 /**
  * Browser-free scraper runner for banks/services with REST APIs.

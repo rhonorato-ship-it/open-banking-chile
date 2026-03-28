@@ -1,5 +1,5 @@
 export const dynamic = "force-dynamic";
-export const maxDuration = 300;
+export const maxDuration = 150;
 
 import { auth } from "@/lib/auth";
 import { supabase } from "@/lib/db";
@@ -17,8 +17,9 @@ function stringToPhase(msg: string): Phase {
   return 4;
 }
 
-/** Hard timeout for the entire scrape operation. Leaves 25s headroom under Vercel's 300s limit. */
-const SCRAPE_TIMEOUT_MS = 275_000;
+/** Hard timeouts per scraper mode. API scrapers are fetch-only and should be fast. Browser scrapers need time for page loads + 2FA. */
+const TIMEOUT_API_MS = 30_000;      // 30s for API mode (fetch calls + movement storage)
+const TIMEOUT_BROWSER_MS = 120_000; // 120s for browser mode (page loads, 2FA waits)
 
 export async function GET(req: Request, { params }: { params: Promise<{ bankId: string }> }) {
   const session = await auth();
@@ -172,9 +173,10 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
           },
         });
 
+        const timeoutMs = needsBrowser ? TIMEOUT_BROWSER_MS : TIMEOUT_API_MS;
         let scrapeTimerId: ReturnType<typeof setTimeout> | undefined;
         const timeoutPromise = new Promise<never>((_, reject) => {
-          scrapeTimerId = setTimeout(() => reject(new Error("SCRAPE_TIMEOUT")), SCRAPE_TIMEOUT_MS);
+          scrapeTimerId = setTimeout(() => reject(new Error("SCRAPE_TIMEOUT")), timeoutMs);
         });
 
         let result;
