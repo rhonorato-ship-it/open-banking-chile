@@ -51,6 +51,15 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
       keepaliveInterval = setInterval(keepalive, 20_000);
 
       try {
+        // Auto-release stale locks older than 5 minutes (from crashed/timed-out functions)
+        await supabase
+          .from("bank_credentials")
+          .update({ is_syncing: false })
+          .eq("user_id", userId)
+          .eq("bank_id", bankId)
+          .eq("is_syncing", true)
+          .lt("last_synced_at", new Date(Date.now() - 5 * 60_000).toISOString());
+
         // Atomically acquire sync lock via RPC
         const { data: acquired, error: lockError } = await supabase.rpc("acquire_sync_lock", {
           p_user_id: userId,
@@ -222,12 +231,14 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
         });
       } finally {
         clearInterval(keepaliveInterval);
-        supabase
-          .from("bank_credentials")
-          .update({ is_syncing: false })
-          .eq("user_id", userId)
-          .eq("bank_id", bankId)
-          .then(() => {}, () => {}); // best-effort reset
+        // Must await — fire-and-forget may not execute before Vercel kills the function
+        try {
+          await supabase
+            .from("bank_credentials")
+            .update({ is_syncing: false })
+            .eq("user_id", userId)
+            .eq("bank_id", bankId);
+        } catch { /* best-effort */ }
         try { controller.close(); } catch { /* already closed */ }
       }
     },
