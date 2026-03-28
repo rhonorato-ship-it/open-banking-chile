@@ -24,7 +24,6 @@ Banks:
 - BICE (`bice`) — Keycloak OIDC token exchange at `auth.bice.cl` + cookie jar. Data endpoints need live testing.
 - Citibank (`citi`) — cookie jar login (ioBlackBox sent empty). REST at `/US/REST/accountsPanel/getCustomerAccounts.jws` + CSV download.
 - Banco Falabella (`falabella`) — cookie jar auth + REST API for account and CMR credit card data. Endpoints need live testing.
-- Itaú (`itau`) — WPS portal cookie jar + HTML parsing. Imperva may block; returns helpful error if blocked.
 - Santander (`santander`) — cookie jar auth via login iframe endpoint + REST API. Multi-account + CC support.
 - Scotiabank (`scotiabank`) — cookie jar auth + REST API. Historical periods via `SCOTIABANK_MONTHS` env var.
 
@@ -33,6 +32,9 @@ WealthTech:
 - Racional (`racional`) — Firebase Auth (`racional-prod`) + Firestore REST API
 
 **Browser mode** (requires Puppeteer):
+
+Banks:
+- Itaú (`itau`) — IBM WebSphere Portal (server-rendered HTML, no JSON APIs). Imperva blocks Node.js fetch(); requires real browser. 2FA via Itaú Key push notification.
 
 PayTech:
 - MercadoPago (`mercadopago`) — MercadoLibre login with email + password. Device fingerprint (`dps`) requires browser JS. Extracts balance + activity from dashboard.
@@ -86,9 +88,9 @@ PayTech:
 
 ### Institutions with anti-bot protections (may block API mode)
 
-All banks are now API mode, but these have anti-bot measures that may block Node.js `fetch()`. Their scrapers detect the block and return helpful error messages suggesting `--profile` as fallback:
+Most banks are API mode, but these have anti-bot measures that may block Node.js `fetch()`. Their scrapers detect the block and return helpful error messages suggesting `--profile` as fallback:
 
-- **Itaú** — Imperva bot protection. Scraper detects "No pudimos validar tu acceso" and suggests `--profile`.
+- **Itaú** — Imperva bot protection. Now **browser mode** (Imperva confirmed to block fetch(); no JSON APIs exist). Still detects Imperva block and suggests `--headful --profile` if headless Chrome is also blocked.
 - **BancoEstado** — Akamai TLS fingerprinting. Scraper detects 403/captcha and suggests `--headful --profile`.
 - **Citi** — ThreatMetrix ioBlackBox. Scraper sends empty ioBlackBox; if login fails, suggests browser mode.
 - **BCI** — JSF ViewState. Server-rendered portal may reject non-browser requests.
@@ -192,10 +194,11 @@ src/
     balance.ts             — Balance extraction (regex + CSS selector fallbacks)
     two-factor.ts          — 2FA detection and wait (configurable keywords/timeout)
   banks/
-    12 API-mode scrapers (fetch-only): bchile.ts, edwards.ts, fintual.ts,
+    11 API-mode scrapers (fetch-only): bchile.ts, edwards.ts, fintual.ts,
     racional.ts, bci.ts, bestado.ts, bice.ts, citi.ts, falabella.ts,
-    itau.ts, santander.ts, scotiabank.ts
-    1 browser-mode scraper: mercadopago.ts (MercadoLibre login requires browser)
+    santander.ts, scotiabank.ts
+    2 browser-mode scrapers: itau.ts (IBM WebSphere, no JSON APIs),
+    mercadopago.ts (MercadoLibre login requires browser)
 
 web/                       — Next.js 15 multi-user dashboard (App Router), deployed on Vercel
   app/
