@@ -194,8 +194,8 @@ src/
     balance.ts             — Balance extraction (regex + CSS selector fallbacks)
     two-factor.ts          — 2FA detection and wait (configurable keywords/timeout)
   banks/
-    bchile.ts (API), edwards.ts (API, delegates to bchile),
-    fintual.ts (API), mercadopago.ts (API), racional.ts (API),
+    All 13 scrapers are API mode (fetch-only, no Puppeteer):
+    bchile.ts, edwards.ts, fintual.ts, mercadopago.ts, racional.ts,
     bci.ts, bestado.ts, bice.ts, citi.ts, falabella.ts,
     itau.ts, santander.ts, scotiabank.ts
 
