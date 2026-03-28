@@ -9,13 +9,11 @@ import { runApiScraper } from "../infrastructure/api-runner.js";
 // and DriveWealth (US stock brokerage).
 //
 // Auth: Firebase REST API → signInWithPassword → idToken
-// Data: Cloud Functions at us-central1-racional-prod.cloudfunctions.net
-//       + Firestore for user profile and goal configuration
+// Data: Top-level Firestore collections (deposits, withdrawals, contributions,
+//       goals) filtered by userId, plus Cloud Functions for account summaries.
 //
-// The web app at app.racional.cl fetches portfolio and movement data
-// via Firebase Cloud Functions, NOT direct Firestore reads. The user
-// document in Firestore contains goal definitions and portfolio config,
-// while movements come from DriveWealth via Cloud Functions.
+// Movements live in top-level collections (NOT subcollections under users).
+// Each document has a `userId` field that matches `localId` from Firebase Auth.
 
 const FIREBASE_API_KEY = "AIzaSyCHCBAaUWhTc8mGtyqfahJ4cYpeVACoCJk";
 const FIREBASE_AUTH_URL = "https://identitytoolkit.googleapis.com/v1";
@@ -59,8 +57,8 @@ interface FirebaseMfaError {
 interface RacionalGoal {
   id: string;
   name: string;
+  portfolioId?: string;
   value: number;   // CLP value
-  currency?: string;
 }
 
 // ─── Firebase Auth ───────────────────────────────────────────────
@@ -86,13 +84,13 @@ async function firebaseSignIn(
       return { success: false, error: "Email no registrado en Racional." };
     }
     if (msg === "INVALID_PASSWORD" || msg === "INVALID_LOGIN_CREDENTIALS") {
-      return { success: false, error: "Contraseña incorrecta." };
+      return { success: false, error: "Contrasena incorrecta." };
     }
     if (msg === "USER_DISABLED") {
       return { success: false, error: "Cuenta deshabilitada." };
     }
     if (msg === "TOO_MANY_ATTEMPTS_TRY_LATER") {
-      return { success: false, error: "Demasiados intentos. Intenta más tarde." };
+      return { success: false, error: "Demasiados intentos. Intenta mas tarde." };
     }
     if (msg.startsWith("MISSING_MFA") || msg.includes("MFA")) {
       return { success: false, error: `Se requiere autenticacion multi-factor: ${msg}` };
@@ -102,7 +100,7 @@ async function firebaseSignIn(
   }
 
   const data = await res.json() as FirebaseSignInResponse;
-  debugLog.push(`  Auth OK — user: ${data.email} (${data.localId})`);
+  debugLog.push(`  Auth OK - user: ${data.email} (${data.localId})`);
   return { success: true, idToken: data.idToken, refreshToken: data.refreshToken, localId: data.localId };
 }
 
@@ -147,11 +145,6 @@ interface FirestoreValue {
   referenceValue?: string;
 }
 
-interface FirestoreListResponse {
-  documents?: FirestoreDocument[];
-  nextPageToken?: string;
-}
-
 /** Extract the plain JS value from a Firestore typed value. */
 function fsVal(v: FirestoreValue | undefined): string | number | boolean | null {
   if (!v) return null;
@@ -187,12 +180,14 @@ function fsDeep(v: FirestoreValue | undefined): unknown {
   return null;
 }
 
-/** Convert a Firestore document to a plain JS object. */
+/** Convert a Firestore document to a plain JS object with its document ID. */
 function docToObject(doc: FirestoreDocument): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(doc.fields || {})) {
     out[k] = fsDeep(v);
   }
+  // Include the document ID extracted from the document name path
+  out._docId = doc.name.split("/").pop() || "";
   return out;
 }
 
@@ -202,53 +197,41 @@ const authHeaders = (idToken: string) => ({
   "User-Agent": UA,
 });
 
-async function firestoreGetDoc(path: string, idToken: string): Promise<{ ok: true; data: FirestoreDocument } | { ok: false; status: number; body?: string }> {
-  const res = await fetch(`${FIRESTORE_BASE}/${path}`, { headers: authHeaders(idToken) });
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    return { ok: false, status: res.status, body };
-  }
-  return { ok: true, data: await res.json() as FirestoreDocument };
+// ─── Firestore runQuery (top-level collections with userId filter) ───
+
+interface RunQueryResult {
+  document?: FirestoreDocument;
+  readTime?: string;
 }
 
-async function firestoreList(path: string, idToken: string, pageSize = 100): Promise<{ ok: true; data: FirestoreListResponse } | { ok: false; status: number }> {
-  const url = `${FIRESTORE_BASE}/${path}?pageSize=${pageSize}`;
-  const res = await fetch(url, { headers: authHeaders(idToken) });
-  if (!res.ok) return { ok: false, status: res.status };
-  return { ok: true, data: await res.json() as FirestoreListResponse };
-}
-
-/** List all subcollection IDs under a document using the Firestore REST API. */
-async function firestoreListCollections(docPath: string, idToken: string): Promise<string[]> {
-  const url = `${FIRESTORE_BASE}/${docPath}:listCollectionIds`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { ...authHeaders(idToken), "Content-Type": "application/json" },
-    body: JSON.stringify({}),
-  });
-  if (!res.ok) return [];
-  const data = await res.json() as { collectionIds?: string[] };
-  return data.collectionIds || [];
-}
-
-/** Run a Firestore structured query on a parent path (collectionId-based). */
-async function firestoreRunQuery(
-  parentPath: string,
+/**
+ * Query a top-level Firestore collection filtered by userId.
+ * Uses the Firestore REST runQuery endpoint.
+ * Paginates automatically — returns ALL matching documents.
+ */
+async function firestoreQueryByUserId(
   collectionId: string,
+  userId: string,
   idToken: string,
-  orderBy?: string,
-  limit?: number,
+  orderByField?: string,
 ): Promise<FirestoreDocument[]> {
-  // parentPath: e.g. "users/abc123" — the query runs on parentPath/collectionId
-  const url = `${FIRESTORE_BASE}/${parentPath}:runQuery`;
+  const url = `${FIRESTORE_BASE}:runQuery`;
+
   const structuredQuery: Record<string, unknown> = {
     from: [{ collectionId }],
+    where: {
+      fieldFilter: {
+        field: { fieldPath: "userId" },
+        op: "EQUAL",
+        value: { stringValue: userId },
+      },
+    },
   };
-  if (orderBy) {
-    structuredQuery.orderBy = [{ field: { fieldPath: orderBy }, direction: "DESCENDING" }];
-  }
-  if (limit) {
-    structuredQuery.limit = limit;
+
+  if (orderByField) {
+    structuredQuery.orderBy = [
+      { field: { fieldPath: orderByField }, direction: "DESCENDING" },
+    ];
   }
 
   const res = await fetch(url, {
@@ -256,8 +239,10 @@ async function firestoreRunQuery(
     headers: { ...authHeaders(idToken), "Content-Type": "application/json" },
     body: JSON.stringify({ structuredQuery }),
   });
+
   if (!res.ok) return [];
-  const results = await res.json() as Array<{ document?: FirestoreDocument; readTime?: string }>;
+
+  const results = await res.json() as RunQueryResult[];
   return results.filter(r => r.document).map(r => r.document!);
 }
 
@@ -286,418 +271,119 @@ async function callCloudFunction(
   return { ok: true, result: json.result ?? json };
 }
 
-// ─── Data discovery and fetching ─────────────────────────────────
+// ─── Date helpers ────────────────────────────────────────────────
 
-/** Movement type → sign mapping. Deposits and dividends are positive; withdrawals, fees are negative. */
-function movementSign(type: string): number {
-  const t = type.toLowerCase().trim();
-  // Negative types
-  if (t.includes("retiro") || t.includes("withdrawal") || t.includes("rescate")) return -1;
-  if (t.includes("comisi") || t.includes("fee") || t.includes("commission")) return -1;
-  if (t.includes("compra") || t.includes("purchase") || t.includes("buy")) return -1;
-  // Positive types
-  if (t.includes("dep") || t.includes("deposit") || t.includes("aporte")) return 1;
-  if (t.includes("dividend") || t.includes("dividendo")) return 1;
-  if (t.includes("interest") || t.includes("inter")) return 1;
-  if (t.includes("venta") || t.includes("sell") || t.includes("sale")) return 1;
-  // Default: positive (income)
-  return 1;
-}
-
-/** Human-readable movement type for description. */
-function movementLabel(type: string): string {
-  const t = type.toLowerCase().trim();
-  if (t.includes("retiro") || t.includes("withdrawal") || t.includes("rescate")) return "Retiro";
-  if (t.includes("comisi") || t.includes("fee") || t.includes("commission")) return "Comision";
-  if (t.includes("dep") || t.includes("deposit") || t.includes("aporte")) return "Deposito";
-  if (t.includes("dividend") || t.includes("dividendo")) return "Dividendo";
-  if (t.includes("compra") || t.includes("purchase") || t.includes("buy")) return "Compra";
-  if (t.includes("venta") || t.includes("sell") || t.includes("sale")) return "Venta";
-  if (t.includes("interest") || t.includes("inter")) return "Interes";
-  return type || "Movimiento";
-}
-
-/** Extract a date from various possible field names and formats. */
-function extractDate(obj: Record<string, unknown>): string {
-  const raw = String(
-    obj.date || obj.createdAt || obj.created_at || obj.timestamp ||
-    obj.fecha || obj.executedAt || obj.executed_at || obj.settledAt ||
-    obj.processedAt || obj.transactionDate || obj.created || "",
-  );
+/** Convert a Firestore timestamp or ISO string to dd-mm-yyyy. */
+function toDate(raw: unknown): string {
   if (!raw) return "";
-  // Handle ISO timestamps: 2026-03-27T12:00:00Z → 2026-03-27
-  const isoDate = raw.split("T")[0];
-  // Convert YYYY-MM-DD to DD-MM-YYYY for normalizeDate
+  const s = String(raw);
+  // Handle ISO timestamps: 2026-03-27T12:00:00Z or 2026-03-27T12:00:00.000Z
+  const isoDate = s.split("T")[0];
   const ymdMatch = isoDate.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (ymdMatch) {
     return normalizeDate(`${ymdMatch[3]}-${ymdMatch[2]}-${ymdMatch[1]}`);
   }
-  return normalizeDate(isoDate);
+  return normalizeDate(s);
 }
 
-/** Extract amount from various possible field names. */
-function extractAmount(obj: Record<string, unknown>): number {
-  return Number(
-    obj.amount || obj.monto || obj.value || obj.clpAmount ||
-    obj.clpValue || obj.totalAmount || obj.total || 0,
-  );
-}
+// ─── Collection-specific mappers ─────────────────────────────────
 
-/** Extract movement type from various possible field names. */
-function extractType(obj: Record<string, unknown>): string {
-  return String(
-    obj.type || obj.tipo || obj.movementType || obj.transactionType ||
-    obj.category || obj.operationType || "",
-  );
-}
-
-/** Extract description from various possible field names. */
-function extractDescription(obj: Record<string, unknown>): string {
-  return String(
-    obj.description || obj.desc || obj.descripcion || obj.detail ||
-    obj.detalle || obj.concept || obj.concepto || obj.name || obj.label || "",
-  );
-}
-
-/** Convert a raw object (from Firestore doc or Cloud Function) to a BankMovement. */
-function toMovement(obj: Record<string, unknown>, goalName?: string): BankMovement | null {
-  const date = extractDate(obj);
+/** Map a deposits collection document to a BankMovement. */
+function mapDeposit(obj: Record<string, unknown>): BankMovement | null {
+  const date = toDate(obj.createdAt);
   if (!date) return null;
 
-  const rawAmount = extractAmount(obj);
+  const rawAmount = Number(obj.amount || 0);
   if (rawAmount === 0) return null;
 
-  const type = extractType(obj);
-  const sign = movementSign(type);
-  const amount = sign * Math.abs(Math.round(rawAmount));
-
-  const desc = extractDescription(obj);
-  const label = movementLabel(type);
-  const description = desc
-    ? (goalName ? `${label} - ${desc} (${goalName})` : `${label} - ${desc}`)
-    : (goalName ? `${label} (${goalName})` : label);
+  const isBuy = obj.isBuy === true;
+  const description = isBuy ? "Compra" : "Deposito";
 
   return {
     date,
     description,
-    amount,
+    amount: Math.abs(Math.round(rawAmount)),
     balance: 0,
     source: MOVEMENT_SOURCE.account,
   };
 }
 
-// ─── Strategy 1: Cloud Functions ─────────────────────────────────
+/** Map a withdrawals collection document to a BankMovement. */
+function mapWithdrawal(obj: Record<string, unknown>): BankMovement | null {
+  // withdrawals use executionDate as primary date field
+  const date = toDate(obj.executionDate || obj.createdAt);
+  if (!date) return null;
 
-/** Try to fetch movements via Firebase Cloud Functions. */
-async function tryCloudFunctions(
-  userId: string,
-  idToken: string,
-  debugLog: string[],
-): Promise<{ movements: BankMovement[]; goals: RacionalGoal[] } | null> {
-  debugLog.push("3a. Trying Cloud Functions...");
+  // Withdrawals may store amount in executedShareVariations or as a direct amount
+  let rawAmount = 0;
 
-  // Common Cloud Function names for Racional (Ionic/Angular + DriveWealth pattern)
-  const movementFnCandidates = [
-    "getMovements", "getTransactions", "getUserMovements", "getUserTransactions",
-    "movements", "transactions", "getActivity", "getHistory",
-    "api-getMovements", "api-getTransactions", "api/getMovements",
-    "getAccountActivity", "getPortfolioMovements",
-  ];
-  const portfolioFnCandidates = [
-    "getPortfolio", "getUserPortfolio", "getGoals", "getUserGoals",
-    "portfolio", "goals", "getAccounts", "getPositions",
-    "api-getPortfolio", "api-getGoals", "api/getPortfolio",
-    "getAccountSummary", "getDashboard", "getSummary",
-  ];
-
-  const movements: BankMovement[] = [];
-  const goals: RacionalGoal[] = [];
-
-  // Try portfolio Cloud Functions
-  for (const fn of portfolioFnCandidates) {
-    const res = await callCloudFunction(fn, { userId }, idToken);
-    if (res.ok && res.result) {
-      debugLog.push(`  Cloud Function ${fn} responded OK`);
-      const result = res.result as Record<string, unknown>;
-      // Try to extract goals/portfolio from the response
-      const items = (Array.isArray(result) ? result : result.goals || result.portfolio || result.accounts || result.data || result.items || []) as Record<string, unknown>[];
-      if (Array.isArray(items) && items.length > 0) {
-        for (const item of items) {
-          const name = String(item.name || item.title || item.label || "Meta");
-          const value = Number(item.value || item.balance || item.nav || item.clpValue || item.totalValue || item.amount || 0);
-          const id = String(item.id || item.goalId || "");
-          goals.push({ id, name, value: Math.round(value) });
-        }
-        debugLog.push(`  Found ${goals.length} goal(s) via Cloud Function ${fn}`);
-        break;
-      }
+  // Try executedShareVariations first — it's an array of share variation objects
+  const variations = obj.executedShareVariations;
+  if (Array.isArray(variations) && variations.length > 0) {
+    for (const v of variations) {
+      const varObj = v as Record<string, unknown>;
+      rawAmount += Number(varObj.amount || varObj.clpAmount || varObj.value || 0);
     }
   }
 
-  // Try movement Cloud Functions
-  for (const fn of movementFnCandidates) {
-    const res = await callCloudFunction(fn, { userId }, idToken);
-    if (res.ok && res.result) {
-      debugLog.push(`  Cloud Function ${fn} responded OK`);
-      const result = res.result as Record<string, unknown>;
-      const items = (Array.isArray(result) ? result : result.movements || result.transactions || result.activity || result.data || result.items || result.history || []) as Record<string, unknown>[];
-      if (Array.isArray(items) && items.length > 0) {
-        for (const item of items) {
-          const mv = toMovement(item);
-          if (mv) movements.push(mv);
-        }
-        debugLog.push(`  Found ${movements.length} movement(s) via Cloud Function ${fn}`);
-        break;
-      }
-    }
+  if (rawAmount === 0) {
+    rawAmount = Number(obj.amount || obj.clpAmount || obj.value || obj.totalAmount || 0);
   }
 
-  if (movements.length > 0 || goals.length > 0) {
-    return { movements, goals };
-  }
-  debugLog.push("  No data from Cloud Functions");
-  return null;
+  if (rawAmount === 0) return null;
+
+  const isSell = obj.isSell === true;
+  const description = isSell ? "Venta" : "Retiro";
+
+  return {
+    date,
+    description,
+    amount: -Math.abs(Math.round(rawAmount)),
+    balance: 0,
+    source: MOVEMENT_SOURCE.account,
+  };
 }
 
-// ─── Strategy 2: Firestore subcollection discovery ───────────────
+/** Map a contributions collection document to a BankMovement. */
+function mapContribution(obj: Record<string, unknown>): BankMovement | null {
+  const date = toDate(obj.createdAt || obj.date || obj.executionDate);
+  if (!date) return null;
 
-/** Discover the actual Firestore subcollection structure via listCollectionIds. */
-async function discoverFirestoreStructure(
-  userId: string,
-  idToken: string,
-  debugLog: string[],
-): Promise<{ movements: BankMovement[]; goals: RacionalGoal[]; balance: number }> {
-  debugLog.push("3b. Discovering Firestore structure...");
+  const rawAmount = Number(obj.amount || obj.clpAmount || obj.value || 0);
+  if (rawAmount === 0) return null;
 
-  const userBase = `users/${userId}`;
-  const movements: BankMovement[] = [];
-  const goals: RacionalGoal[] = [];
-  let balance = 0;
+  // Determine type: dividends are positive, commissions are negative
+  const type = String(obj.type || obj.contributionType || obj.category || "").toLowerCase();
 
-  // Step 1: Read the user document
-  const userDocRes = await firestoreGetDoc(userBase, idToken);
-  let userObj: Record<string, unknown> = {};
-  if (userDocRes.ok) {
-    userObj = docToObject(userDocRes.data);
-    const fields = Object.keys(userDocRes.data.fields || {});
-    debugLog.push(`  User doc fields (${fields.length}): ${fields.slice(0, 20).join(", ")}${fields.length > 20 ? "..." : ""}`);
+  let description: string;
+  let sign: number;
 
-    // Check for embedded portfolio/balance data in the user document
-    balance = Number(
-      userObj.balance || userObj.totalBalance || userObj.clpBalance ||
-      userObj.portfolioValue || userObj.totalValue || userObj.total || 0,
-    );
-    if (balance > 0) {
-      debugLog.push(`  Direct balance in user doc: $${Math.round(balance).toLocaleString("es-CL")}`);
-    }
-
-    // Look for embedded goals array in user doc
-    const goalsArray = (userObj.goals || userObj.portfolio || userObj.accounts || userObj.metas) as Record<string, unknown>[] | undefined;
-    if (Array.isArray(goalsArray)) {
-      for (const g of goalsArray) {
-        const name = String(g.name || g.title || g.label || "Meta");
-        const value = Number(g.value || g.balance || g.nav || g.clpValue || g.totalValue || g.amount || 0);
-        const id = String(g.id || g.goalId || "");
-        if (name) goals.push({ id, name, value: Math.round(value) });
-      }
-      if (goals.length > 0) {
-        debugLog.push(`  Found ${goals.length} embedded goal(s) in user doc`);
-      }
-    }
-
-    // Look for embedded movements in user doc
-    const movArray = (userObj.movements || userObj.transactions || userObj.activity || userObj.history) as Record<string, unknown>[] | undefined;
-    if (Array.isArray(movArray)) {
-      for (const item of movArray) {
-        const mv = toMovement(item);
-        if (mv) movements.push(mv);
-      }
-      if (movements.length > 0) {
-        debugLog.push(`  Found ${movements.length} embedded movement(s) in user doc`);
-      }
-    }
+  if (type.includes("comisi") || type.includes("fee") || type.includes("commission")) {
+    description = "Comision";
+    sign = -1;
+  } else if (type.includes("dividend") || type.includes("dividendo")) {
+    description = "Dividendo";
+    sign = 1;
+  } else if (type.includes("inter") || type.includes("interest")) {
+    description = "Interes";
+    sign = 1;
+  } else if (type.includes("tax") || type.includes("impuesto")) {
+    description = "Impuesto";
+    sign = -1;
   } else {
-    debugLog.push(`  User doc read failed: ${userDocRes.status}`);
+    // Default: positive (income). Most contributions are dividends.
+    description = type || "Contribucion";
+    // If amount is already negative in the source, respect that
+    sign = rawAmount < 0 ? -1 : 1;
   }
 
-  // Step 2: Discover subcollections via listCollectionIds
-  const subcollections = await firestoreListCollections(userBase, idToken);
-  debugLog.push(`  Subcollections under user doc: ${subcollections.length > 0 ? subcollections.join(", ") : "(none)"}`);
-
-  // Step 3: Try each subcollection
-  for (const col of subcollections) {
-    const colLower = col.toLowerCase();
-    const listRes = await firestoreList(`${userBase}/${col}`, idToken, 200);
-    if (!listRes.ok || !listRes.data.documents) continue;
-
-    const docs = listRes.data.documents;
-    debugLog.push(`  Collection "${col}": ${docs.length} doc(s)`);
-
-    // Detect if this collection contains goals/portfolio or movements
-    if (colLower.includes("goal") || colLower.includes("meta") || colLower.includes("portfolio") || colLower.includes("account") || colLower.includes("investment") || colLower.includes("objective")) {
-      // Parse as goals
-      for (const doc of docs) {
-        const obj = docToObject(doc);
-        const name = String(obj.name || obj.title || obj.label || obj.goalName || doc.name.split("/").pop() || "Meta");
-        const value = Number(obj.value || obj.balance || obj.nav || obj.clpValue || obj.totalValue || obj.amount || obj.total || 0);
-        const id = doc.name.split("/").pop() || "";
-        goals.push({ id, name, value: Math.round(value) });
-
-        // Look for nested movements under each goal
-        const goalSubcollections = await firestoreListCollections(`${userBase}/${col}/${id}`, idToken);
-        if (goalSubcollections.length > 0) {
-          debugLog.push(`    Goal "${name}" subcollections: ${goalSubcollections.join(", ")}`);
-        }
-        for (const subCol of goalSubcollections) {
-          const subLower = subCol.toLowerCase();
-          if (subLower.includes("mov") || subLower.includes("trans") || subLower.includes("activ") || subLower.includes("hist") || subLower.includes("oper")) {
-            const subListRes = await firestoreList(`${userBase}/${col}/${id}/${subCol}`, idToken, 200);
-            if (subListRes.ok && subListRes.data.documents) {
-              for (const mvDoc of subListRes.data.documents) {
-                const mv = toMovement(docToObject(mvDoc), name);
-                if (mv) movements.push(mv);
-              }
-              debugLog.push(`    Found ${subListRes.data.documents.length} doc(s) in ${col}/${id}/${subCol}`);
-            }
-          }
-        }
-      }
-    } else if (colLower.includes("mov") || colLower.includes("trans") || colLower.includes("activ") || colLower.includes("hist") || colLower.includes("oper") || colLower.includes("transfer") || colLower.includes("deposit") || colLower.includes("withdraw")) {
-      // Parse as movements
-      for (const doc of docs) {
-        const mv = toMovement(docToObject(doc));
-        if (mv) movements.push(mv);
-      }
-      debugLog.push(`  Parsed ${movements.length} movement(s) from "${col}"`);
-    } else {
-      // Unknown collection — log first doc fields for debugging
-      if (docs.length > 0) {
-        const sampleFields = Object.keys(docs[0].fields || {});
-        debugLog.push(`    Sample fields: ${sampleFields.join(", ")}`);
-      }
-    }
-  }
-
-  // Step 4: If no subcollections found, try well-known paths directly
-  if (subcollections.length === 0) {
-    debugLog.push("  No subcollections found via listCollectionIds — trying known paths...");
-
-    const knownGoalPaths = ["goals", "metas", "objectives", "portfolios", "accounts", "investments"];
-    const knownMovPaths = ["movements", "transactions", "activity", "operations", "history", "transfers"];
-
-    for (const col of knownGoalPaths) {
-      const listRes = await firestoreList(`${userBase}/${col}`, idToken);
-      if (listRes.ok && listRes.data.documents && listRes.data.documents.length > 0) {
-        debugLog.push(`  Found goals at ${userBase}/${col} (${listRes.data.documents.length} doc(s))`);
-        for (const doc of listRes.data.documents) {
-          const obj = docToObject(doc);
-          const name = String(obj.name || obj.title || obj.label || doc.name.split("/").pop() || "Meta");
-          const value = Number(obj.value || obj.balance || obj.nav || obj.clpValue || obj.totalValue || obj.amount || 0);
-          const id = doc.name.split("/").pop() || "";
-          goals.push({ id, name, value: Math.round(value) });
-
-          // Probe for nested movements under each goal
-          for (const movCol of knownMovPaths) {
-            const nestedRes = await firestoreList(`${userBase}/${col}/${id}/${movCol}`, idToken);
-            if (nestedRes.ok && nestedRes.data.documents && nestedRes.data.documents.length > 0) {
-              debugLog.push(`  Found movements at goals/${id}/${movCol} (${nestedRes.data.documents.length} doc(s))`);
-              for (const mvDoc of nestedRes.data.documents) {
-                const mv = toMovement(docToObject(mvDoc), name);
-                if (mv) movements.push(mv);
-              }
-            }
-          }
-        }
-        break;
-      }
-    }
-
-    // Also try top-level movement collections
-    if (movements.length === 0) {
-      for (const col of knownMovPaths) {
-        const listRes = await firestoreList(`${userBase}/${col}`, idToken);
-        if (listRes.ok && listRes.data.documents && listRes.data.documents.length > 0) {
-          debugLog.push(`  Found movements at ${userBase}/${col} (${listRes.data.documents.length} doc(s))`);
-          for (const doc of listRes.data.documents) {
-            const mv = toMovement(docToObject(doc));
-            if (mv) movements.push(mv);
-          }
-          break;
-        }
-      }
-    }
-  }
-
-  // Step 5: Try Firestore runQuery to find movements in collection groups
-  if (movements.length === 0) {
-    debugLog.push("  Trying Firestore runQuery (collection group)...");
-    const queryCollections = ["movements", "transactions", "activity", "operations"];
-    for (const col of queryCollections) {
-      const queryDocs = await firestoreRunQuery(userBase, col, idToken, "date", 100);
-      if (queryDocs.length > 0) {
-        debugLog.push(`  runQuery found ${queryDocs.length} doc(s) in "${col}"`);
-        for (const doc of queryDocs) {
-          const mv = toMovement(docToObject(doc));
-          if (mv) movements.push(mv);
-        }
-        break;
-      }
-    }
-  }
-
-  // Compute balance from goals if not found directly
-  if (!balance && goals.length > 0) {
-    balance = goals.reduce((sum, g) => sum + g.value, 0);
-  }
-
-  return { movements, goals, balance };
-}
-
-// ─── Strategy 3: Explore user doc for goal references ────────────
-
-/** Extract goal data from the user document and follow references. */
-async function extractGoalsFromUserDoc(
-  userObj: Record<string, unknown>,
-  userId: string,
-  idToken: string,
-  debugLog: string[],
-): Promise<{ goals: RacionalGoal[]; movements: BankMovement[] }> {
-  const goals: RacionalGoal[] = [];
-  const movements: BankMovement[] = [];
-
-  // Look for map fields that might be goals (e.g., userDoc has goal configs as map values)
-  for (const [key, val] of Object.entries(userObj)) {
-    if (val && typeof val === "object" && !Array.isArray(val)) {
-      const obj = val as Record<string, unknown>;
-      // Check if this looks like a goal config
-      if (obj.name || obj.title || obj.label || obj.goalName) {
-        const name = String(obj.name || obj.title || obj.label || obj.goalName || key);
-        const value = Number(obj.value || obj.balance || obj.nav || obj.clpValue || obj.totalValue || obj.amount || 0);
-        const goalId = String(obj.id || obj.goalId || obj.driveWealthAccountId || key);
-
-        if (name && name !== "null" && name !== "undefined") {
-          goals.push({ id: goalId, name, value: Math.round(value) });
-          debugLog.push(`  Goal from user doc field "${key}": ${name} = $${Math.round(value).toLocaleString("es-CL")}`);
-
-          // Try to read movements under this goal reference
-          if (goalId) {
-            for (const movCol of ["movements", "transactions", "activity"]) {
-              const nestedRes = await firestoreList(`users/${userId}/goals/${goalId}/${movCol}`, idToken);
-              if (nestedRes.ok && nestedRes.data.documents && nestedRes.data.documents.length > 0) {
-                for (const mvDoc of nestedRes.data.documents) {
-                  const mv = toMovement(docToObject(mvDoc), name);
-                  if (mv) movements.push(mv);
-                }
-                debugLog.push(`  Found ${nestedRes.data.documents.length} movement(s) under goals/${goalId}/${movCol}`);
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-
-  return { goals, movements };
+  return {
+    date,
+    description,
+    amount: sign * Math.abs(Math.round(rawAmount)),
+    balance: 0,
+    source: MOVEMENT_SOURCE.account,
+  };
 }
 
 // ─── Main scrape function ────────────────────────────────────────
@@ -709,7 +395,7 @@ async function scrapeRacional(options: ScraperOptions, debugLog: string[]): Prom
 
   progress("Conectando con Racional...");
 
-  // Firebase Auth: email + password → idToken
+  // ── Step 1: Firebase Auth ──
   const authResult = await firebaseSignIn(email, password, debugLog);
   if (!authResult.success) {
     return { success: false, bank, movements: [], error: authResult.error, debug: debugLog.join("\n") };
@@ -717,72 +403,140 @@ async function scrapeRacional(options: ScraperOptions, debugLog: string[]): Prom
   const { idToken, refreshToken, localId } = authResult;
 
   progress("Sesion iniciada correctamente");
-  debugLog.push("2. Fetching data...");
+  debugLog.push("2. Fetching data from Firestore top-level collections...");
 
-  // Strategy 1: Try Cloud Functions (likely endpoint for movements)
-  let allMovements: BankMovement[] = [];
-  let goals: RacionalGoal[] = [];
+  // ── Step 2: Fetch goals (portfolio names) ──
+  const goals: RacionalGoal[] = [];
+  try {
+    const goalDocs = await firestoreQueryByUserId("goals", localId, idToken, "createdAt");
+    debugLog.push(`  goals: ${goalDocs.length} document(s)`);
+    for (const doc of goalDocs) {
+      const obj = docToObject(doc);
+      const name = String(obj.name || obj.title || obj.label || "Meta");
+      const id = String(obj._docId || "");
+      const portfolioId = obj.portfolioId ? String(obj.portfolioId) : undefined;
+      const value = Number(obj.value || obj.balance || obj.clpValue || obj.totalValue || 0);
+      goals.push({ id, name, portfolioId, value: Math.round(value) });
+      debugLog.push(`    Goal: "${name}" (id=${id}, portfolioId=${portfolioId || "none"})`);
+    }
+  } catch (e) {
+    debugLog.push(`  goals query failed: ${e}`);
+  }
+
+  progress("Obteniendo movimientos...");
+
+  // ── Step 3: Fetch deposits (all history) ──
+  const allMovements: BankMovement[] = [];
+
+  try {
+    const depositDocs = await firestoreQueryByUserId("deposits", localId, idToken, "createdAt");
+    debugLog.push(`  deposits: ${depositDocs.length} document(s)`);
+    let depositCount = 0;
+    for (const doc of depositDocs) {
+      const mv = mapDeposit(docToObject(doc));
+      if (mv) {
+        allMovements.push(mv);
+        depositCount++;
+      }
+    }
+    debugLog.push(`    Mapped ${depositCount} deposit movement(s)`);
+  } catch (e) {
+    debugLog.push(`  deposits query failed: ${e}`);
+  }
+
+  // ── Step 4: Fetch withdrawals (all history) ──
+  try {
+    const withdrawalDocs = await firestoreQueryByUserId("withdrawals", localId, idToken, "executionDate");
+    debugLog.push(`  withdrawals: ${withdrawalDocs.length} document(s)`);
+    let withdrawalCount = 0;
+    for (const doc of withdrawalDocs) {
+      const mv = mapWithdrawal(docToObject(doc));
+      if (mv) {
+        allMovements.push(mv);
+        withdrawalCount++;
+      }
+    }
+    debugLog.push(`    Mapped ${withdrawalCount} withdrawal movement(s)`);
+  } catch (e) {
+    debugLog.push(`  withdrawals query failed: ${e}`);
+  }
+
+  // ── Step 5: Fetch contributions (dividends, commissions, etc.) ──
+  try {
+    const contribDocs = await firestoreQueryByUserId("contributions", localId, idToken, "createdAt");
+    debugLog.push(`  contributions: ${contribDocs.length} document(s)`);
+    let contribCount = 0;
+    for (const doc of contribDocs) {
+      const mv = mapContribution(docToObject(doc));
+      if (mv) {
+        allMovements.push(mv);
+        contribCount++;
+      }
+    }
+    debugLog.push(`    Mapped ${contribCount} contribution movement(s)`);
+  } catch (e) {
+    debugLog.push(`  contributions query failed: ${e}`);
+  }
+
+  // ── Step 6: Try DrivewealthAccountSummary for balance data ──
   let balance = 0;
 
-  const cfResult = await tryCloudFunctions(localId, idToken, debugLog);
-  if (cfResult) {
-    allMovements = cfResult.movements;
-    goals = cfResult.goals;
-    balance = goals.reduce((sum, g) => sum + g.value, 0);
-  }
-
-  // Strategy 2: Discover Firestore structure (subcollections, nested paths)
-  if (allMovements.length === 0) {
-    progress("Buscando datos en Firestore...");
-    const fsResult = await discoverFirestoreStructure(localId, idToken, debugLog);
-    if (fsResult.movements.length > 0 || fsResult.goals.length > 0) {
-      allMovements = fsResult.movements;
-      if (fsResult.goals.length > 0) goals = fsResult.goals;
-      if (fsResult.balance > 0) balance = fsResult.balance;
+  try {
+    debugLog.push("3. Calling DrivewealthAccountSummary...");
+    const summaryRes = await callCloudFunction("DrivewealthAccountSummary", {}, idToken);
+    if (summaryRes.ok && summaryRes.result) {
+      const result = summaryRes.result as Record<string, unknown>;
+      // Extract cash balance or total equity from the summary
+      const equity = Number(
+        result.equity || result.totalEquity || result.accountBalance ||
+        result.cashBalance || result.cash || result.balance || result.total || 0,
+      );
+      if (equity > 0) {
+        balance = Math.round(equity);
+        debugLog.push(`  Account summary balance: $${balance.toLocaleString("es-CL")}`);
+      } else {
+        debugLog.push(`  Account summary returned but no balance extracted. Keys: ${Object.keys(result).join(", ")}`);
+      }
+    } else if (!summaryRes.ok) {
+      debugLog.push(`  DrivewealthAccountSummary failed: HTTP ${summaryRes.status}`);
     }
+  } catch (e) {
+    debugLog.push(`  DrivewealthAccountSummary error: ${e}`);
   }
 
-  // Strategy 3: Deep-inspect user doc fields for goal references
-  if (allMovements.length === 0 && goals.length === 0) {
-    debugLog.push("3c. Deep-inspecting user doc for goal references...");
-    const userDocRes = await firestoreGetDoc(`users/${localId}`, idToken);
-    if (userDocRes.ok) {
-      const userObj = docToObject(userDocRes.data);
-      const deepResult = await extractGoalsFromUserDoc(userObj, localId, idToken, debugLog);
-      if (deepResult.goals.length > 0) goals = deepResult.goals;
-      if (deepResult.movements.length > 0) allMovements = deepResult.movements;
-    }
-  }
-
-  // Compute balance from goals if not set
+  // Fall back: compute balance from goal values
   if (!balance && goals.length > 0) {
     balance = goals.reduce((sum, g) => sum + g.value, 0);
-    debugLog.push(`  Computed balance from ${goals.length} goal(s): $${Math.round(balance).toLocaleString("es-CL")}`);
+    if (balance > 0) {
+      debugLog.push(`  Computed balance from ${goals.length} goal(s): $${Math.round(balance).toLocaleString("es-CL")}`);
+    }
   }
 
-  // Fallback: if we found goals but no movements, create portfolio snapshots
+  // ── Step 7: Fallback — if no movements, create snapshots from goals ──
   if (allMovements.length === 0 && goals.length > 0) {
-    debugLog.push("  No movement history found — creating portfolio balance snapshots from goals");
+    debugLog.push("  No movement history found - creating portfolio balance snapshots from goals");
     const today = new Date();
     const dd = String(today.getDate()).padStart(2, "0");
     const mm = String(today.getMonth() + 1).padStart(2, "0");
     const yyyy = today.getFullYear();
     const dateStr = `${dd}-${mm}-${yyyy}`;
 
-    allMovements = goals
-      .filter(g => g.value > 0)
-      .map(g => ({
-        date: dateStr,
-        description: `${g.name} (${g.id})`,
-        amount: g.value,
-        balance: g.value,
-        source: MOVEMENT_SOURCE.account as typeof MOVEMENT_SOURCE.account,
-      }));
+    for (const g of goals) {
+      if (g.value > 0) {
+        allMovements.push({
+          date: dateStr,
+          description: `${g.name} (${g.id})`,
+          amount: g.value,
+          balance: g.value,
+          source: MOVEMENT_SOURCE.account as typeof MOVEMENT_SOURCE.account,
+        });
+      }
+    }
   }
 
   const deduplicated = deduplicateMovements(allMovements);
-  debugLog.push(`6. Total: ${deduplicated.length} unique movement(s)`);
-  progress(`Listo — ${deduplicated.length} movimientos totales`);
+  debugLog.push(`4. Total: ${deduplicated.length} unique movement(s)`);
+  progress(`Listo - ${deduplicated.length} movimientos totales`);
 
   // Persist tokens for next run
   const sessionCookies = JSON.stringify({ idToken, refreshToken, localId });
