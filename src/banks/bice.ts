@@ -1,23 +1,33 @@
 import type { BankMovement, BankScraper, ScrapeResult, ScraperOptions } from "../types.js";
 import { MOVEMENT_SOURCE } from "../types.js";
-import { normalizeDate, deduplicateMovements } from "../utils.js";
+import { formatRut, normalizeDate, deduplicateMovements } from "../utils.js";
 import { runApiScraper } from "../infrastructure/api-runner.js";
 
 // ─── BICE constants ─────────────────────────────────────────────
 //
-// Auth: Keycloak OIDC at auth.bice.cl/auth/realms/personas
-// Flow: GET portal → redirect to Keycloak → parse <form action="..."> → POST credentials
-//       → follow redirect chain back to portal with session cookies
-// Data: REST API at portalpersonas.bice.cl (endpoints are best-guess, needs discovery)
+// Auth: Keycloak OIDC at auth.bice.cl/realms/personas
+// Gateway: gw.bice.cl (OAuth agent proxy + BFF endpoints)
+//
+// Flow:
+//   1. GET portalpersonas.bice.cl → redirect to Keycloak → parse <form action> → POST creds
+//   2. Keycloak redirects back with auth code in URL
+//   3. POST gw.bice.cl/oauth-agent-personas/login/start → initiate OAuth agent session
+//   4. POST gw.bice.cl/oauth-agent-personas/login/end → complete session, get cookies
+//   5. Use session cookies to call BFF endpoints on gw.bice.cl
 //
 // No browser needed — this scraper uses fetch() exclusively.
 
 const PORTAL_URL = "https://portalpersonas.bice.cl";
-const API_BASE = "https://portalpersonas.bice.cl/api";
+const GW_BASE = "https://gw.bice.cl";
+const OAUTH_AGENT = `${GW_BASE}/oauth-agent-personas`;
+const BFF_PRODUCTS = `${GW_BASE}/portalpersonas/bff-portal-hbp/v1/products`;
+const BFF_BALANCE = `${GW_BASE}/portalpersonas/bff-checking-account-transactions-100/v1/balance`;
+const BFF_TRANSACTIONS = `${GW_BASE}/portalpersonas/bff-checking-account-transactions-100/v1/transactions`;
 
-const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const UA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
-// ─── Cookie jar ──────────────────────────────────────────────────
+// ─── Cookie jar (domain-aware) ──────────────────────────────────
 
 interface CookieJar {
   cookies: Map<string, string>;
@@ -33,14 +43,20 @@ function createCookieJar(): CookieJar {
     set(raw: string) {
       const [nameValue] = raw.split(";");
       const eqIdx = nameValue.indexOf("=");
-      if (eqIdx > 0) cookies.set(nameValue.slice(0, eqIdx).trim(), nameValue.slice(eqIdx + 1).trim());
+      if (eqIdx > 0)
+        cookies.set(
+          nameValue.slice(0, eqIdx).trim(),
+          nameValue.slice(eqIdx + 1).trim(),
+        );
     },
     setAll(headers: Headers) {
       const setCookies = headers.getSetCookie?.() ?? [];
       for (const raw of setCookies) this.set(raw);
     },
     header() {
-      return Array.from(cookies.entries()).map(([k, v]) => `${k}=${v}`).join("; ");
+      return Array.from(cookies.entries())
+        .map(([k, v]) => `${k}=${v}`)
+        .join("; ");
     },
   };
 }
@@ -49,26 +65,34 @@ function createCookieJar(): CookieJar {
 
 /** Extract the Keycloak form action URL from the login page HTML */
 function parseKeycloakFormAction(html: string): string | null {
-  // Keycloak login form: <form id="kc-form-login" action="https://auth.bice.cl/auth/realms/...">
-  const match = html.match(/<form[^>]*id=["']kc-form-login["'][^>]*action=["']([^"']+)["']/i)
-    || html.match(/<form[^>]*action=["']([^"']+)["'][^>]*id=["']kc-form-login["']/i);
+  const match =
+    html.match(
+      /<form[^>]*id=["']kc-form-login["'][^>]*action=["']([^"']+)["']/i,
+    ) ||
+    html.match(
+      /<form[^>]*action=["']([^"']+)["'][^>]*id=["']kc-form-login["']/i,
+    );
   if (match) return match[1].replace(/&amp;/g, "&");
   // Fallback: any form with action containing auth.bice.cl
-  const fallback = html.match(/<form[^>]*action=["'](https?:\/\/auth\.bice\.cl[^"']+)["']/i);
+  const fallback = html.match(
+    /<form[^>]*action=["'](https?:\/\/auth\.bice\.cl[^"']+)["']/i,
+  );
   if (fallback) return fallback[1].replace(/&amp;/g, "&");
   return null;
 }
 
 /** Check if the HTML contains Keycloak error/feedback messages */
 function parseKeycloakError(html: string): string | null {
-  // Standard Keycloak error span
-  const errorMatch = html.match(/<span[^>]*class=["'][^"']*kc-feedback-text[^"']*["'][^>]*>([\s\S]*?)<\/span>/i);
+  const errorMatch = html.match(
+    /<span[^>]*class=["'][^"']*kc-feedback-text[^"']*["'][^>]*>([\s\S]*?)<\/span>/i,
+  );
   if (errorMatch) {
     const text = errorMatch[1].replace(/<[^>]+>/g, "").trim();
     if (text) return text;
   }
-  // Alert div
-  const alertMatch = html.match(/<div[^>]*class=["'][^"']*alert[^"']*["'][^>]*>([\s\S]*?)<\/div>/i);
+  const alertMatch = html.match(
+    /<div[^>]*class=["'][^"']*alert[^"']*["'][^>]*>([\s\S]*?)<\/div>/i,
+  );
   if (alertMatch) {
     const text = alertMatch[1].replace(/<[^>]+>/g, "").trim();
     if (text) return text;
@@ -79,61 +103,93 @@ function parseKeycloakError(html: string): string | null {
 /** Detect 2FA indicators in Keycloak page */
 function is2FAPage(html: string): boolean {
   const lower = html.toLowerCase();
-  return lower.includes("otp") ||
+  return (
+    lower.includes("otp") ||
     lower.includes("two-factor") ||
     lower.includes("segundo factor") ||
     lower.includes("verificaci") ||
     (lower.includes("code") && lower.includes("sms")) ||
     lower.includes("kc-form-otp") ||
-    lower.includes("authenticator");
+    lower.includes("authenticator")
+  );
+}
+
+/** Extract auth code and state from a Keycloak redirect URL */
+function extractAuthParams(url: string): { code: string; state: string } | null {
+  try {
+    const parsed = new URL(url);
+    const code = parsed.searchParams.get("code");
+    const state = parsed.searchParams.get("state");
+    if (code && state) return { code, state };
+    // Also check the hash fragment (some OIDC flows use fragment)
+    if (parsed.hash) {
+      const hashParams = new URLSearchParams(parsed.hash.slice(1));
+      const hCode = hashParams.get("code");
+      const hState = hashParams.get("state");
+      if (hCode && hState) return { code: hCode, state: hState };
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 // ─── Login ───────────────────────────────────────────────────────
 
-async function biceLogin(
+async function biceKeycloakLogin(
   rut: string,
   password: string,
   debugLog: string[],
   onTwoFactorCode?: () => Promise<string>,
-): Promise<{ success: true; jar: CookieJar } | { success: false; error: string }> {
-  const jar = createCookieJar();
+): Promise<
+  | { success: true; portalJar: CookieJar; gwJar: CookieJar }
+  | { success: false; error: string }
+> {
+  const portalJar = createCookieJar(); // Cookies for portalpersonas.bice.cl
+  const gwJar = createCookieJar(); // Cookies for gw.bice.cl
 
-  // Step 1: GET portal — manually follow redirects to collect cookies at each hop
+  // Step 1: GET portal — follow redirects manually to collect cookies and land on Keycloak
   debugLog.push("1. Fetching portal (triggers Keycloak redirect)...");
   let currentUrl: string = PORTAL_URL;
   let loginHtml = "";
   let maxHops = 15;
   while (maxHops-- > 0) {
     const res = await fetch(currentUrl, {
-      headers: { "User-Agent": UA, "Cookie": jar.header() },
+      headers: { "User-Agent": UA, Cookie: portalJar.header() },
       redirect: "manual",
     });
-    jar.setAll(res.headers);
+    portalJar.setAll(res.headers);
     const location = res.headers.get("location");
     if (location) {
-      currentUrl = location.startsWith("http") ? location : new URL(location, currentUrl).href;
-      debugLog.push(`  Redirect: ${currentUrl.slice(0, 80)}...`);
+      currentUrl = location.startsWith("http")
+        ? location
+        : new URL(location, currentUrl).href;
+      debugLog.push(`  Redirect: ${currentUrl.slice(0, 100)}...`);
       continue;
     }
-    // Final destination — read HTML
     loginHtml = await res.text();
-    debugLog.push(`  Landed: ${currentUrl.slice(0, 80)} (${res.status}), cookies: ${jar.cookies.size}`);
+    debugLog.push(
+      `  Landed: ${currentUrl.slice(0, 80)} (${res.status}), cookies: ${portalJar.cookies.size}`,
+    );
     break;
   }
 
-  // Step 2: Parse Keycloak form action URL (contains session code)
+  // Step 2: Parse Keycloak form action
   const formAction = parseKeycloakFormAction(loginHtml);
   if (!formAction) {
     debugLog.push("  ERROR: Could not find Keycloak form action in HTML");
-    return { success: false, error: "No se encontro el formulario de login de Keycloak." };
+    return {
+      success: false,
+      error: "No se encontro el formulario de login de Keycloak.",
+    };
   }
   debugLog.push(`2. Found Keycloak form action: ${formAction.substring(0, 80)}...`);
 
-  // Step 3: POST credentials as form-urlencoded
+  // Step 3: POST credentials — BICE Keycloak expects formatted RUT with dots
   debugLog.push("3. Submitting credentials to Keycloak...");
-  const cleanRut = rut.replace(/[.\-]/g, "");
+  const formattedRut = formatRut(rut);
   const body = new URLSearchParams({
-    username: cleanRut,
+    username: formattedRut,
     password: password,
   });
 
@@ -142,360 +198,702 @@ async function biceLogin(
     headers: {
       "User-Agent": UA,
       "Content-Type": "application/x-www-form-urlencoded",
-      Cookie: jar.header(),
+      Cookie: portalJar.header(),
       Referer: currentUrl,
       Origin: "https://auth.bice.cl",
     },
     body: body.toString(),
     redirect: "manual",
   });
-  jar.setAll(loginRes.headers);
+  portalJar.setAll(loginRes.headers);
 
   const location = loginRes.headers.get("location") || "";
-  debugLog.push(`  Login response: ${loginRes.status}, Location: ${location.substring(0, 80)}`);
+  debugLog.push(
+    `  Login response: ${loginRes.status}, Location: ${location.substring(0, 100)}`,
+  );
 
   // Status 200 = Keycloak sent back the login page (credentials wrong or 2FA)
   if (loginRes.status === 200) {
     const responseHtml = await loginRes.text();
 
-    // Check for 2FA
     if (is2FAPage(responseHtml)) {
       debugLog.push("  2FA detected — requesting code...");
       if (!onTwoFactorCode) {
-        return { success: false, error: "Se requiere codigo 2FA pero no hay callback configurado." };
+        return {
+          success: false,
+          error: "Se requiere codigo 2FA pero no hay callback configurado.",
+        };
       }
 
       const code = await onTwoFactorCode();
       debugLog.push("  Submitting 2FA code...");
-
-      // Parse 2FA form action (may differ from login form)
       const otpFormAction = parseKeycloakFormAction(responseHtml) || formAction;
-      const otpBody = new URLSearchParams({
-        otp: code,
-      });
+      const otpBody = new URLSearchParams({ otp: code });
 
       const otpRes = await fetch(otpFormAction, {
         method: "POST",
         headers: {
           "User-Agent": UA,
           "Content-Type": "application/x-www-form-urlencoded",
-          Cookie: jar.header(),
+          Cookie: portalJar.header(),
           Referer: currentUrl,
           Origin: "https://auth.bice.cl",
         },
         body: otpBody.toString(),
         redirect: "manual",
       });
-      jar.setAll(otpRes.headers);
+      portalJar.setAll(otpRes.headers);
 
       const otpLocation = otpRes.headers.get("location") || "";
-      debugLog.push(`  2FA response: ${otpRes.status}, Location: ${otpLocation.substring(0, 80)}`);
+      debugLog.push(
+        `  2FA response: ${otpRes.status}, Location: ${otpLocation.substring(0, 100)}`,
+      );
 
       if (otpRes.status === 200) {
         const otpHtml = await otpRes.text();
         const otpError = parseKeycloakError(otpHtml);
-        return { success: false, error: `Error 2FA: ${otpError || "Codigo incorrecto"}` };
+        return {
+          success: false,
+          error: `Error 2FA: ${otpError || "Codigo incorrecto"}`,
+        };
       }
 
-      // Follow redirect chain after 2FA
       if (otpRes.status >= 300 && otpRes.status < 400 && otpLocation) {
-        return await followRedirectChain(jar, otpLocation, debugLog);
+        return await followKeycloakRedirectAndOAuth(
+          portalJar,
+          gwJar,
+          otpLocation,
+          debugLog,
+        );
       }
     }
 
-    // Check for login error
     const loginError = parseKeycloakError(responseHtml);
-    return { success: false, error: `Credenciales incorrectas: ${loginError || "RUT o clave invalida."}` };
+    return {
+      success: false,
+      error: `Credenciales incorrectas: ${loginError || "RUT o clave invalida."}`,
+    };
   }
 
-  // Status 302/303 = success, follow redirect chain
+  // Status 302/303 = success, follow redirect chain and complete OAuth
   if (loginRes.status >= 300 && loginRes.status < 400 && location) {
-    return await followRedirectChain(jar, location, debugLog);
+    return await followKeycloakRedirectAndOAuth(
+      portalJar,
+      gwJar,
+      location,
+      debugLog,
+    );
   }
 
-  return { success: false, error: `Respuesta inesperada de Keycloak: ${loginRes.status}` };
+  return {
+    success: false,
+    error: `Respuesta inesperada de Keycloak: ${loginRes.status}`,
+  };
 }
 
-/** Follow the Keycloak redirect chain back to the portal */
-async function followRedirectChain(
-  jar: CookieJar,
+/**
+ * Follow the Keycloak redirect chain to extract the auth code,
+ * then complete the OAuth agent flow on gw.bice.cl.
+ */
+async function followKeycloakRedirectAndOAuth(
+  portalJar: CookieJar,
+  gwJar: CookieJar,
   initialLocation: string,
   debugLog: string[],
-): Promise<{ success: true; jar: CookieJar } | { success: false; error: string }> {
-  debugLog.push("4. Following redirect chain to portal...");
+): Promise<
+  | { success: true; portalJar: CookieJar; gwJar: CookieJar }
+  | { success: false; error: string }
+> {
+  debugLog.push("4. Following Keycloak redirect chain...");
   let url = initialLocation;
   let hops = 0;
-  const MAX_HOPS = 10;
+  const MAX_HOPS = 15;
+  let authCode: string | null = null;
+  let authState: string | null = null;
 
+  // Follow redirects manually, looking for the auth code in redirect URLs
   while (hops < MAX_HOPS) {
+    // Check if current URL contains the auth code (before following it)
+    const params = extractAuthParams(url);
+    if (params) {
+      authCode = params.code;
+      authState = params.state;
+      debugLog.push(`  Found auth code at hop ${hops + 1}: code=${authCode.substring(0, 20)}..., state=${authState.substring(0, 20)}...`);
+      break;
+    }
+
     const res = await fetch(url, {
-      headers: { "User-Agent": UA, Cookie: jar.header() },
+      headers: { "User-Agent": UA, Cookie: portalJar.header() },
       redirect: "manual",
     });
-    jar.setAll(res.headers);
+    portalJar.setAll(res.headers);
 
     const nextLocation = res.headers.get("location") || "";
-    debugLog.push(`  Hop ${hops + 1}: ${res.status} ${url.substring(0, 60)}...`);
+    debugLog.push(`  Hop ${hops + 1}: ${res.status} ${url.substring(0, 80)}...`);
 
     if (res.status >= 300 && res.status < 400 && nextLocation) {
-      url = nextLocation.startsWith("http") ? nextLocation : new URL(nextLocation, url).href;
+      url = nextLocation.startsWith("http")
+        ? nextLocation
+        : new URL(nextLocation, url).href;
+
+      // Check the redirect target for auth code
+      const redirectParams = extractAuthParams(url);
+      if (redirectParams) {
+        authCode = redirectParams.code;
+        authState = redirectParams.state;
+        debugLog.push(
+          `  Found auth code in redirect: code=${authCode.substring(0, 20)}..., state=${authState.substring(0, 20)}...`,
+        );
+        break;
+      }
+
       hops++;
       continue;
     }
 
-    // We've landed (200 response)
-    if (res.status === 200) {
-      // If we're on the portal, login succeeded
-      if (url.includes("portalpersonas.bice.cl")) {
-        debugLog.push(`5. Login OK! Cookies: ${Array.from(jar.cookies.keys()).join(", ")}`);
-        return { success: true, jar };
-      }
-      // If we're still on auth.bice.cl, something went wrong
-      if (url.includes("auth.bice.cl")) {
-        return { success: false, error: "Redireccion termino en Keycloak — login posiblemente fallido." };
-      }
+    // We landed on a 200 response — check if the final URL has auth params
+    const finalParams = extractAuthParams(url);
+    if (finalParams) {
+      authCode = finalParams.code;
+      authState = finalParams.state;
+      debugLog.push(
+        `  Found auth code in final URL: code=${authCode.substring(0, 20)}...`,
+      );
+      break;
+    }
+
+    // If we landed on the portal without an auth code, the redirect
+    // may have been consumed by the SPA. Try extracting from the URL anyway.
+    if (url.includes("portalpersonas.bice.cl")) {
+      debugLog.push("  Landed on portal — checking URL for auth params...");
     }
 
     break;
   }
 
-  // Final attempt: GET the portal directly with collected cookies
-  debugLog.push("5. Final: GETting portal with session cookies...");
-  const portalRes = await fetch(PORTAL_URL, {
-    headers: { "User-Agent": UA, Cookie: jar.header() },
-    redirect: "follow",
-  });
-  jar.setAll(portalRes.headers);
-
-  if (portalRes.url.includes("auth.bice.cl")) {
-    return { success: false, error: "Sesion no establecida — redirigido de vuelta a Keycloak." };
+  if (!authCode) {
+    // Fallback: try to use the session cookies we collected during the redirect chain
+    // Some Keycloak setups exchange the code server-side via the SPA's redirect handler
+    debugLog.push(
+      "  No auth code found in redirects. Attempting direct OAuth agent flow...",
+    );
+    return await attemptOAuthAgentWithCookies(portalJar, gwJar, url, debugLog);
   }
 
-  debugLog.push(`  Portal OK: ${portalRes.status}, cookies: ${jar.cookies.size}`);
-  return { success: true, jar };
+  // Step 5: Complete OAuth agent flow on gw.bice.cl
+  return await completeOAuthAgent(portalJar, gwJar, authCode, authState ?? "", url, debugLog);
 }
 
-// ─── API helpers ─────────────────────────────────────────────────
+/**
+ * Complete the OAuth agent session using the auth code.
+ * POST login/start with the code, then POST login/end.
+ */
+async function completeOAuthAgent(
+  portalJar: CookieJar,
+  gwJar: CookieJar,
+  authCode: string,
+  authState: string,
+  pageUrl: string,
+  debugLog: string[],
+): Promise<
+  | { success: true; portalJar: CookieJar; gwJar: CookieJar }
+  | { success: false; error: string }
+> {
+  debugLog.push("5. Completing OAuth agent session on gw.bice.cl...");
 
-async function apiGet<T>(jar: CookieJar, path: string): Promise<T> {
-  const url = path.startsWith("http") ? path : `${API_BASE}/${path}`;
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": UA,
-      Accept: "application/json",
-      Cookie: jar.header(),
-      Referer: PORTAL_URL,
-      Origin: "https://portalpersonas.bice.cl",
-    },
-  });
-  jar.setAll(res.headers);
-  if (!res.ok) throw new Error(`API GET ${path} -> ${res.status}`);
-  return res.json() as Promise<T>;
+  // POST login/start — initiates the OAuth agent session
+  try {
+    debugLog.push("  POST oauth-agent-personas/login/start...");
+    const startRes = await fetch(`${OAUTH_AGENT}/login/start`, {
+      method: "POST",
+      headers: {
+        "User-Agent": UA,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        Cookie: gwJar.header(),
+        Origin: PORTAL_URL,
+        Referer: `${PORTAL_URL}/`,
+      },
+      body: JSON.stringify({
+        code: authCode,
+        state: authState,
+      }),
+    });
+    gwJar.setAll(startRes.headers);
+    const startBody = await startRes.text();
+    debugLog.push(
+      `  login/start: ${startRes.status}, cookies: ${gwJar.cookies.size}, body: ${startBody.substring(0, 200)}`,
+    );
+
+    if (!startRes.ok && startRes.status !== 302) {
+      // Try alternative body shapes
+      debugLog.push("  Retrying login/start with pageUrl...");
+      const startRes2 = await fetch(`${OAUTH_AGENT}/login/start`, {
+        method: "POST",
+        headers: {
+          "User-Agent": UA,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          Cookie: gwJar.header(),
+          Origin: PORTAL_URL,
+          Referer: `${PORTAL_URL}/`,
+        },
+        body: JSON.stringify({ pageUrl }),
+      });
+      gwJar.setAll(startRes2.headers);
+      const startBody2 = await startRes2.text();
+      debugLog.push(
+        `  login/start (retry): ${startRes2.status}, body: ${startBody2.substring(0, 200)}`,
+      );
+    }
+  } catch (err) {
+    debugLog.push(
+      `  login/start error: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  // POST login/end — completes the session, sets HTTP-only cookies
+  try {
+    debugLog.push("  POST oauth-agent-personas/login/end...");
+    const endRes = await fetch(`${OAUTH_AGENT}/login/end`, {
+      method: "POST",
+      headers: {
+        "User-Agent": UA,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        Cookie: gwJar.header(),
+        Origin: PORTAL_URL,
+        Referer: `${PORTAL_URL}/`,
+      },
+      body: JSON.stringify({
+        pageUrl,
+      }),
+    });
+    gwJar.setAll(endRes.headers);
+    const endBody = await endRes.text();
+    debugLog.push(
+      `  login/end: ${endRes.status}, cookies: ${gwJar.cookies.size}, body: ${endBody.substring(0, 200)}`,
+    );
+
+    if (!endRes.ok) {
+      return {
+        success: false,
+        error: `OAuth agent login/end falló: ${endRes.status}`,
+      };
+    }
+  } catch (err) {
+    debugLog.push(
+      `  login/end error: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return {
+      success: false,
+      error: `Error en OAuth agent: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
+  // Verify session by fetching userInfo
+  try {
+    debugLog.push("  GET oauth-agent-personas/userInfo...");
+    const userInfoRes = await fetch(`${OAUTH_AGENT}/userInfo`, {
+      headers: {
+        "User-Agent": UA,
+        Accept: "application/json",
+        Cookie: gwJar.header(),
+        Origin: PORTAL_URL,
+        Referer: `${PORTAL_URL}/`,
+      },
+    });
+    gwJar.setAll(userInfoRes.headers);
+    if (userInfoRes.ok) {
+      const userInfo = await userInfoRes.text();
+      debugLog.push(`  userInfo: ${userInfoRes.status}, body: ${userInfo.substring(0, 200)}`);
+    } else {
+      debugLog.push(`  userInfo: ${userInfoRes.status} (non-critical)`);
+    }
+  } catch {
+    debugLog.push("  userInfo: failed (non-critical)");
+  }
+
+  debugLog.push(
+    `6. OAuth agent session established. GW cookies: ${Array.from(gwJar.cookies.keys()).join(", ")}`,
+  );
+  return { success: true, portalJar, gwJar };
 }
 
-async function apiPost<T>(jar: CookieJar, path: string, body: unknown = {}): Promise<T> {
-  const url = path.startsWith("http") ? path : `${API_BASE}/${path}`;
+/**
+ * Fallback: if no auth code was found in the redirect chain,
+ * try the OAuth agent flow using only the session cookies.
+ * The SPA might handle the code exchange client-side.
+ */
+async function attemptOAuthAgentWithCookies(
+  portalJar: CookieJar,
+  gwJar: CookieJar,
+  landingUrl: string,
+  debugLog: string[],
+): Promise<
+  | { success: true; portalJar: CookieJar; gwJar: CookieJar }
+  | { success: false; error: string }
+> {
+  debugLog.push("5. (Fallback) Attempting OAuth agent with session cookies...");
+
+  // The SPA's redirect handler (portalpersonas.bice.cl) may call login/start itself.
+  // We replicate that call. The OAuth agent may accept the URL with code as pageUrl.
+  try {
+    const startRes = await fetch(`${OAUTH_AGENT}/login/start`, {
+      method: "POST",
+      headers: {
+        "User-Agent": UA,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        Cookie: gwJar.header(),
+        Origin: PORTAL_URL,
+        Referer: `${PORTAL_URL}/`,
+      },
+      body: JSON.stringify({ pageUrl: landingUrl }),
+    });
+    gwJar.setAll(startRes.headers);
+    const startBody = await startRes.text();
+    debugLog.push(
+      `  login/start (fallback): ${startRes.status}, body: ${startBody.substring(0, 200)}`,
+    );
+  } catch (err) {
+    debugLog.push(
+      `  login/start (fallback) error: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  // POST login/end
+  try {
+    const endRes = await fetch(`${OAUTH_AGENT}/login/end`, {
+      method: "POST",
+      headers: {
+        "User-Agent": UA,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        Cookie: gwJar.header(),
+        Origin: PORTAL_URL,
+        Referer: `${PORTAL_URL}/`,
+      },
+      body: JSON.stringify({ pageUrl: landingUrl }),
+    });
+    gwJar.setAll(endRes.headers);
+    const endBody = await endRes.text();
+    debugLog.push(
+      `  login/end (fallback): ${endRes.status}, cookies: ${gwJar.cookies.size}, body: ${endBody.substring(0, 200)}`,
+    );
+
+    if (!endRes.ok) {
+      return {
+        success: false,
+        error: `OAuth agent session falló (fallback): ${endRes.status}. Posiblemente el auth code expiró.`,
+      };
+    }
+  } catch (err) {
+    return {
+      success: false,
+      error: `Error en OAuth agent (fallback): ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
+  debugLog.push(
+    `6. OAuth agent session established (fallback). GW cookies: ${Array.from(gwJar.cookies.keys()).join(", ")}`,
+  );
+  return { success: true, portalJar, gwJar };
+}
+
+// ─── BFF API helpers ─────────────────────────────────────────────
+
+async function bffPost<T>(
+  gwJar: CookieJar,
+  url: string,
+  body: unknown = {},
+): Promise<T> {
   const res = await fetch(url, {
     method: "POST",
     headers: {
       "User-Agent": UA,
       "Content-Type": "application/json",
       Accept: "application/json",
-      Cookie: jar.header(),
-      Referer: PORTAL_URL,
-      Origin: "https://portalpersonas.bice.cl",
+      Cookie: gwJar.header(),
+      Origin: PORTAL_URL,
+      Referer: `${PORTAL_URL}/`,
     },
     body: JSON.stringify(body),
   });
-  jar.setAll(res.headers);
-  if (!res.ok) throw new Error(`API POST ${path} -> ${res.status}`);
+  gwJar.setAll(res.headers);
+  if (!res.ok) throw new Error(`BFF POST ${url} -> ${res.status}`);
   return res.json() as Promise<T>;
 }
 
-/** Try multiple candidate URLs, return the first that succeeds */
-async function tryEndpoints<T>(jar: CookieJar, candidates: string[], debugLog: string[]): Promise<T | null> {
-  for (const path of candidates) {
-    try {
-      const result = await apiGet<T>(jar, path);
-      debugLog.push(`    OK: ${path}`);
-      return result;
-    } catch {
-      debugLog.push(`    Skip: ${path}`);
-    }
-  }
-  return null;
+// ─── API response types ──────────────────────────────────────────
+
+interface BiceProduct {
+  id?: string;
+  accountNumber?: string;
+  productType?: string;
+  productName?: string;
+  currency?: string;
+  balance?: number;
+  availableBalance?: number;
+  // Flexible: API shape may vary
+  [key: string]: unknown;
 }
 
-// ─── API response types (best-guess, needs validation with real data) ──
-
-interface BiceAccount {
-  numero?: string;
-  mascara?: string;
-  tipo?: string;
-  moneda?: string;
-  saldo?: number;
-  saldoDisponible?: number;
-  nombre?: string;
-  producto?: string;
-}
-
-interface BiceMovement {
-  fecha?: string;
-  fechaContable?: string;
-  descripcion?: string;
-  glosa?: string;
-  monto?: number;
-  cargo?: number;
-  abono?: number;
-  saldo?: number;
-  tipo?: string;
+interface BiceProductsResponse {
+  products?: BiceProduct[];
+  accounts?: BiceProduct[];
+  data?: BiceProduct[];
+  // Fallback: might be a flat array
+  [key: string]: unknown;
 }
 
 interface BiceBalanceResponse {
+  balance?: number;
+  availableBalance?: number;
   saldo?: number;
   saldoDisponible?: number;
-  saldoContable?: number;
-  disponible?: number;
-  cuentas?: BiceAccount[];
+  // Fallback fields
+  [key: string]: unknown;
 }
 
-interface BiceMovementsResponse {
-  movimientos?: BiceMovement[];
-  transacciones?: BiceMovement[];
-  data?: BiceMovement[];
-  content?: BiceMovement[];
+interface BiceTransaction {
+  date?: string;
+  fecha?: string;
+  transactionDate?: string;
+  description?: string;
+  descripcion?: string;
+  glosa?: string;
+  amount?: number;
+  monto?: number;
+  cargo?: number;
+  abono?: number;
+  balance?: number;
+  saldo?: number;
+  category?: string;
+  tipo?: string;
+  type?: string;
+  [key: string]: unknown;
+}
+
+interface BiceTransactionsResponse {
+  transactions?: BiceTransaction[];
+  movimientos?: BiceTransaction[];
+  data?: BiceTransaction[];
+  content?: BiceTransaction[];
+  // Pagination info
+  totalPages?: number;
+  totalElements?: number;
+  page?: number;
+  hasMore?: boolean;
+  [key: string]: unknown;
 }
 
 // ─── Data extraction ─────────────────────────────────────────────
 
-function biceMovToMovement(mov: BiceMovement): BankMovement | null {
-  const dateStr = mov.fecha || mov.fechaContable || "";
+function biceTransactionToMovement(tx: BiceTransaction): BankMovement | null {
+  // Extract date from various possible field names
+  const dateStr = tx.date || tx.fecha || tx.transactionDate || "";
   if (!dateStr) return null;
 
-  const description = (mov.descripcion || mov.glosa || "").trim();
+  // Extract description
+  const description = (tx.description || tx.descripcion || tx.glosa || "").trim();
   if (!description) return null;
 
+  // Extract amount — BICE uses Cargos (negative) and Abonos (positive)
   let amount: number;
-  if (mov.monto !== undefined) {
-    amount = mov.monto;
-  } else if (mov.cargo !== undefined && mov.cargo > 0) {
-    amount = -Math.abs(mov.cargo);
-  } else if (mov.abono !== undefined && mov.abono > 0) {
-    amount = Math.abs(mov.abono);
+  if (tx.amount !== undefined && tx.amount !== null) {
+    amount = tx.amount;
+  } else if (tx.monto !== undefined && tx.monto !== null) {
+    amount = tx.monto;
+  } else if (tx.cargo !== undefined && Number(tx.cargo) > 0) {
+    amount = -Math.abs(Number(tx.cargo));
+  } else if (tx.abono !== undefined && Number(tx.abono) > 0) {
+    amount = Math.abs(Number(tx.abono));
   } else {
     return null;
   }
 
-  // If type indicates "cargo" (debit), ensure amount is negative
-  if (mov.tipo?.toLowerCase().includes("cargo") && amount > 0) {
+  // If category/type says "Cargos" and amount is positive, flip to negative
+  const category = (tx.category || tx.tipo || tx.type || "").toLowerCase();
+  if (category.includes("cargo") && amount > 0) {
     amount = -amount;
   }
+  // If category says "Abonos" and amount is negative, flip to positive
+  if (category.includes("abono") && amount < 0) {
+    amount = -amount;
+  }
+
+  const balance = tx.balance ?? tx.saldo ?? 0;
 
   return {
     date: normalizeDate(dateStr),
     description,
     amount,
-    balance: mov.saldo ?? 0,
+    balance: typeof balance === "number" ? balance : 0,
     source: MOVEMENT_SOURCE.account,
   };
 }
 
-async function fetchBalance(jar: CookieJar, debugLog: string[]): Promise<number | undefined> {
-  debugLog.push("  Trying balance endpoints...");
+// ─── Data fetching ───────────────────────────────────────────────
 
-  // Candidate balance endpoints (best-guess, will need Chrome DevTools discovery)
-  const balanceCandidates = [
-    "cuentas/saldos",
-    "cuentas/saldo",
-    "productos/cuentas/saldos",
-    "productos/saldos",
-    "saldos",
-    "cuenta-corriente/saldo",
-    "v1/cuentas/saldos",
-    "resumen/saldos",
-    "dashboard/saldos",
-  ];
+async function fetchProducts(
+  gwJar: CookieJar,
+  debugLog: string[],
+): Promise<BiceProduct[]> {
+  debugLog.push("  Fetching products...");
+  try {
+    const res = await bffPost<BiceProductsResponse>(gwJar, BFF_PRODUCTS);
+    const products = res.products || res.accounts || res.data || [];
 
-  const result = await tryEndpoints<BiceBalanceResponse>(jar, balanceCandidates, debugLog);
-  if (!result) return undefined;
+    // If the response is an array at the top level (not wrapped in an object)
+    if (Array.isArray(res)) {
+      debugLog.push(`  Products: ${(res as BiceProduct[]).length} (top-level array)`);
+      return res as BiceProduct[];
+    }
 
-  // Try to extract balance from various response shapes
-  if (result.saldoDisponible !== undefined) return result.saldoDisponible;
-  if (result.saldo !== undefined) return result.saldo;
-  if (result.disponible !== undefined) return result.disponible;
-  if (result.saldoContable !== undefined) return result.saldoContable;
-
-  // If response has an array of accounts, find CLP account
-  if (result.cuentas?.length) {
-    const clp = result.cuentas.find(c => !c.moneda || c.moneda === "CLP");
-    if (clp) return clp.saldoDisponible ?? clp.saldo;
+    debugLog.push(`  Products: ${products.length}`);
+    return products;
+  } catch (err) {
+    debugLog.push(
+      `  Products error: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return [];
   }
-
-  return undefined;
 }
 
-async function fetchMovements(jar: CookieJar, debugLog: string[]): Promise<BankMovement[]> {
-  debugLog.push("  Trying movement endpoints...");
+async function fetchBalance(
+  gwJar: CookieJar,
+  debugLog: string[],
+): Promise<number | undefined> {
+  debugLog.push("  Fetching balance...");
+  try {
+    const res = await bffPost<BiceBalanceResponse>(gwJar, BFF_BALANCE);
+    const balance =
+      res.balance ??
+      res.availableBalance ??
+      res.saldo ??
+      res.saldoDisponible;
+    if (balance !== undefined && typeof balance === "number") {
+      debugLog.push(`  Balance: $${balance.toLocaleString("es-CL")}`);
+      return balance;
+    }
+    debugLog.push(`  Balance response keys: ${Object.keys(res).join(", ")}`);
+    return undefined;
+  } catch (err) {
+    debugLog.push(
+      `  Balance error: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return undefined;
+  }
+}
 
-  // Candidate movement endpoints (best-guess, will need Chrome DevTools discovery)
-  const movementCandidates = [
-    "movimientos",
-    "cuentas/movimientos",
-    "cuenta-corriente/movimientos",
-    "productos/cuentas/movimientos",
-    "v1/movimientos",
-    "cartola/movimientos",
-    "transacciones",
-    "movimientos/ultimos",
-    "dashboard/movimientos",
-  ];
+async function fetchTransactions(
+  gwJar: CookieJar,
+  debugLog: string[],
+): Promise<BankMovement[]> {
+  debugLog.push("  Fetching transactions...");
+  const allMovements: BankMovement[] = [];
 
-  const result = await tryEndpoints<BiceMovementsResponse>(jar, movementCandidates, debugLog);
-  if (!result) return [];
+  try {
+    // First page — try empty body, then with pagination params
+    let res = await bffPost<BiceTransactionsResponse>(gwJar, BFF_TRANSACTIONS);
+    let rawTxs = res.transactions || res.movimientos || res.data || res.content || [];
 
-  // Try to extract movements from various response shapes
-  const rawMovements = result.movimientos || result.transacciones || result.data || result.content || [];
-  const movements: BankMovement[] = [];
+    // Handle top-level array
+    if (Array.isArray(res)) {
+      rawTxs = res as BiceTransaction[];
+    }
 
-  for (const mov of rawMovements) {
-    const converted = biceMovToMovement(mov);
-    if (converted) movements.push(converted);
+    debugLog.push(`  Transactions page 1: ${rawTxs.length} items`);
+
+    for (const tx of rawTxs) {
+      const mov = biceTransactionToMovement(tx);
+      if (mov) allMovements.push(mov);
+    }
+
+    // Paginate if the API supports it
+    let page = 2;
+    const MAX_PAGES = 20;
+    let hasMore = res.hasMore === true || (res.totalPages !== undefined && page <= res.totalPages);
+
+    while (hasMore && page <= MAX_PAGES) {
+      try {
+        res = await bffPost<BiceTransactionsResponse>(gwJar, BFF_TRANSACTIONS, {
+          page,
+          pageSize: 50,
+        });
+        rawTxs = res.transactions || res.movimientos || res.data || res.content || [];
+        if (Array.isArray(res)) rawTxs = res as BiceTransaction[];
+
+        if (rawTxs.length === 0) break;
+
+        debugLog.push(`  Transactions page ${page}: ${rawTxs.length} items`);
+        for (const tx of rawTxs) {
+          const mov = biceTransactionToMovement(tx);
+          if (mov) allMovements.push(mov);
+        }
+
+        page++;
+        hasMore =
+          res.hasMore === true ||
+          (res.totalPages !== undefined && page <= res.totalPages);
+      } catch {
+        break;
+      }
+    }
+  } catch (err) {
+    debugLog.push(
+      `  Transactions error: ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 
-  return movements;
+  return allMovements;
 }
 
 // ─── Main scrape function ────────────────────────────────────────
 
-async function scrapeBice(options: ScraperOptions, debugLog: string[]): Promise<ScrapeResult> {
+async function scrapeBice(
+  options: ScraperOptions,
+  debugLog: string[],
+): Promise<ScrapeResult> {
   const { rut, password, onProgress, onTwoFactorCode } = options;
   const bank = "bice";
   const progress = onProgress || (() => {});
 
-  // Login
+  // Login via Keycloak + OAuth agent
   progress("Conectando con BICE API...");
-  const loginResult = await biceLogin(rut, password, debugLog, onTwoFactorCode);
+  const loginResult = await biceKeycloakLogin(
+    rut,
+    password,
+    debugLog,
+    onTwoFactorCode,
+  );
   if (!loginResult.success) {
-    return { success: false, bank, movements: [], error: loginResult.error, debug: debugLog.join("\n") };
+    return {
+      success: false,
+      bank,
+      movements: [],
+      error: loginResult.error,
+      debug: debugLog.join("\n"),
+    };
   }
 
-  const { jar } = loginResult;
+  const { gwJar } = loginResult;
   progress("Sesion iniciada correctamente");
 
-  // Fetch balance
-  debugLog.push("6. Fetching balance via API...");
-  progress("Obteniendo saldo...");
-  const balance = await fetchBalance(jar, debugLog);
-  if (balance !== undefined) {
-    debugLog.push(`  Balance: $${balance.toLocaleString("es-CL")}`);
-  } else {
-    debugLog.push("  Balance: not found (API endpoints need discovery)");
-  }
+  // Fetch products (account list)
+  debugLog.push("7. Fetching data via BFF endpoints...");
+  progress("Obteniendo productos...");
+  const products = await fetchProducts(gwJar, debugLog);
+  debugLog.push(`  Found ${products.length} product(s)`);
 
-  // Fetch movements
-  debugLog.push("7. Fetching movements via API...");
+  // Fetch balance
+  progress("Obteniendo saldo...");
+  const balance = await fetchBalance(gwJar, debugLog);
+
+  // Fetch transactions (movements)
   progress("Extrayendo movimientos...");
-  const movements = await fetchMovements(jar, debugLog);
+  const movements = await fetchTransactions(gwJar, debugLog);
   debugLog.push(`  Raw movements: ${movements.length}`);
 
   const deduplicated = deduplicateMovements(movements);
