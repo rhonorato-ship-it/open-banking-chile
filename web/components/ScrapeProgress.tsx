@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
+import Link from "next/link";
 
 type Phase = 1 | 2 | 3 | 4 | 5;
 
@@ -302,7 +303,24 @@ export default function ScrapeProgress({ bankId, bankName, agentic = false, onDo
         )}
 
         {/* Actions on error */}
-        {errorMsg && (
+        {errorMsg && /invalid|incorrecta|credential|clave|password|usuario/i.test(errorMsg) && (
+          <div className="mt-2 space-y-2">
+            <p className="text-xs text-slate-500 text-center">Las credenciales guardadas no funcionaron.</p>
+            <Link
+              href={`/banks?add=${bankId}`}
+              className="block w-full py-2.5 rounded-full bg-teal-600 text-white text-sm font-bold hover:bg-teal-700 transition-colors text-center"
+            >
+              Actualizar credenciales
+            </Link>
+            <button
+              onClick={() => onError(errorMsg)}
+              className="w-full py-2 rounded-full border border-slate-200 text-sm text-slate-400 hover:text-slate-700 transition-colors"
+            >
+              Cerrar
+            </button>
+          </div>
+        )}
+        {errorMsg && !/invalid|incorrecta|credential|clave|password|usuario/i.test(errorMsg) && (
           <div className="flex gap-2 mt-2">
             <button
               onClick={() => setRetryCount((c) => c + 1)}
