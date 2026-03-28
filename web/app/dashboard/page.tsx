@@ -356,10 +356,9 @@ export default function DashboardPage() {
                     <div className="flex gap-2 mt-auto">
                       <button
                         onClick={() => setScraping({ id: b.id, name: b.name })}
-                        disabled={b.isSyncing}
-                        className="flex-1 py-2 rounded-xl bg-[#0ea5e9] text-black text-xs font-bold hover:bg-[#38bdf8] disabled:opacity-40 transition-colors"
+                        className="flex-1 py-2 rounded-xl bg-[#0ea5e9] text-black text-xs font-bold hover:bg-[#38bdf8] transition-colors"
                       >
-                        {b.isSyncing ? "Sincronizando…" : "Sincronizar"}
+                        Sincronizar
                       </button>
                       <Link
                         href={`/movements?bankId=${b.id}`}
