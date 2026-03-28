@@ -1,455 +1,614 @@
-import type { Page } from "puppeteer-core";
 import type { BankMovement, BankScraper, ScrapeResult, ScraperOptions } from "../types.js";
 import { MOVEMENT_SOURCE } from "../types.js";
-import { closePopups, delay, parseChileanAmount, normalizeDate, deduplicateMovements } from "../utils.js";
-import { runScraper } from "../infrastructure/scraper-runner.js";
-import type { BrowserSession } from "../infrastructure/browser.js";
-import { fillRut, fillPassword, clickSubmit, detectLoginError } from "../actions/login.js";
-import { dismissBanners } from "../actions/navigation.js";
+import { formatRut, normalizeDate, deduplicateMovements } from "../utils.js";
+import { runApiScraper } from "../infrastructure/api-runner.js";
 
-// ─── Scotiabank-specific constants ───────────────────────────────
+// ─── Scotiabank constants ───────────────────────────────────────
+//
+// Auth: Form-based login at personas.scotiabank.cl
+// Data: REST API at personas.scotiabank.cl (JSON endpoints)
+//
+// No browser needed — this scraper uses fetch() exclusively.
 
 const BANK_URL = "https://www.scotiabank.cl";
+const LOGIN_PAGE = "https://personas.scotiabank.cl/scotiabank-web/personas/login";
+const LOGIN_POST_CANDIDATES = [
+  "https://personas.scotiabank.cl/api/auth/login",
+  "https://personas.scotiabank.cl/scotiabank-web/personas/api/auth/login",
+  "https://personas.scotiabank.cl/api/login",
+  "https://personas.scotiabank.cl/scotiabank-web/personas/login",
+];
+const API_BASE = "https://personas.scotiabank.cl/api";
 
-const LOGIN_SELECTORS = {
-  rutSelectors: ["#inputDni", 'input[name="inputDni"]', 'input[id*="Dni"]', 'input[name*="Dni"]'],
-  passwordSelectors: ["#inputPassword", 'input[name="inputPassword"]', 'input[id*="Password"]', 'input[name*="Password"]'],
-  rutFormat: "dash" as const,
-};
+const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
-// ─── Shadow DOM helper ───────────────────────────────────────────
+// ─── API types ───────────────────────────────────────────────────
 
-function allDeepJs(): string {
-  return `function allDeep(root, sel) {
-    const out = Array.from(root.querySelectorAll(sel));
-    for (const el of Array.from(root.querySelectorAll("*"))) {
-      if (el.shadowRoot) out.push(...allDeep(el.shadowRoot, sel));
-    }
-    return out;
-  }`;
+interface ApiAccount {
+  id?: string;
+  numero?: string;
+  mascara?: string;
+  tipo?: string;
+  moneda?: string;
+  saldo?: number;
+  saldoDisponible?: number;
+  descripcion?: string;
 }
 
-// ─── Scotiabank-specific helpers ─────────────────────────────────
-
-async function waitForDashboardContent(page: Page): Promise<void> {
-  const start = Date.now();
-  while (Date.now() - start < 15000) {
-    const hasContent = await page.evaluate(new Function(`${allDeepJs()}
-      return allDeep(document, "a, button, span").some(el => {
-        const text = el.innerText?.trim().toLowerCase() || "";
-        return text === "ver cartola" || text === "cuenta corriente";
-      });`) as () => boolean);
-    if (hasContent) break;
-    await delay(1500);
-  }
+interface ApiMovement {
+  fecha?: string;
+  fechaContable?: string;
+  descripcion?: string;
+  glosa?: string;
+  cargo?: number;
+  abono?: number;
+  monto?: number;
+  saldo?: number;
+  tipo?: string;
 }
 
-async function dismissScotiaTutorial(page: Page, debugLog: string[]): Promise<void> {
-  for (let i = 0; i < 8; i++) {
-    const dismissed = await page.evaluate(new Function(`${allDeepJs()}
-      for (const el of allDeep(document, "button, a, span")) {
-        const text = el.innerText?.trim().toLowerCase() || "";
-        if (text === "continuar" || text === "terminar" || text === "cerrar" || text === "omitir" || text === "saltar") {
-          el.click(); return text;
-        }
-      }
-      return null;`) as () => string | null);
-    if (!dismissed) break;
-    debugLog.push(`  Tutorial dismissed: "${dismissed}"`);
-    await delay(600);
-  }
+interface ApiMovementsResponse {
+  movimientos?: ApiMovement[];
+  pagina?: number;
+  totalPaginas?: number;
+  masPaginas?: boolean;
+  totalRegistros?: number;
 }
 
-async function navigateToMovements(page: Page, debugLog: string[]): Promise<void> {
-  await waitForDashboardContent(page);
+// ─── Cookie jar ──────────────────────────────────────────────────
 
-  // Try "Ver cartola" (pierce Shadow DOM)
-  const clickedCartola = await page.evaluate(new Function(`${allDeepJs()}
-    for (const el of allDeep(document, "a, button, span")) {
-      const text = el.innerText?.trim().toLowerCase() || "";
-      if (text === "ver cartola" || text === "ver saldo y movimientos") {
-        el.click(); return true;
-      }
-    }
-    return false;`) as () => boolean);
-  if (clickedCartola) { debugLog.push("  Clicked: Ver cartola"); await delay(5000); return; }
-
-  // Sidebar fallback
-  const clickedCuentas = await page.evaluate(new Function(`${allDeepJs()}
-    for (const el of allDeep(document, "a, button, li, span")) {
-      if (el.innerText?.trim().toLowerCase() === "cuentas") { el.click(); return true; }
-    }
-    return false;`) as () => boolean);
-  if (clickedCuentas) { debugLog.push("  Sidebar: Cuentas"); await delay(2500); }
-
-  const subTargets = ["cartola", "movimientos", "últimos movimientos", "estado de cuenta"];
-  for (const target of subTargets) {
-    const clicked = await page.evaluate(new Function("target", `${allDeepJs()}
-      for (const el of allDeep(document, "a, button, [role='menuitem'], li, span")) {
-        const text = el.innerText?.trim().toLowerCase() || "";
-        if (text.includes(target) && text.length < 60) { el.click(); return true; }
-      }
-      return false;`).bind(null, target) as () => boolean);
-    if (clicked) { debugLog.push(`  Clicked: ${target}`); await delay(5000); return; }
-  }
+interface CookieJar {
+  cookies: Map<string, string>;
+  set(raw: string): void;
+  setAll(headers: Headers): void;
+  header(): string;
+  csrf(): string;
 }
 
-async function extractMovements(page: Page): Promise<BankMovement[]> {
-  // Extract from page + all frames (piercing Shadow DOM)
-  const contexts: Array<{ evaluate: Page["evaluate"] }> = [page];
-  for (const frame of page.frames()) {
-    if (frame !== page.mainFrame()) contexts.push(frame as unknown as { evaluate: Page["evaluate"] });
-  }
+function createCookieJar(): CookieJar {
+  const cookies = new Map<string, string>();
+  return {
+    cookies,
+    set(raw: string) {
+      const [nameValue] = raw.split(";");
+      const eqIdx = nameValue.indexOf("=");
+      if (eqIdx > 0) cookies.set(nameValue.slice(0, eqIdx).trim(), nameValue.slice(eqIdx + 1).trim());
+    },
+    setAll(headers: Headers) {
+      const setCookies = headers.getSetCookie?.() ?? [];
+      for (const raw of setCookies) this.set(raw);
+    },
+    header() {
+      return Array.from(cookies.entries()).map(([k, v]) => `${k}=${v}`).join("; ");
+    },
+    csrf() {
+      // Try common CSRF cookie names
+      return decodeURIComponent(
+        cookies.get("XSRF-TOKEN") ?? cookies.get("csrf-token") ?? cookies.get("_csrf") ?? "",
+      );
+    },
+  };
+}
 
-  const allRaw: Array<{ date: string; description: string; amount: string; balance: string }> = [];
-  for (const ctx of contexts) {
-    try {
-      const raw = await ctx.evaluate(new Function(`${allDeepJs()}
-        const results = [];
-        const tables = allDeep(document, "table");
-        for (const table of tables) {
-          const rows = Array.from(table.querySelectorAll("tr"));
-          if (rows.length < 2) continue;
-          let dateIndex = 0, descriptionIndex = 1, cargoIndex = -1, abonoIndex = -1, amountIndex = -1, balanceIndex = -1, hasHeader = false;
-          for (const row of rows) {
-            const headers = row.querySelectorAll("th");
-            if (headers.length < 2) continue;
-            const ht = Array.from(headers).map(h => h.innerText?.trim().toLowerCase() || "");
-            if (!ht.some(h => h.includes("fecha"))) continue;
-            hasHeader = true;
-            dateIndex = ht.findIndex(h => h.includes("fecha"));
-            descriptionIndex = ht.findIndex(h => h.includes("descrip") || h.includes("detalle") || h.includes("glosa"));
-            cargoIndex = ht.findIndex(h => h.includes("cargo") || h.includes("débito") || h.includes("debito"));
-            abonoIndex = ht.findIndex(h => h.includes("abono") || h.includes("crédito") || h.includes("credito"));
-            amountIndex = ht.findIndex(h => h === "monto" || h.includes("importe"));
-            balanceIndex = ht.findIndex(h => h.includes("saldo"));
-            break;
-          }
-          if (!hasHeader) continue;
-          let lastDate = "";
-          for (const row of rows) {
-            const cells = row.querySelectorAll("td");
-            if (cells.length < 3) continue;
-            const values = Array.from(cells).map(c => c.innerText?.trim() || "");
-            const rawDate = values[dateIndex] || "";
-            const hasDate = /^\\d{1,2}[\\/.-]\\d{1,2}([\\/.-]\\d{2,4})?$/.test(rawDate);
-            const date = hasDate ? rawDate : lastDate;
-            if (!date) continue;
-            if (hasDate) lastDate = rawDate;
-            const description = descriptionIndex >= 0 ? (values[descriptionIndex] || "") : "";
-            let amount = "";
-            if (cargoIndex >= 0 && values[cargoIndex]) amount = "-" + values[cargoIndex];
-            else if (abonoIndex >= 0 && values[abonoIndex]) amount = values[abonoIndex];
-            else if (amountIndex >= 0) amount = values[amountIndex] || "";
-            const balance = balanceIndex >= 0 ? (values[balanceIndex] || "") : "";
-            if (!amount) continue;
-            results.push({ date, description, amount, balance });
-          }
-        }
-        if (results.length === 0) {
-          const cards = allDeep(document, "[class*='mov'], [class*='tran'], [class*='transaction'], li, article");
-          for (const card of cards) {
-            const text = card.innerText || "";
-            const lines = text.split("\\n").map(l => l.trim()).filter(Boolean);
-            if (lines.length < 3 || lines.length > 10) continue;
-            const date = lines.find(l => /\\d{1,2}[\\/.-]\\d{1,2}[\\/.-]\\d{2,4}/.test(l));
-            const amount = lines.find(l => /[$]\\s*[\\d.]+/.test(l));
-            if (!date || !amount) continue;
-            const description = lines.find(l => l !== date && l !== amount && l.length > 3) || "";
-            const balance = lines.find(l => l.toLowerCase().includes("saldo") && /[$]\\s*[\\d.]+/.test(l)) || "";
-            const isCargo = text.toLowerCase().includes("cargo") || text.toLowerCase().includes("débito") || amount.includes("-");
-            results.push({ date, description, amount: isCargo ? (amount.startsWith("-") ? amount : "-" + amount) : amount, balance });
-          }
-        }
-        return results;`) as () => Array<{ date: string; description: string; amount: string; balance: string }>);
-      allRaw.push(...raw);
-    } catch { /* detached frame */ }
-  }
+// ─── Login ───────────────────────────────────────────────────────
 
-  const seen = new Set<string>();
-  return allRaw.map(m => {
-    const amount = parseChileanAmount(m.amount);
-    if (amount === 0) return null;
-    return { date: normalizeDate(m.date), description: m.description, amount, balance: m.balance ? parseChileanAmount(m.balance) : 0, source: MOVEMENT_SOURCE.account } as BankMovement;
-  }).filter((m): m is BankMovement => {
-    if (!m) return false;
-    const key = `${m.date}|${m.description}|${m.amount}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
+async function scotiaLogin(
+  rut: string,
+  password: string,
+  debugLog: string[],
+  onTwoFactorCode?: () => Promise<string>,
+): Promise<{ success: true; jar: CookieJar } | { success: false; error: string }> {
+  const jar = createCookieJar();
+
+  // Step 1: GET login page to collect pre-auth cookies
+  debugLog.push("1. Fetching Scotiabank login page...");
+  const loginPageRes = await fetch(LOGIN_PAGE, {
+    headers: { "User-Agent": UA },
+    redirect: "follow",
   });
-}
+  jar.setAll(loginPageRes.headers);
+  debugLog.push(`  Status: ${loginPageRes.status}, cookies: ${jar.cookies.size}`);
 
-async function scotiaPaginate(page: Page, debugLog: string[]): Promise<BankMovement[]> {
-  const all: BankMovement[] = [];
-  for (let i = 0; i < 20; i++) {
-    all.push(...await extractMovements(page));
-    const urlBefore = page.url();
-    const nextClicked = await page.evaluate(new Function(`${allDeepJs()}
-      const candidates = allDeep(document, "button, a, [role='button']");
-      for (const btn of candidates) {
-        const text = btn.innerText?.trim().toLowerCase() || "";
-        if (!text.includes("siguiente") && !text.includes("ver más") && !text.includes("mostrar más") && text !== "›" && text !== ">") continue;
-        if (btn.disabled || btn.getAttribute("aria-disabled") === "true" || btn.classList.contains("disabled")) return false;
-        btn.click(); return true;
-      }
-      return false;`) as () => boolean);
-    if (!nextClicked) break;
-    await delay(3000);
-    const urlAfter = page.url();
-    if (new URL(urlBefore).pathname.split("/").slice(0, 6).join("/") !== new URL(urlAfter).pathname.split("/").slice(0, 6).join("/")) { debugLog.push("  Pagination stopped: URL changed"); break; }
-    debugLog.push(`  Pagination: page ${i + 2}`);
-  }
-  return deduplicateMovements(all);
-}
+  // Also GET main bank URL for additional cookies
+  const mainPageRes = await fetch(BANK_URL, {
+    headers: { "User-Agent": UA },
+    redirect: "follow",
+  });
+  jar.setAll(mainPageRes.headers);
 
-async function navigateToPreviousPeriod(page: Page, debugLog: string[], doSave: (page: Page, name: string) => Promise<void>, stepIndex: number): Promise<boolean> {
-  // Expand sidebar Cuentas
-  await page.evaluate(new Function(`${allDeepJs()}
-    for (const el of allDeep(document, "nav a, nav button, aside a, aside button, a, button, li, span")) {
-      if (el.innerText?.trim().toLowerCase() === "cuentas") { el.click(); return true; }
-    }
-    return false;`) as () => boolean);
-  await delay(2000);
+  // Step 2: Try login POST to candidate endpoints
+  debugLog.push("2. Submitting credentials...");
+  const formattedRut = formatRut(rut);
+  const csrf = jar.csrf();
 
-  // Click Cartola/Movimientos submenu
-  const subTargets = ["cartola", "movimientos cuenta", "cuenta corriente", "movimientos"];
-  let entered = false;
-  for (const target of subTargets) {
-    const clicked = await page.evaluate(new Function("t", `${allDeepJs()}
-      for (const el of allDeep(document, "a, button, [role='menuitem'], li, span")) {
-        const text = el.innerText?.trim().toLowerCase() || "";
-        if (text.includes(t) && text.length < 80) { el.click(); return true; }
-      }
-      return false;`).bind(null, target) as () => boolean);
-    if (clicked) { debugLog.push(`  Sidebar: ${target}`); await delay(5000); entered = true; break; }
-  }
-  if (!entered) return false;
+  let loginSuccess = false;
+  let loginError = "";
 
-  // Click "Consultar Movimientos Anteriores"
-  const targets = ["movimientos anteriores", "consultar movimientos", "consultar cartolas"];
-  let clicked = false;
-  // Try main page
-  clicked = await page.evaluate(new Function("tgts", `${allDeepJs()}
-    for (const t of tgts) {
-      for (const el of allDeep(document, "a, button, span, [role='tab'], [role='link'], li")) {
-        const text = el.innerText?.trim().toLowerCase() || "";
-        if (text.includes(t) && text.length < 80) { el.click(); return true; }
-      }
-    }
-    return false;`).bind(null, targets) as () => boolean);
+  for (const loginUrl of LOGIN_POST_CANDIDATES) {
+    debugLog.push(`  Trying: ${loginUrl}`);
 
-  // Try frames
-  if (!clicked) {
-    for (const frame of page.frames()) {
-      if (frame === page.mainFrame()) continue;
-      try {
-        clicked = await frame.evaluate(new Function("tgts", `${allDeepJs()}
-          for (const t of tgts) {
-            for (const el of allDeep(document, "a, button, span, [role='tab'], [role='link'], li")) {
-              const text = el.innerText?.trim().toLowerCase() || "";
-              if (text.includes(t) && text.length < 80) { el.click(); return true; }
+    // Try JSON body first
+    try {
+      const jsonRes = await fetch(loginUrl, {
+        method: "POST",
+        headers: {
+          "User-Agent": UA,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          Cookie: jar.header(),
+          Referer: LOGIN_PAGE,
+          Origin: "https://personas.scotiabank.cl",
+          ...(csrf ? { "X-XSRF-TOKEN": csrf, "X-CSRF-TOKEN": csrf } : {}),
+        },
+        body: JSON.stringify({ rut: formattedRut, password }),
+        redirect: "manual",
+      });
+      jar.setAll(jsonRes.headers);
+
+      const status = jsonRes.status;
+      debugLog.push(`    JSON POST → ${status}`);
+
+      if (status >= 200 && status < 400 && status !== 401 && status !== 403) {
+        // Check for 2FA requirement in response
+        if (status === 200 || status === 302) {
+          let responseBody: Record<string, unknown> = {};
+          try { responseBody = await jsonRes.json() as Record<string, unknown>; } catch { /* not JSON */ }
+
+          const bodyStr = JSON.stringify(responseBody).toLowerCase();
+          if (bodyStr.includes("clave dinámica") || bodyStr.includes("segundo factor") ||
+              bodyStr.includes("código de verificación") || bodyStr.includes("token") ||
+              bodyStr.includes("2fa") || bodyStr.includes("otp") ||
+              (responseBody.requires2FA === true) || (responseBody.requiresOtp === true)) {
+            debugLog.push("  2FA required");
+            if (!onTwoFactorCode) {
+              return { success: false, error: "El banco pide clave dinámica o 2FA y no se proporcionó callback." };
+            }
+            const code = await onTwoFactorCode();
+            debugLog.push("  Submitting 2FA code...");
+
+            // Try submitting 2FA code
+            const twoFaUrls = [
+              `${API_BASE}/auth/2fa`,
+              `${API_BASE}/auth/verify`,
+              `${API_BASE}/auth/otp`,
+              loginUrl.replace("/login", "/2fa"),
+            ];
+            let twoFaSuccess = false;
+            for (const twoFaUrl of twoFaUrls) {
+              try {
+                const twoFaRes = await fetch(twoFaUrl, {
+                  method: "POST",
+                  headers: {
+                    "User-Agent": UA,
+                    "Content-Type": "application/json",
+                    Accept: "application/json",
+                    Cookie: jar.header(),
+                    Referer: LOGIN_PAGE,
+                    Origin: "https://personas.scotiabank.cl",
+                    ...(jar.csrf() ? { "X-XSRF-TOKEN": jar.csrf(), "X-CSRF-TOKEN": jar.csrf() } : {}),
+                  },
+                  body: JSON.stringify({ code, otp: code, token: code }),
+                  redirect: "manual",
+                });
+                jar.setAll(twoFaRes.headers);
+                if (twoFaRes.status >= 200 && twoFaRes.status < 400) {
+                  twoFaSuccess = true;
+                  debugLog.push(`    2FA accepted at ${twoFaUrl}`);
+                  break;
+                }
+              } catch { /* try next */ }
+            }
+            if (!twoFaSuccess) {
+              return { success: false, error: "No se pudo validar la clave dinámica (2FA)." };
             }
           }
-          return false;`).bind(null, targets) as () => boolean);
-        if (clicked) break;
-      } catch { /* detached */ }
+
+          // Check for explicit login error
+          if (responseBody.error || responseBody.mensaje?.toString().toLowerCase().includes("incorrecto")) {
+            loginError = String(responseBody.error || responseBody.mensaje || "Credenciales incorrectas");
+            continue;
+          }
+        }
+
+        loginSuccess = true;
+        debugLog.push(`    Login accepted at ${loginUrl}`);
+        break;
+      }
+    } catch { /* try next format */ }
+
+    // Try form-encoded body
+    try {
+      const formBody = new URLSearchParams({
+        rut: formattedRut,
+        password,
+        ...(csrf ? { _csrf: csrf } : {}),
+      });
+      const formRes = await fetch(loginUrl, {
+        method: "POST",
+        headers: {
+          "User-Agent": UA,
+          "Content-Type": "application/x-www-form-urlencoded",
+          Cookie: jar.header(),
+          Referer: LOGIN_PAGE,
+          ...(csrf ? { "X-XSRF-TOKEN": csrf } : {}),
+        },
+        body: formBody.toString(),
+        redirect: "manual",
+      });
+      jar.setAll(formRes.headers);
+
+      const status = formRes.status;
+      const location = formRes.headers.get("location") || "";
+      debugLog.push(`    Form POST → ${status}, Location: ${location}`);
+
+      // 302 redirect to portal = success, 302 to login = failure
+      if (status === 302 && !location.includes("login") && !location.includes("error")) {
+        // Follow redirect to collect session cookies
+        const redirectUrl = location.startsWith("http") ? location : `https://personas.scotiabank.cl${location}`;
+        const redirectRes = await fetch(redirectUrl, {
+          headers: { "User-Agent": UA, Cookie: jar.header() },
+          redirect: "follow",
+        });
+        jar.setAll(redirectRes.headers);
+        loginSuccess = true;
+        debugLog.push(`    Login accepted (form) at ${loginUrl}`);
+        break;
+      }
+
+      if (status === 200) {
+        // Could be success (JSON API) or failure (re-rendered login page)
+        try {
+          const body = await formRes.json() as Record<string, unknown>;
+          if (!body.error && !String(body.mensaje ?? "").toLowerCase().includes("incorrecto")) {
+            loginSuccess = true;
+            debugLog.push(`    Login accepted (form 200) at ${loginUrl}`);
+            break;
+          }
+          loginError = String(body.error || body.mensaje || "");
+        } catch { /* not JSON, likely rendered login page = failure */ }
+      }
+    } catch { /* try next endpoint */ }
+  }
+
+  if (!loginSuccess) {
+    return { success: false, error: loginError || "Credenciales incorrectas o no se encontró endpoint de login." };
+  }
+
+  debugLog.push(`3. Login OK! Cookies: ${Array.from(jar.cookies.keys()).join(", ")}`);
+  return { success: true, jar };
+}
+
+// ─── API helpers ─────────────────────────────────────────────────
+
+async function apiGet<T>(jar: CookieJar, path: string): Promise<T> {
+  const url = path.startsWith("http") ? path : `${API_BASE}/${path}`;
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": UA,
+      Accept: "application/json",
+      Cookie: jar.header(),
+      Referer: LOGIN_PAGE,
+      Origin: "https://personas.scotiabank.cl",
+      ...(jar.csrf() ? { "X-XSRF-TOKEN": jar.csrf(), "X-CSRF-TOKEN": jar.csrf() } : {}),
+    },
+  });
+  jar.setAll(res.headers);
+  if (!res.ok) throw new Error(`API GET ${path} -> ${res.status}`);
+  return res.json() as Promise<T>;
+}
+
+async function apiPost<T>(jar: CookieJar, path: string, body: unknown = {}): Promise<T> {
+  const url = path.startsWith("http") ? path : `${API_BASE}/${path}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "User-Agent": UA,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      Cookie: jar.header(),
+      Referer: LOGIN_PAGE,
+      Origin: "https://personas.scotiabank.cl",
+      ...(jar.csrf() ? { "X-XSRF-TOKEN": jar.csrf(), "X-CSRF-TOKEN": jar.csrf() } : {}),
+    },
+    body: JSON.stringify(body),
+  });
+  jar.setAll(res.headers);
+  if (!res.ok) throw new Error(`API POST ${path} -> ${res.status}`);
+  return res.json() as Promise<T>;
+}
+
+// ─── Data extraction ─────────────────────────────────────────────
+
+function apiMovToMovement(mov: ApiMovement): BankMovement {
+  const date = normalizeDate(mov.fecha || mov.fechaContable || "");
+  const description = (mov.descripcion || mov.glosa || "").trim();
+
+  let amount: number;
+  if (mov.cargo !== undefined && mov.cargo !== null && mov.cargo !== 0) {
+    amount = -Math.abs(mov.cargo);
+  } else if (mov.abono !== undefined && mov.abono !== null && mov.abono !== 0) {
+    amount = Math.abs(mov.abono);
+  } else if (mov.monto !== undefined && mov.monto !== null) {
+    // If tipo is available, use it to determine sign
+    if (mov.tipo === "cargo" || mov.tipo === "debito") {
+      amount = -Math.abs(mov.monto);
+    } else if (mov.tipo === "abono" || mov.tipo === "credito") {
+      amount = Math.abs(mov.monto);
+    } else {
+      amount = mov.monto; // preserve original sign
+    }
+  } else {
+    amount = 0;
+  }
+
+  return {
+    date,
+    description,
+    amount,
+    balance: mov.saldo ?? 0,
+    source: MOVEMENT_SOURCE.account,
+  };
+}
+
+// ─── Fetch movements ─────────────────────────────────────────────
+
+async function fetchMovements(
+  jar: CookieJar,
+  account: ApiAccount,
+  debugLog: string[],
+  startDate?: string,
+  endDate?: string,
+): Promise<BankMovement[]> {
+  const movements: BankMovement[] = [];
+  const accountId = account.id || account.numero || "";
+
+  // Try multiple endpoint patterns
+  const endpointCandidates = [
+    `cuentas/${accountId}/movimientos`,
+    `cuentas/movimientos`,
+    `movimientos/cuenta/${accountId}`,
+    `movimientos`,
+  ];
+
+  for (const endpoint of endpointCandidates) {
+    try {
+      // Build query params
+      const params: Record<string, string> = {};
+      if (accountId) params.cuenta = accountId;
+      if (startDate) params.fechaDesde = startDate;
+      if (endDate) params.fechaHasta = endDate;
+      params.pagina = "1";
+
+      const queryString = Object.entries(params).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join("&");
+      const url = `${endpoint}?${queryString}`;
+
+      const response = await apiGet<ApiMovementsResponse | ApiMovement[]>(jar, url);
+
+      // Handle array response
+      if (Array.isArray(response)) {
+        for (const mov of response) {
+          const m = apiMovToMovement(mov);
+          if (m.amount !== 0) movements.push(m);
+        }
+        debugLog.push(`  Fetched ${response.length} movements from ${endpoint}`);
+        break;
+      }
+
+      // Handle paginated response
+      if (response.movimientos) {
+        for (const mov of response.movimientos) {
+          const m = apiMovToMovement(mov);
+          if (m.amount !== 0) movements.push(m);
+        }
+        debugLog.push(`  Page 1: ${response.movimientos.length} movements from ${endpoint}`);
+
+        // Paginate
+        const totalPages = response.totalPaginas ?? (response.masPaginas ? 25 : 1);
+        for (let page = 2; page <= Math.min(totalPages, 25); page++) {
+          if (response.masPaginas === false && !response.totalPaginas) break;
+          try {
+            params.pagina = String(page);
+            const qs = Object.entries(params).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join("&");
+            const pageResponse = await apiGet<ApiMovementsResponse>(jar, `${endpoint}?${qs}`);
+            if (!pageResponse.movimientos?.length) break;
+            for (const mov of pageResponse.movimientos) {
+              const m = apiMovToMovement(mov);
+              if (m.amount !== 0) movements.push(m);
+            }
+            debugLog.push(`  Page ${page}: ${pageResponse.movimientos.length} movements`);
+            if (pageResponse.masPaginas === false) break;
+          } catch { break; }
+        }
+        break;
+      }
+    } catch { /* try next endpoint */ }
+  }
+
+  // Also try POST-based movement fetch if GET yielded nothing
+  if (movements.length === 0) {
+    const postEndpoints = [
+      "cuentas/movimientos",
+      "movimientos/consultar",
+      "movimientos/getCartola",
+    ];
+    for (const endpoint of postEndpoints) {
+      try {
+        const body: Record<string, unknown> = { cuenta: accountId };
+        if (account.numero) body.numeroCuenta = account.numero;
+        if (startDate) body.fechaDesde = startDate;
+        if (endDate) body.fechaHasta = endDate;
+        body.pagina = 1;
+
+        const response = await apiPost<ApiMovementsResponse | ApiMovement[]>(jar, endpoint, body);
+
+        if (Array.isArray(response)) {
+          for (const mov of response) {
+            const m = apiMovToMovement(mov);
+            if (m.amount !== 0) movements.push(m);
+          }
+          debugLog.push(`  POST ${endpoint}: ${response.length} movements`);
+          break;
+        }
+        if (response.movimientos?.length) {
+          for (const mov of response.movimientos) {
+            const m = apiMovToMovement(mov);
+            if (m.amount !== 0) movements.push(m);
+          }
+          debugLog.push(`  POST ${endpoint}: ${response.movimientos.length} movements`);
+
+          // Paginate POST
+          let hasMore = (response.masPaginas ?? false) || ((response.totalPaginas ?? 1) > 1);
+          for (let page = 2; hasMore && page <= 25; page++) {
+            try {
+              body.pagina = page;
+              const pageRes = await apiPost<ApiMovementsResponse>(jar, endpoint, body);
+              if (!pageRes.movimientos?.length) break;
+              for (const mov of pageRes.movimientos) {
+                const m = apiMovToMovement(mov);
+                if (m.amount !== 0) movements.push(m);
+              }
+              hasMore = (pageRes.masPaginas ?? false) || (page < (pageRes.totalPaginas ?? 1));
+            } catch { hasMore = false; }
+          }
+          break;
+        }
+      } catch { /* try next */ }
     }
   }
 
-  if (!clicked) { debugLog.push("  No 'Consultar Movimientos Anteriores' link found"); return false; }
-  debugLog.push("  Clicked: Consultar Movimientos Anteriores");
-  await delay(4000);
-  await doSave(page, `period-${stepIndex}-form`);
-  return true;
-}
-
-async function fillAndSubmitDateRange(page: Page, startDate: string, endDate: string, debugLog: string[]): Promise<boolean> {
-  const [sd, sm, sy] = startDate.split("/");
-  const [ed, em, ey] = endDate.split("/");
-  const frames = [page.mainFrame(), ...page.frames().filter((f) => f !== page.mainFrame())];
-
-  for (const frame of frames) {
-    try {
-      const inputCount = await frame.evaluate(() =>
-        Array.from(document.querySelectorAll('input[type="text"], input:not([type])')).filter(el => (el as HTMLInputElement).offsetParent !== null && !(el as HTMLInputElement).disabled).length
-      ).catch(() => 0);
-      if (inputCount < 4) continue;
-
-      const filled = await frame.evaluate((vals: Record<string, string>) => {
-        function setVal(el: HTMLInputElement, val: string) { el.focus(); el.value = val; el.dispatchEvent(new Event("input", { bubbles: true })); el.dispatchEvent(new Event("change", { bubbles: true })); el.blur(); }
-        const inputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type])')).filter(el => (el as HTMLInputElement).offsetParent !== null && !(el as HTMLInputElement).disabled) as HTMLInputElement[];
-        let filled = 0;
-        for (const inp of inputs) { const key = inp.name || inp.id; if (key && key in vals) { setVal(inp, vals[key]); filled++; } }
-        if (filled === 0 && inputs.length >= 6) { const order = ["sd", "sm", "sy", "ed", "em", "ey"]; for (let i = 0; i < 6; i++) setVal(inputs[i], vals[order[i]]); return true; }
-        return filled > 0;
-      }, { idd: sd, imm: sm, iaa: sy, fdd: ed, fmm: em, faa: ey, sd, sm, sy, ed, em, ey });
-      if (!filled) continue;
-
-      await delay(500);
-      const submitted = await frame.evaluate(() => {
-        for (const el of document.querySelectorAll('button, input[type="submit"], input[type="button"], input[type="image"], a[href="#"]')) {
-          const text = ((el as HTMLElement).innerText?.trim() || (el as HTMLInputElement).value || (el as HTMLInputElement).alt || "").toLowerCase();
-          if (text === "aceptar" || text === "buscar" || text === "consultar" || text === "enviar") { (el as HTMLElement).click(); return true; }
-        }
-        for (const el of document.querySelectorAll('button, input[type="submit"], input[type="image"]')) {
-          if ((el as HTMLInputElement).type === "submit" || (el as HTMLInputElement).type === "image") { (el as HTMLElement).click(); return true; }
-        }
-        return false;
-      });
-      if (submitted) { debugLog.push(`  Submitted: ${startDate} → ${endDate}`); await delay(6000); return true; }
-    } catch { /* detached */ }
-  }
-  return false;
+  return movements;
 }
 
 // ─── Main scrape function ────────────────────────────────────────
 
-async function scrapeScotiabank(session: BrowserSession, options: ScraperOptions): Promise<ScrapeResult> {
-  const { rut, password, saveScreenshots: doScreenshots, onProgress } = options;
-  const { page, debugLog, screenshot: doSave } = session;
-  const progress = onProgress || (() => {});
+async function scrapeScotiabank(options: ScraperOptions, debugLog: string[]): Promise<ScrapeResult> {
+  const { rut, password, onProgress, onTwoFactorCode } = options;
   const bank = "scotiabank";
+  const progress = onProgress || (() => {});
 
-  // 1. Navigate
-  debugLog.push("1. Navigating to Scotiabank...");
-  progress("Abriendo sitio del banco...");
-  await page.goto(BANK_URL, { waitUntil: "networkidle2", timeout: 30000 });
-  await delay(2000);
-  await dismissBanners(page);
-  await doSave(page, "01-homepage");
+  // Step 1: Login
+  progress("Conectando con Scotiabank API...");
+  const loginResult = await scotiaLogin(rut, password, debugLog, onTwoFactorCode);
+  if (!loginResult.success) {
+    return { success: false, bank, movements: [], error: loginResult.error, debug: debugLog.join("\n") };
+  }
 
-  // 2. Login
-  debugLog.push("2. Clicking login button...");
-  await page.evaluate(() => {
-    for (const el of Array.from(document.querySelectorAll("a, button"))) {
-      const text = (el as HTMLElement).innerText?.trim().toLowerCase() || "";
-      const href = (el as HTMLAnchorElement).href || "";
-      if (text === "ingresar" || text === "acceso clientes" || text.includes("iniciar sesión") || href.includes("login") || href.includes("auth")) {
-        (el as HTMLElement).click(); return;
+  const { jar } = loginResult;
+  progress("Sesion iniciada correctamente");
+
+  // Step 2: Fetch accounts
+  debugLog.push("4. Fetching accounts...");
+  progress("Obteniendo cuentas...");
+
+  let accounts: ApiAccount[] = [];
+  const accountEndpoints = ["cuentas", "cuentas/lista", "productos/cuentas", "productos"];
+  for (const endpoint of accountEndpoints) {
+    try {
+      const response = await apiGet<ApiAccount[] | { cuentas?: ApiAccount[]; productos?: ApiAccount[] }>(jar, endpoint);
+      if (Array.isArray(response)) {
+        accounts = response;
+      } else if (response.cuentas) {
+        accounts = response.cuentas;
+      } else if (response.productos) {
+        accounts = response.productos.filter(p => p.tipo === "cuenta" || p.tipo === "cuentaCorriente" || p.tipo === "cuentaVista");
       }
-    }
-  });
-  await delay(4000);
-  await doSave(page, "02-login-form");
-
-  debugLog.push("3. Filling RUT...");
-  progress("Ingresando RUT...");
-  if (!(await fillRut(page, rut, LOGIN_SELECTORS))) {
-    const ss = await page.screenshot({ encoding: "base64" });
-    return { success: false, bank, movements: [], error: "No se encontró campo de RUT", screenshot: ss as string, debug: debugLog.join("\n") };
-  }
-  await delay(1000);
-
-  debugLog.push("4. Filling password...");
-  let passOk = await fillPassword(page, password, LOGIN_SELECTORS);
-  if (!passOk) { await page.keyboard.press("Enter"); await delay(3000); passOk = await fillPassword(page, password, LOGIN_SELECTORS); }
-  if (!passOk) {
-    const ss = await page.screenshot({ encoding: "base64" });
-    return { success: false, bank, movements: [], error: "No se encontró campo de clave", screenshot: ss as string, debug: debugLog.join("\n") };
-  }
-  await delay(800);
-
-  debugLog.push("5. Submitting login...");
-  progress("Iniciando sesión...");
-  await clickSubmit(page, page, LOGIN_SELECTORS);
-  await delay(8000);
-  await doSave(page, "03-after-login");
-
-  // 2FA check
-  const pageContent = (await page.content()).toLowerCase();
-  if (pageContent.includes("clave dinámica") || pageContent.includes("segundo factor") || pageContent.includes("código de verificación") || pageContent.includes("token")) {
-    const ss = await page.screenshot({ encoding: "base64" });
-    return { success: false, bank, movements: [], error: "El banco pide clave dinámica o 2FA.", screenshot: ss as string, debug: debugLog.join("\n") };
-  }
-
-  const loginError = await detectLoginError(page);
-  if (loginError) {
-    const ss = await page.screenshot({ encoding: "base64" });
-    return { success: false, bank, movements: [], error: `Error del banco: ${loginError}`, screenshot: ss as string, debug: debugLog.join("\n") };
-  }
-
-  debugLog.push("6. Login OK!");
-  progress("Sesión iniciada correctamente");
-  await closePopups(page);
-  await dismissScotiaTutorial(page, debugLog);
-
-  // 7. Navigate to cartola
-  debugLog.push("7. Looking for Cartola/Movimientos...");
-  progress("Buscando cartola de cuenta...");
-  await navigateToMovements(page, debugLog);
-  await dismissScotiaTutorial(page, debugLog);
-  await doSave(page, "04-movements-page");
-
-  // 8. Try expanding date range
-  try {
-    const selectInfo = await page.evaluate(() => {
-      const selects = Array.from(document.querySelectorAll("select"));
-      return selects.map((sel, i) => ({
-        index: i, name: sel.name || sel.id || `select-${i}`,
-        options: Array.from(sel.querySelectorAll("option")).map((o) => ({ text: o.text.trim(), value: o.value })),
-      }));
-    });
-    for (const sel of selectInfo) {
-      for (const opt of sel.options) {
-        const text = opt.text.toLowerCase();
-        if (text.includes("todos") || text.includes("último mes") || text.includes("30 día") || text.includes("mes anterior")) {
-          await page.evaluate((selIdx: number, optValue: string) => {
-            const selects = document.querySelectorAll("select");
-            const select = selects[selIdx] as HTMLSelectElement;
-            if (select) { select.value = optValue; select.dispatchEvent(new Event("change", { bubbles: true })); }
-          }, sel.index, opt.value);
-          await delay(3000);
-          break;
-        }
+      if (accounts.length > 0) {
+        debugLog.push(`  Found ${accounts.length} account(s) from ${endpoint}`);
+        break;
       }
+    } catch { /* try next */ }
+  }
+
+  // Step 3: Fetch balance
+  let balance: number | undefined;
+
+  // Try dedicated balance endpoint
+  const balanceEndpoints = ["cuentas/saldos", "saldos", "productos/saldos"];
+  for (const endpoint of balanceEndpoints) {
+    try {
+      const response = await apiGet<Array<{ moneda?: string; saldo?: number; disponible?: number; saldoDisponible?: number }> | { saldo?: number; disponible?: number }>(jar, endpoint);
+      if (Array.isArray(response)) {
+        const clp = response.find(s => s.moneda === "CLP" || !s.moneda);
+        if (clp) balance = clp.disponible ?? clp.saldoDisponible ?? clp.saldo;
+      } else if (response.saldo !== undefined || response.disponible !== undefined) {
+        balance = response.disponible ?? response.saldo;
+      }
+      if (balance !== undefined) {
+        debugLog.push(`  Balance: $${balance}`);
+        break;
+      }
+    } catch { /* try next */ }
+  }
+
+  // Also try balance from accounts
+  if (balance === undefined && accounts.length > 0) {
+    const acct = accounts.find(a => a.moneda === "CLP" || !a.moneda);
+    if (acct) balance = acct.saldoDisponible ?? acct.saldo;
+  }
+
+  // Step 4: Fetch movements for current period
+  debugLog.push("5. Fetching movements (current period)...");
+  progress("Extrayendo movimientos de cuenta...");
+
+  const allMovements: BankMovement[] = [];
+
+  if (accounts.length > 0) {
+    for (const account of accounts) {
+      const acctMovs = await fetchMovements(jar, account, debugLog);
+      allMovements.push(...acctMovs);
     }
-  } catch { /* ignore */ }
+  } else {
+    // If no accounts found, try fetching movements directly (some APIs don't need account selection)
+    const defaultAccount: ApiAccount = { id: "", numero: "" };
+    const movs = await fetchMovements(jar, defaultAccount, debugLog);
+    allMovements.push(...movs);
+  }
 
-  // 9. Extract current period
-  const movements = await scotiaPaginate(page, debugLog);
-  debugLog.push(`9. Extracted ${movements.length} movements (current period)`);
-  progress(`Periodo actual: ${movements.length} movimientos`);
+  debugLog.push(`  Current period: ${allMovements.length} movements`);
+  progress(`Periodo actual: ${allMovements.length} movimientos`);
 
-  // 10. Historical periods
+  // Step 5: Historical periods (SCOTIABANK_MONTHS env var)
   const months = Math.min(Math.max(parseInt(process.env.SCOTIABANK_MONTHS || "0", 10) || 0, 0), 12);
   if (months > 0) {
-    debugLog.push(`10. Fetching ${months} additional period(s)...`);
-    progress(`Extrayendo ${months} periodo(s) histórico(s)...`);
+    debugLog.push(`6. Fetching ${months} historical period(s)...`);
+    progress(`Extrayendo ${months} periodo(s) historico(s)...`);
+
     const now = new Date();
     for (let m = 0; m < months; m++) {
-      await dismissScotiaTutorial(page, debugLog);
-      if (!(await navigateToPreviousPeriod(page, debugLog, doSave, m + 1))) break;
       const target = new Date(now.getFullYear(), now.getMonth() - (m + 1), 1);
       const firstDay = new Date(target.getFullYear(), target.getMonth(), 1);
       const lastDay = new Date(target.getFullYear(), target.getMonth() + 1, 0);
-      const fmt = (d: Date) => `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}/${d.getFullYear()}`;
-      if (!(await fillAndSubmitDateRange(page, fmt(firstDay), fmt(lastDay), debugLog))) break;
-      const periodMovements = await scotiaPaginate(page, debugLog);
-      debugLog.push(`  Period -${m + 1}: ${periodMovements.length} movements`);
-      movements.push(...periodMovements);
+
+      const fmt = (d: Date) =>
+        `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}/${d.getFullYear()}`;
+
+      debugLog.push(`  Period -${m + 1}: ${fmt(firstDay)} to ${fmt(lastDay)}`);
+
+      for (const account of accounts.length > 0 ? accounts : [{ id: "", numero: "" }]) {
+        const periodMovs = await fetchMovements(jar, account, debugLog, fmt(firstDay), fmt(lastDay));
+        allMovements.push(...periodMovs);
+        debugLog.push(`    ${periodMovs.length} movements`);
+      }
     }
   }
 
-  const deduplicated = deduplicateMovements(movements);
-  debugLog.push(`  Total: ${deduplicated.length} unique movements`);
-  progress(`Listo — ${deduplicated.length} movimientos totales`);
-
-  let balance: number | undefined;
-  if (deduplicated.length > 0 && deduplicated[0].balance > 0) balance = deduplicated[0].balance;
-  if (balance === undefined) {
-    balance = await page.evaluate(() => {
-      const bodyText = document.body?.innerText || "";
-      const patterns = [/saldo disponible[\s\S]{0,50}\$\s*([\d.]+)/i, /saldo actual[\s\S]{0,50}\$\s*([\d.]+)/i];
-      for (const pattern of patterns) { const match = bodyText.match(pattern); if (match) return parseInt(match[1].replace(/[^0-9]/g, ""), 10); }
-      return undefined;
-    });
+  // Step 6: Balance fallback from movements
+  if (balance === undefined && allMovements.length > 0 && allMovements[0].balance > 0) {
+    balance = allMovements[0].balance;
   }
 
-  await doSave(page, "05-final");
-  const ss = doScreenshots ? (await page.screenshot({ encoding: "base64", fullPage: true })) as string : undefined;
+  // Deduplicate and return
+  const deduplicated = deduplicateMovements(allMovements);
+  debugLog.push(`7. Total: ${deduplicated.length} unique movements`);
+  progress(`Listo -- ${deduplicated.length} movimientos totales`);
 
-  return { success: true, bank, movements: deduplicated, balance: balance ?? undefined, screenshot: ss, debug: debugLog.join("\n") };
+  return {
+    success: true,
+    bank,
+    movements: deduplicated,
+    balance: balance ?? undefined,
+    debug: debugLog.join("\n"),
+  };
 }
 
 // ─── Export ──────────────────────────────────────────────────────
@@ -458,7 +617,8 @@ const scotiabank: BankScraper = {
   id: "scotiabank",
   name: "Scotiabank Chile",
   url: BANK_URL,
-  scrape: (options) => runScraper("scotiabank", options, {}, scrapeScotiabank),
+  mode: "api",
+  scrape: (options) => runApiScraper("scotiabank", options, scrapeScotiabank),
 };
 
 export default scotiabank;
