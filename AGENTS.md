@@ -32,12 +32,10 @@ WealthTech:
 - Fintual (`fintual`) — public REST API at `https://fintual.cl/api-docs`
 - Racional (`racional`) — Firebase Auth (`racional-prod`) + Firestore REST API
 
-PayTech:
-- MercadoPago (`mercadopago`) — OAuth2 access token + public API at `api.mercadopago.com` (PayTech arm of MercadoLibre)
-
 **Browser mode** (requires Puppeteer):
 
-None — all institutions migrated to API mode. Some may fall back to requiring browser if anti-bot protections block Node.js fetch (BancoEstado/Akamai, Itaú/Imperva, BCI/JSF, Citi/ioBlackBox).
+PayTech:
+- MercadoPago (`mercadopago`) — MercadoLibre login with email + password. Device fingerprint (`dps`) requires browser JS. Extracts balance + activity from dashboard.
 
 ---
 
@@ -194,10 +192,10 @@ src/
     balance.ts             — Balance extraction (regex + CSS selector fallbacks)
     two-factor.ts          — 2FA detection and wait (configurable keywords/timeout)
   banks/
-    All 13 scrapers are API mode (fetch-only, no Puppeteer):
-    bchile.ts, edwards.ts, fintual.ts, mercadopago.ts, racional.ts,
-    bci.ts, bestado.ts, bice.ts, citi.ts, falabella.ts,
+    12 API-mode scrapers (fetch-only): bchile.ts, edwards.ts, fintual.ts,
+    racional.ts, bci.ts, bestado.ts, bice.ts, citi.ts, falabella.ts,
     itau.ts, santander.ts, scotiabank.ts
+    1 browser-mode scraper: mercadopago.ts (MercadoLibre login requires browser)
 
 web/                       — Next.js 15 multi-user dashboard (App Router), deployed on Vercel
   app/

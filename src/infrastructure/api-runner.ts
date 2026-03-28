@@ -5,15 +5,19 @@ export type ApiScrapeFn = (
   debugLog: string[],
 ) => Promise<ScrapeResult>;
 
+/** Default timeout for API scrapers: 240s (leaves 60s headroom under Vercel's 300s limit) */
+const DEFAULT_TIMEOUT_MS = 240_000;
+
 /**
  * Browser-free scraper runner for banks/services with REST APIs.
- * Handles credential validation and error wrapping like runScraper(),
- * but has no browser lifecycle (no launch, no logout, no cleanup).
+ * Handles credential validation, error wrapping, and hard timeout.
+ * No browser lifecycle (no launch, no logout, no cleanup).
  */
 export async function runApiScraper(
   bankId: string,
   options: ScraperOptions,
   scrapeFn: ApiScrapeFn,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS,
 ): Promise<ScrapeResult> {
   const { rut, password } = options;
 
@@ -28,8 +32,15 @@ export async function runApiScraper(
 
   const debugLog: string[] = [];
 
+  let timerId: ReturnType<typeof setTimeout> | undefined;
   try {
-    return await scrapeFn(options, debugLog);
+    const scrapePromise = scrapeFn(options, debugLog);
+
+    const timeoutPromise = new Promise<ScrapeResult>((_, reject) => {
+      timerId = setTimeout(() => reject(new Error(`Timeout: el scraper no respondió en ${Math.round(timeoutMs / 1000)}s`)), timeoutMs);
+    });
+
+    return await Promise.race([scrapePromise, timeoutPromise]);
   } catch (error) {
     return {
       success: false,
@@ -38,5 +49,7 @@ export async function runApiScraper(
       error: `Error del scraper: ${error instanceof Error ? error.message : String(error)}`,
       debug: debugLog.join("\n"),
     };
+  } finally {
+    if (timerId) clearTimeout(timerId);
   }
 }

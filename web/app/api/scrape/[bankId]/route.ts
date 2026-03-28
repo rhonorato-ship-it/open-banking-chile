@@ -17,6 +17,9 @@ function stringToPhase(msg: string): Phase {
   return 4;
 }
 
+/** Hard timeout for the entire scrape operation. Leaves 25s headroom under Vercel's 300s limit. */
+const SCRAPE_TIMEOUT_MS = 275_000;
+
 export async function GET(req: Request, { params }: { params: Promise<{ bankId: string }> }) {
   const session = await auth();
   if (!session?.user?.id) return new Response("Unauthorized", { status: 401 });
@@ -32,47 +35,60 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
 
   const stream = new ReadableStream({
     async start(controller) {
+      let terminated = false;
+
+      /** Send an SSE event. No-ops if stream is already closed. */
       const send = (data: object) => {
+        if (terminated) return;
         try {
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
         } catch {
-          // stream may already be closed
+          terminated = true;
         }
       };
 
-      const keepalive = () => {
+      /** Send a terminal event (done or error) and close the stream. Idempotent. */
+      const terminate = (data: object) => {
+        send(data);
+        terminated = true;
+        clearInterval(keepaliveInterval);
+        try { controller.close(); } catch { /* already closed */ }
+      };
+
+      /** Reset the sync lock in the DB. Must be awaited. */
+      const releaseLock = async () => {
         try {
-          controller.enqueue(encoder.encode(": keepalive\n\n"));
-        } catch {
-          // ignore
-        }
+          await supabase
+            .from("bank_credentials")
+            .update({ is_syncing: false })
+            .eq("user_id", userId)
+            .eq("bank_id", bankId);
+        } catch { /* best-effort */ }
       };
 
-      keepaliveInterval = setInterval(keepalive, 20_000);
+      // Keepalives as real SSE data events so the client's onmessage handler can reset its inactivity timer.
+      // SSE comments (": keepalive\n\n") are silently consumed by EventSource and never fire onmessage.
+      keepaliveInterval = setInterval(() => {
+        if (terminated) return;
+        try { controller.enqueue(encoder.encode(`data: ${JSON.stringify({ keepalive: true })}\n\n`)); } catch { terminated = true; }
+      }, 20_000);
 
       try {
-        // Force-release any stuck sync lock for this bank (from crashed/timed-out functions).
-        // This is safe because we're about to start a new sync anyway.
-        await supabase
-          .from("bank_credentials")
-          .update({ is_syncing: false })
-          .eq("user_id", userId)
-          .eq("bank_id", bankId)
-          .eq("is_syncing", true);
+        // ── Lock acquisition ─────────────────────────────────────
+        // Force-release any stuck lock (from crashed/timed-out previous functions)
+        await releaseLock();
 
-        // Atomically acquire sync lock via RPC
         const { data: acquired, error: lockError } = await supabase.rpc("acquire_sync_lock", {
           p_user_id: userId,
           p_bank_id: bankId,
         });
 
         if (lockError || !acquired) {
-          send({ phase: 1, error: true, message: "Ya hay una sincronización en curso para este banco. Reintenta en unos segundos." });
-          controller.close();
+          terminate({ phase: 1, error: true, message: "No se pudo iniciar la sincronización. Reintenta." });
           return;
         }
 
-        // Fetch and decrypt credentials — always scoped to this user
+        // ── Credentials ──────────────────────────────────────────
         const { data: cred, error: credError } = await supabase
           .from("bank_credentials")
           .select("encrypted_rut, rut_iv, encrypted_password, password_iv")
@@ -81,18 +97,12 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
           .single();
 
         if (credError || !cred) {
-          console.error("[scrape] credential lookup failed:", credError, "userId:", userId, "bankId:", bankId);
-          await supabase
-            .from("bank_credentials")
-            .update({ is_syncing: false })
-            .eq("user_id", userId)
-            .eq("bank_id", bankId);
-          send({ phase: 1, error: true, message: "No se encontraron credenciales para este banco." });
-          controller.close();
+          console.error(`[scrape:${bankId}] credential lookup failed:`, credError);
+          terminate({ phase: 1, error: true, message: "No se encontraron credenciales para este banco." });
           return;
         }
 
-        // Session cookies are optional (column may not exist yet)
+        // Session cookies (optional — column may not exist)
         let sessionCookies: string | null = null;
         try {
           const { data: cookieRow } = await supabase
@@ -104,36 +114,25 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
           if (cookieRow?.encrypted_cookies && cookieRow?.cookies_iv) {
             sessionCookies = await decrypt(cookieRow.encrypted_cookies, cookieRow.cookies_iv);
           }
-        } catch {
-          // cookies columns may not exist — not critical
-        }
+        } catch { /* not critical */ }
 
         const rut = await decrypt(cred.encrypted_rut, cred.rut_iv);
         const password = await decrypt(cred.encrypted_password, cred.password_iv);
 
         send({ phase: 1, label: "Iniciando conexión", message: "Abriendo sesión segura" });
 
-        // API-mode scrapers (e.g. Fintual) use fetch() — skip Chromium initialization
+        // ── Browser setup (only for non-API scrapers) ────────────
         const needsBrowser = bank.mode !== "api";
-
         let chromePath: string | undefined;
         let launchArgs: string[] | undefined;
         if (needsBrowser) {
-          // Dynamic import — only load @sparticuz/chromium when a browser is needed.
-          // This avoids the ~45s cold-start penalty for API-mode scrapers.
           const chromium = (await import("@sparticuz/chromium")).default;
           chromePath = await chromium.executablePath();
-          launchArgs = chromium.args.filter(
-            (a: string) => !a.startsWith("--headless"),
-          );
+          launchArgs = chromium.args.filter((a: string) => !a.startsWith("--headless"));
           launchArgs.push("--headless=shell");
         }
 
-        // Load stored browser cookies (if any) — avoids 2FA on repeat runs
-        const storedCookiesJson: string | undefined = sessionCookies ?? undefined;
-
-        // 2FA code exchange: SSE signals the frontend, which POSTs the code to a Supabase row.
-        // The onTwoFactorCode callback polls for up to 90s (matching typical bank code TTL).
+        // ── 2FA callback ─────────────────────────────────────────
         const onTwoFactorCode = async (): Promise<string> => {
           send({ phase: 2, requires_2fa: true, label: "Verificación requerida", message: "El banco solicita un código de verificación. Ingresa el código que recibiste." });
           const deadline = Date.now() + 90_000;
@@ -153,7 +152,8 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
           return "";
         };
 
-        const result = await bank.scrape({
+        // ── Scrape with hard timeout ─────────────────────────────
+        const scrapePromise = bank.scrape({
           rut,
           password,
           ...(chromePath ? { chromePath } : {}),
@@ -172,7 +172,19 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
           },
         });
 
-        // Persist session cookies so the next sync skips 2FA
+        let scrapeTimerId: ReturnType<typeof setTimeout> | undefined;
+        const timeoutPromise = new Promise<never>((_, reject) => {
+          scrapeTimerId = setTimeout(() => reject(new Error("SCRAPE_TIMEOUT")), SCRAPE_TIMEOUT_MS);
+        });
+
+        let result;
+        try {
+          result = await Promise.race([scrapePromise, timeoutPromise]);
+        } finally {
+          if (scrapeTimerId) clearTimeout(scrapeTimerId);
+        }
+
+        // ── Persist session cookies ──────────────────────────────
         if (result.success && result.sessionCookies) {
           try {
             const { ciphertext, iv } = await encrypt(result.sessionCookies);
@@ -185,13 +197,13 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
         }
 
         if (!result.success) {
-          send({ phase: 2, error: true, message: result.error ?? "Error desconocido al scrapear el banco." });
+          terminate({ phase: 2, error: true, message: result.error ?? "Error desconocido al scrapear el banco." });
           return;
         }
 
+        // ── Store movements ──────────────────────────────────────
         send({ phase: 4, label: "Procesando datos", message: "Guardando movimientos..." });
 
-        // Upsert movements — conflict on hash is a no-op (deduplication)
         let inserted = 0;
         for (const m of result.movements) {
           const hash = movementHash(userId, bankId, m.date, m.description, m.amount);
@@ -214,32 +226,33 @@ export async function GET(req: Request, { params }: { params: Promise<{ bankId: 
           inserted += (rows ?? []).length;
         }
 
+        // ── Success ──────────────────────────────────────────────
         await supabase
           .from("bank_credentials")
           .update({ is_syncing: false, last_synced_at: new Date().toISOString() })
           .eq("user_id", userId)
           .eq("bank_id", bankId);
 
-        send({ phase: 5, label: "Completado", message: `${inserted} movimientos nuevos sincronizados`, done: true });
+        terminate({ phase: 5, label: "Completado", message: `${inserted} movimientos nuevos sincronizados`, done: true });
+
       } catch (err) {
         const message = err instanceof Error ? err.message : "Error inesperado";
         console.error(`[scrape:${bankId}]`, message);
-        send({
-          phase: 2,
-          error: true,
-          message: "No se pudo completar la sincronizacion. Reintenta en unos minutos.",
-        });
+
+        const userMessage = message === "SCRAPE_TIMEOUT"
+          ? "La sincronización tardó demasiado y fue cancelada. Reintenta."
+          : "No se pudo completar la sincronización. Reintenta en unos minutos.";
+
+        terminate({ phase: 2, error: true, message: userMessage });
+
       } finally {
+        // Guaranteed lock release — runs even if terminate() was already called
         clearInterval(keepaliveInterval);
-        // Must await — fire-and-forget may not execute before Vercel kills the function
-        try {
-          await supabase
-            .from("bank_credentials")
-            .update({ is_syncing: false })
-            .eq("user_id", userId)
-            .eq("bank_id", bankId);
-        } catch { /* best-effort */ }
-        try { controller.close(); } catch { /* already closed */ }
+        await releaseLock();
+        if (!terminated) {
+          // Safety net: if somehow we got here without sending a terminal event
+          terminate({ phase: 2, error: true, message: "Error inesperado. Reintenta." });
+        }
       }
     },
   });

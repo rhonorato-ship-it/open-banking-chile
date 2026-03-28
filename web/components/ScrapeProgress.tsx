@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 
 type Phase = 1 | 2 | 3 | 4 | 5;
 
@@ -28,6 +28,9 @@ const PHASES: { id: Phase; label: string }[] = [
   { id: 5, label: "Completado" },
 ];
 
+/** If no SSE message arrives within this window, assume the connection is dead. */
+const INACTIVITY_TIMEOUT_MS = 45_000;
+
 export default function ScrapeProgress({ bankId, bankName, onDone, onError }: Props) {
   const [currentPhase, setCurrentPhase] = useState<Phase>(1);
   const [currentMessage, setCurrentMessage] = useState("");
@@ -39,6 +42,21 @@ export default function ScrapeProgress({ bankId, bankName, onDone, onError }: Pr
   const [submitting2FA, setSubmitting2FA] = useState(false);
   const esRef = useRef<EventSource | null>(null);
   const codeInputRef = useRef<HTMLInputElement | null>(null);
+  const inactivityTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const needs2FARef = useRef(false);
+
+  /** Reset the inactivity timer. Called on every SSE message. */
+  const resetInactivityTimer = useCallback(() => {
+    if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
+    inactivityTimerRef.current = setTimeout(() => {
+      // No message received for INACTIVITY_TIMEOUT_MS — connection is dead
+      if (esRef.current) {
+        esRef.current.close();
+        esRef.current = null;
+      }
+      setErrorMsg("La conexión con el servidor se perdió. Reintenta.");
+    }, INACTIVITY_TIMEOUT_MS);
+  }, []);
 
   useEffect(() => {
     // Reset state on retry
@@ -47,34 +65,53 @@ export default function ScrapeProgress({ bankId, bankName, onDone, onError }: Pr
     setErrorMsg(null);
     setDone(false);
     setNeeds2FA(false);
+    needs2FARef.current = false;
     setTwoFACode("");
     setSubmitting2FA(false);
 
     const es = new EventSource(`/api/scrape/${bankId}`);
     esRef.current = es;
 
+    // Start the inactivity timer
+    resetInactivityTimer();
+
     es.onmessage = (e) => {
-      const data: PhaseEvent = JSON.parse(e.data);
+      // Every message (including keepalives) proves the connection is alive
+      resetInactivityTimer();
+
+      const data = JSON.parse(e.data) as PhaseEvent & { keepalive?: boolean };
+
+      // Server keepalive — just reset the timer, nothing else to do
+      if (data.keepalive) return;
 
       if (data.error) {
         setErrorMsg(data.message ?? "Error inesperado");
         setCurrentPhase(data.phase);
         setNeeds2FA(false);
+        needs2FARef.current = false;
         es.close();
         return;
       }
 
       if (data.requires_2fa) {
         setNeeds2FA(true);
+        needs2FARef.current = true;
         setCurrentPhase(data.phase);
         if (data.message) setCurrentMessage(data.message);
+        // Extend timeout during 2FA (user needs time to get the code)
+        if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
+        inactivityTimerRef.current = setTimeout(() => {
+          es.close();
+          setErrorMsg("Tiempo de espera agotado para el código 2FA.");
+        }, 120_000); // 2 minutes for 2FA
         setTimeout(() => codeInputRef.current?.focus(), 100);
         return;
       }
 
       // If we were waiting for 2FA and moved past phase 2, clear the input
-      if (needs2FA && data.phase > 2) {
+      if (needs2FARef.current && data.phase > 2) {
         setNeeds2FA(false);
+        needs2FARef.current = false;
       }
 
       setCurrentPhase(data.phase);
@@ -82,18 +119,23 @@ export default function ScrapeProgress({ bankId, bankName, onDone, onError }: Pr
 
       if (data.done) {
         setDone(true);
+        if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
         es.close();
         setTimeout(onDone, 1500);
       }
     };
 
     es.onerror = () => {
+      if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
       setErrorMsg("Conexión interrumpida — intenta de nuevo");
       es.close();
     };
 
-    return () => es.close();
-  }, [bankId, retryCount]); // eslint-disable-line react-hooks/exhaustive-deps
+    return () => {
+      if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
+      es.close();
+    };
+  }, [bankId, retryCount, resetInactivityTimer]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const submit2FACode = async () => {
     if (!twoFACode.trim() || submitting2FA) return;
@@ -106,6 +148,8 @@ export default function ScrapeProgress({ bankId, bankName, onDone, onError }: Pr
       });
       setNeeds2FA(false);
       setCurrentMessage("Código enviado — verificando...");
+      // Restart normal inactivity timer
+      resetInactivityTimer();
     } catch {
       setErrorMsg("Error al enviar código");
     } finally {
