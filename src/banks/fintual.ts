@@ -80,6 +80,7 @@ async function fetchGoals(
     headers: {
       "X-User-Email": email,
       "X-User-Token": token,
+      "Authorization": `Bearer ${token}`,
       "User-Agent": UA,
     },
   });
