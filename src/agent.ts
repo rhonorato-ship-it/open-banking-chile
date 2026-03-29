@@ -139,11 +139,92 @@ function readCredentialsFromEnv(
 // ─── Auto-auth flow ──────────────────────────────────────────
 
 /**
- * Interactive auth: prompt user to open the dashboard and paste the token.
+ * Browser-based auth: starts a local callback server, opens the dashboard
+ * in the default browser, and waits for the page to deliver the JWT
+ * automatically.  No copy/paste required — the user only needs to be logged
+ * in on the dashboard.
+ *
+ * Rejects with Error("timeout") after 5 minutes so the caller can fall back
+ * to the manual paste flow.
+ */
+async function browserAuth(webUrl: string): Promise<string> {
+  const { createServer } = await import("node:http");
+  const { execFile } = await import("node:child_process");
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+
+    const server = createServer((req, res) => {
+      if (req.method === "OPTIONS") {
+        res.writeHead(204, {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET",
+          "Access-Control-Allow-Headers": "Content-Type",
+        });
+        res.end();
+        return;
+      }
+
+      const parsed = new URL(req.url ?? "/", "http://localhost");
+      if (parsed.pathname === "/callback") {
+        const token = parsed.searchParams.get("token");
+        res.writeHead(200, {
+          "Content-Type": "text/plain",
+          "Access-Control-Allow-Origin": "*",
+        });
+        res.end("ok");
+
+        if (token && !settled) {
+          settled = true;
+          server.close();
+          resolve(token);
+        }
+      }
+    });
+
+    server.on("error", (err) => {
+      if (!settled) reject(err);
+    });
+
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address() as { port: number };
+      const callbackUrl = `http://127.0.0.1:${addr.port}/callback`;
+      const authUrl = `${webUrl}/agent?callback=${encodeURIComponent(callbackUrl)}`;
+
+      console.log("");
+      console.log("  Abriendo navegador para autenticacion...");
+      console.log(`  Si no se abre automaticamente: ${authUrl}`);
+      console.log("");
+
+      // Open browser — execFile avoids shell injection
+      if (process.platform === "darwin") {
+        execFile("open", [authUrl]);
+      } else if (process.platform === "win32") {
+        execFile("cmd", ["/c", "start", "", authUrl]);
+      } else {
+        execFile("xdg-open", [authUrl]);
+      }
+    });
+
+    // 5-minute timeout → caller falls back to manual paste
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        server.close();
+        reject(new Error("timeout"));
+      }
+    }, 5 * 60 * 1000);
+
+    server.on("close", () => clearTimeout(timer));
+  });
+}
+
+/**
+ * Manual fallback: prompt user to open the dashboard and paste the token.
  */
 async function interactiveAuth(webUrl: string): Promise<string> {
   console.log("");
-  console.log("  === Autenticacion del agente ===");
+  console.log("  === Autenticacion del agente (manual) ===");
   console.log("");
   console.log(`  1. Abre tu navegador: ${webUrl}/agent`);
   console.log("  2. Genera y copia el token.");
@@ -172,10 +253,17 @@ export async function startAgent(
   const savedConfig = loadConfig();
   let resolvedToken = token || savedConfig?.token;
 
-  // Auto-auth: if no token and running in a TTY, prompt interactively
+  // Auto-auth: try browser-based flow first, fall back to manual paste
   if (!resolvedToken) {
     if (process.stdin.isTTY) {
-      resolvedToken = await interactiveAuth(resolvedWebUrl);
+      resolvedToken = await browserAuth(resolvedWebUrl).catch(async (err) => {
+        if ((err as Error).message === "timeout") {
+          warn("Tiempo de espera agotado. Cambiando a autenticacion manual.");
+        } else {
+          warn(`No se pudo abrir el navegador: ${(err as Error).message}`);
+        }
+        return interactiveAuth(resolvedWebUrl);
+      });
     } else {
       console.error(
         "Error: No agent token provided.\n" +
