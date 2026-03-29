@@ -207,12 +207,13 @@ interface RunQueryResult {
 }
 
 /**
- * Query a top-level Firestore collection filtered by userId.
+ * Query a top-level Firestore collection filtered by a single field.
  * Uses the Firestore REST runQuery endpoint.
- * Paginates automatically — returns ALL matching documents.
+ * Returns ALL matching documents (no pagination needed for small collections).
  */
-async function firestoreQueryByUserId(
+async function firestoreQueryByField(
   collectionId: string,
+  fieldPath: string,
   userId: string,
   idToken: string,
   orderByField?: string,
@@ -223,7 +224,7 @@ async function firestoreQueryByUserId(
     from: [{ collectionId }],
     where: {
       fieldFilter: {
-        field: { fieldPath: "userId" },
+        field: { fieldPath },
         op: "EQUAL",
         value: { stringValue: userId },
       },
@@ -246,6 +247,38 @@ async function firestoreQueryByUserId(
 
   const results = await res.json() as RunQueryResult[];
   return results.filter(r => r.document).map(r => r.document!);
+}
+
+/**
+ * Query a top-level Firestore collection trying multiple field names
+ * (userId, uid, userUid) and merging results, deduplicated by document path.
+ * Newer Racional documents may use `uid` instead of `userId`.
+ */
+async function firestoreQueryByUser(
+  collectionId: string,
+  localId: string,
+  idToken: string,
+  orderByField?: string,
+): Promise<FirestoreDocument[]> {
+  const fieldNames = ["userId", "uid", "userUid"];
+  const seen = new Set<string>();
+  const merged: FirestoreDocument[] = [];
+
+  for (const field of fieldNames) {
+    try {
+      const docs = await firestoreQueryByField(collectionId, field, localId, idToken, orderByField);
+      for (const doc of docs) {
+        if (!seen.has(doc.name)) {
+          seen.add(doc.name);
+          merged.push(doc);
+        }
+      }
+    } catch {
+      // ignore individual field query failures
+    }
+  }
+
+  return merged;
 }
 
 // ─── Cloud Functions helpers ─────────────────────────────────────
@@ -485,7 +518,7 @@ async function scrapeRacional(options: ScraperOptions, debugLog: string[]): Prom
   // ── Step 2: Fetch goals (portfolio names + values for balance) ──
   const goals: RacionalGoal[] = [];
   try {
-    const goalDocs = await firestoreQueryByUserId("goals", localId, idToken);
+    const goalDocs = await firestoreQueryByUser("goals", localId, idToken);
     debugLog.push(`  goals: ${goalDocs.length} document(s)`);
     for (const doc of goalDocs) {
       const obj = docToObject(doc);
@@ -514,7 +547,7 @@ async function scrapeRacional(options: ScraperOptions, debugLog: string[]): Prom
   const allMovements: BankMovement[] = [];
 
   try {
-    const depositDocs = await firestoreQueryByUserId("deposits", localId, idToken);
+    const depositDocs = await firestoreQueryByUser("deposits", localId, idToken);
     debugLog.push(`  deposits: ${depositDocs.length} document(s)`);
     let depositCount = 0;
     for (const doc of depositDocs) {
@@ -531,7 +564,7 @@ async function scrapeRacional(options: ScraperOptions, debugLog: string[]): Prom
 
   // ── Step 4: Fetch withdrawals (all history — no date limits) ──
   try {
-    const withdrawalDocs = await firestoreQueryByUserId("withdrawals", localId, idToken);
+    const withdrawalDocs = await firestoreQueryByUser("withdrawals", localId, idToken);
     debugLog.push(`  withdrawals: ${withdrawalDocs.length} document(s)`);
     let withdrawalCount = 0;
     for (const doc of withdrawalDocs) {
@@ -548,7 +581,7 @@ async function scrapeRacional(options: ScraperOptions, debugLog: string[]): Prom
 
   // ── Step 5: Fetch contributions (dividends, commissions, etc. — all history) ──
   try {
-    const contribDocs = await firestoreQueryByUserId("contributions", localId, idToken);
+    const contribDocs = await firestoreQueryByUser("contributions", localId, idToken);
     debugLog.push(`  contributions: ${contribDocs.length} document(s)`);
     let contribCount = 0;
     for (const doc of contribDocs) {
@@ -563,20 +596,97 @@ async function scrapeRacional(options: ScraperOptions, debugLog: string[]): Prom
     debugLog.push(`  contributions query failed: ${e}`);
   }
 
-  // ── Step 6: Try DrivewealthAccountSummary for balance data ──
+  // ── Step 6: Fetch transactions collection (newer movement format) ──
+  try {
+    const txDocs = await firestoreQueryByUser("transactions", localId, idToken);
+    debugLog.push(`  transactions: ${txDocs.length} document(s)`);
+    let txCount = 0;
+    for (const doc of txDocs) {
+      const obj = docToObject(doc);
+      // Classify by type field, then map to deposit/withdrawal/contribution
+      const type = String(obj.type || obj.transactionType || obj.kind || "").toLowerCase();
+      let mv: BankMovement | null = null;
+      if (type.includes("deposit") || type.includes("deposito") || type.includes("buy") || type.includes("compra") || type === "in") {
+        mv = mapDeposit(obj, debugLog);
+      } else if (type.includes("withdraw") || type.includes("retiro") || type.includes("sell") || type.includes("venta") || type === "out") {
+        mv = mapWithdrawal(obj, debugLog);
+      } else if (type.includes("dividend") || type.includes("dividendo") || type.includes("comisi") || type.includes("fee") || type.includes("interest")) {
+        mv = mapContribution(obj, debugLog);
+      } else {
+        // Unknown type — try as deposit (positive amount) or withdrawal (negative)
+        const rawAmount = extractAmount(obj, "amount", "clpAmount", "value", "totalAmount", "total");
+        if (rawAmount < 0) {
+          mv = mapWithdrawal(obj, debugLog);
+        } else {
+          mv = mapDeposit(obj, debugLog);
+        }
+      }
+      if (mv) {
+        allMovements.push(mv);
+        txCount++;
+      }
+    }
+    debugLog.push(`    Mapped ${txCount} transaction movement(s)`);
+  } catch (e) {
+    debugLog.push(`  transactions query failed: ${e}`);
+  }
+
+  // ── Step 6b: Fetch orders collection (buy/sell orders) ──
+  try {
+    const orderDocs = await firestoreQueryByUser("orders", localId, idToken);
+    debugLog.push(`  orders: ${orderDocs.length} document(s)`);
+    let orderCount = 0;
+    for (const doc of orderDocs) {
+      const obj = docToObject(doc);
+      const side = String(obj.side || obj.orderType || obj.type || "").toLowerCase();
+      let mv: BankMovement | null = null;
+      if (side.includes("sell") || side.includes("venta")) {
+        mv = mapWithdrawal(obj, debugLog);
+      } else {
+        mv = mapDeposit(obj, debugLog);
+      }
+      if (mv) {
+        allMovements.push(mv);
+        orderCount++;
+      }
+    }
+    debugLog.push(`    Mapped ${orderCount} order movement(s)`);
+  } catch (e) {
+    debugLog.push(`  orders query failed: ${e}`);
+  }
+
+  // ── Step 7: Try DrivewealthAccountSummary for balance data ──
   let balance = 0;
 
   try {
     debugLog.push("3. Calling DrivewealthAccountSummary...");
-    // Pass userId so the cloud function knows which account to query
-    const summaryRes = await callCloudFunction("DrivewealthAccountSummary", { userId: localId }, idToken);
-    if (summaryRes.ok && summaryRes.result) {
-      const result = summaryRes.result as Record<string, unknown>;
-      debugLog.push(`  Cloud function response keys: ${Object.keys(result).join(", ")}`);
+
+    // Try multiple payload shapes — older API uses { userId }, newer may use { uid }
+    const payloads = [
+      { userId: localId },
+      { uid: localId },
+      { userUid: localId },
+      {},
+    ];
+
+    let summaryResult: Record<string, unknown> | null = null;
+    for (const payload of payloads) {
+      const summaryRes = await callCloudFunction("DrivewealthAccountSummary", payload, idToken);
+      if (summaryRes.ok && summaryRes.result) {
+        summaryResult = summaryRes.result as Record<string, unknown>;
+        debugLog.push(`  Cloud function OK with payload: ${JSON.stringify(payload)}`);
+        break;
+      } else if (!summaryRes.ok) {
+        debugLog.push(`  DrivewealthAccountSummary(${JSON.stringify(payload)}) failed: HTTP ${summaryRes.status}`);
+      }
+    }
+
+    if (summaryResult) {
+      debugLog.push(`  Cloud function response keys: ${Object.keys(summaryResult).join(", ")}`);
 
       // Extract balance using deep path checking (result.data.equity, etc.)
       const equity = deepExtractNumber(
-        result,
+        summaryResult,
         "equity", "totalEquity", "accountBalance",
         "cashBalance", "cash", "balance", "total",
         "clpEquity", "clpBalance", "clpTotal",
@@ -587,17 +697,14 @@ async function scrapeRacional(options: ScraperOptions, debugLog: string[]): Prom
         balance = Math.round(equity);
         debugLog.push(`  Account summary balance: $${balance.toLocaleString("es-CL")}`);
       } else {
-        // Log all keys at every level for debugging
         debugLog.push(`  Account summary returned but no balance extracted.`);
-        debugLog.push(`    Top-level keys: ${Object.keys(result).join(", ")}`);
-        for (const [k, v] of Object.entries(result)) {
+        debugLog.push(`    Top-level keys: ${Object.keys(summaryResult).join(", ")}`);
+        for (const [k, v] of Object.entries(summaryResult)) {
           if (v && typeof v === "object" && !Array.isArray(v)) {
             debugLog.push(`    ${k} keys: ${Object.keys(v as Record<string, unknown>).join(", ")}`);
           }
         }
       }
-    } else if (!summaryRes.ok) {
-      debugLog.push(`  DrivewealthAccountSummary failed: HTTP ${summaryRes.status} - ${summaryRes.body || ""}`);
     }
   } catch (e) {
     debugLog.push(`  DrivewealthAccountSummary error: ${e}`);
