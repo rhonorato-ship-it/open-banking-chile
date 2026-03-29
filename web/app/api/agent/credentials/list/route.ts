@@ -9,7 +9,7 @@ import crypto from "crypto";
  *
  * Returns all connected bank IDs for the authenticated user.
  * No credentials are returned -- just the list of bank_id values.
- * Auth: Bearer token (agent JWT signed with SUPABASE_JWT_SECRET).
+ * Auth: Bearer token (agent JWT signed with AUTH_SECRET).
  */
 export async function GET(req: Request) {
   // ── Verify JWT ────────────────────────────────────────────────
@@ -19,7 +19,7 @@ export async function GET(req: Request) {
   }
 
   const token = authHeader.slice(7);
-  const secret = process.env.SUPABASE_JWT_SECRET;
+  const secret = process.env.AUTH_SECRET;
   if (!secret) {
     return NextResponse.json({ error: "Server misconfigured" }, { status: 500 });
   }

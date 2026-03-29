@@ -9,7 +9,7 @@ import crypto from "crypto";
  * GET /api/agent/credentials?bankId=bice
  *
  * Returns decrypted { rut, password } for the authenticated user + bank.
- * Auth: Bearer token (agent JWT signed with SUPABASE_JWT_SECRET).
+ * Auth: Bearer token (agent JWT signed with AUTH_SECRET).
  */
 export async function GET(req: Request) {
   // ── Verify JWT ────────────────────────────────────────────────
@@ -19,7 +19,7 @@ export async function GET(req: Request) {
   }
 
   const token = authHeader.slice(7);
-  const secret = process.env.SUPABASE_JWT_SECRET;
+  const secret = process.env.AUTH_SECRET;
   if (!secret) {
     return NextResponse.json({ error: "Server misconfigured" }, { status: 500 });
   }
@@ -65,7 +65,7 @@ function base64urlDecode(input: string): Buffer {
 }
 
 /**
- * Verify an HS256 JWT signed with SUPABASE_JWT_SECRET.
+ * Verify an HS256 JWT signed with AUTH_SECRET.
  * Returns the `sub` (userId) on success; throws on failure.
  */
 function verifyAgentJWT(token: string, secret: string): string {

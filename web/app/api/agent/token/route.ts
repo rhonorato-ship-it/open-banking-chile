@@ -13,9 +13,9 @@ export async function POST() {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const secret = process.env.SUPABASE_JWT_SECRET;
+  const secret = process.env.AUTH_SECRET;
   if (!secret) {
-    console.error("[agent/token] SUPABASE_JWT_SECRET not set");
+    console.error("[agent/token] AUTH_SECRET not set");
     return NextResponse.json({ error: "Server misconfigured" }, { status: 500 });
   }
 
