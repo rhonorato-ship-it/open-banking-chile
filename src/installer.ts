@@ -17,12 +17,11 @@ import { execFileSync } from "node:child_process";
 const LABEL = "com.open-banking-chile.agent";
 const SERVICE_NAME = "open-banking-chile-agent";
 
-// Resolve the node executable and the CLI script from current process
+// Resolve the node executable and the CLI script from current process.
+// Use process.argv[1] (the running script) to find the package root — this
+// works in both ESM (import.meta.url unavailable in CJS builds) and CJS.
 const nodePath = process.execPath;
-const cliScript = path.resolve(
-  path.dirname(new URL(import.meta.url).pathname),
-  "cli.js",
-);
+const cliScript = path.resolve(path.dirname(process.argv[1]), "cli.js");
 
 // ─── macOS LaunchAgent ────────────────────────────────────────
 
