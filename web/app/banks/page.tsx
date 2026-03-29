@@ -145,6 +145,7 @@ function BankRow({
   const [rut, setRut] = useState("");
   const [password, setPassword] = useState("");
   const [saving, setSaving] = useState(false);
+  const [saveStep, setSaveStep] = useState<"idle" | "validating" | "saving">("idle");
   const [deleting, setDeleting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [error, setError] = useState("");
@@ -156,11 +157,36 @@ function BankRow({
   async function handleSave() {
     if (!rut || !password) { setError(`Completa ${label.toLowerCase()} y contraseña`); return; }
     if (validateRut && !isValidRut(rut)) { setError("RUT inválido — ej: 12345678-9"); return; }
-    setSaving(true);
-    setError("");
+
     const normalized = validateRut ? normalizeRut(rut)! : rut.trim();
+    setError("");
+
+    // Validate credentials before saving (API-mode banks only)
+    setSaveStep("validating");
+    setSaving(true);
+    try {
+      const vRes = await fetch("/api/banks/validate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ bankId: bank.id, rut: normalized, password }),
+      });
+      if (vRes.ok) {
+        const v = await vRes.json() as { canValidate: boolean; valid?: boolean; error?: string };
+        if (v.canValidate && v.valid === false) {
+          setSaving(false);
+          setSaveStep("idle");
+          setError(v.error ?? "Credenciales incorrectas");
+          return;
+        }
+      }
+    } catch {
+      // Validation network error — proceed to save anyway
+    }
+
+    setSaveStep("saving");
     const ok = await onSave(bank.id, normalized, password);
     setSaving(false);
+    setSaveStep("idle");
     if (ok) {
       setOpen(false);
       setRut("");
@@ -268,7 +294,7 @@ function BankRow({
               disabled={saving}
               className="flex-1 py-2 rounded-xl bg-teal-600 text-white text-xs font-bold hover:bg-teal-700 disabled:opacity-40 transition-colors"
             >
-              {saving ? "Guardando…" : "Guardar"}
+              {saveStep === "validating" ? "Verificando…" : saveStep === "saving" ? "Guardando…" : "Guardar"}
             </button>
             <button
               onClick={() => setOpen(false)}

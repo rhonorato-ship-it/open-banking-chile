@@ -55,11 +55,8 @@ async function fintualAuth(
     body: JSON.stringify({ user: { email, password } }),
   });
 
-  if (res.status === 401) {
+  if (res.status === 401 || res.status === 400) {
     return { error: "Credenciales incorrectas (email o contraseña inválida)." };
-  }
-  if (res.status === 422) {
-    return { error: "Faltan credenciales (email y contraseña son requeridos)." };
   }
   if (!res.ok) {
     return { error: `Error de autenticación (HTTP ${res.status}).` };
@@ -120,9 +117,10 @@ async function scrapeFintual(options: ScraperOptions, debugLog: string[]): Promi
   const dateStr = `${dd}-${mm}-${yyyy}`;
 
   // Each goal is a portfolio balance snapshot — one entry per goal per day.
+  // Skip goals with NAV = 0 (closed or unfunded goals produce zero-amount noise).
   // Use Math.round because NAV fluctuates intraday but CLP has no decimals.
   // Description includes goal ID so the dedup hash is stable across syncs.
-  const movements: BankMovement[] = goals.map((goal) => {
+  const movements: BankMovement[] = goals.filter((g) => Math.round(g.attributes.nav) !== 0).map((goal) => {
     const nav = Math.round(goal.attributes.nav);
     return {
       date: dateStr,
