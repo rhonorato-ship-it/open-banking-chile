@@ -22,6 +22,7 @@ export function delay(ms: number): Promise<void> {
 export function findChrome(customPath?: string): string | null {
   if (customPath && fs.existsSync(customPath)) return customPath;
 
+  const home = process.env.HOME ?? "";
   const candidates = [
     // Linux
     "/usr/bin/google-chrome-stable",
@@ -30,9 +31,12 @@ export function findChrome(customPath?: string): string | null {
     "/usr/bin/chromium",
     "/snap/bin/chromium",
     "/snap/bin/chromium-browser",
-    // macOS
+    // macOS — system-wide install
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    // macOS — per-user install (drag-and-drop / DMG into ~/Applications)
+    `${home}/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`,
+    `${home}/Applications/Chromium.app/Contents/MacOS/Chromium`,
     // Windows (WSL)
     "/mnt/c/Program Files/Google/Chrome/Application/chrome.exe",
     "/mnt/c/Program Files (x86)/Google/Chrome/Application/chrome.exe",

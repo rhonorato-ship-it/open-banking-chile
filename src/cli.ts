@@ -54,6 +54,19 @@ async function main() {
     return;
   }
 
+  // ── Install / uninstall as background daemon ──
+  if (args[0] === "install") {
+    const { installDaemon } = await import("./installer.js");
+    installDaemon();
+    return;
+  }
+
+  if (args[0] === "uninstall") {
+    const { uninstallDaemon } = await import("./installer.js");
+    uninstallDaemon();
+    return;
+  }
+
   if (flags.has("--help") || flags.has("-h")) {
     const bankList = listBanks()
       .map((b) => `  ${b.id.padEnd(15)} ${b.name}`)

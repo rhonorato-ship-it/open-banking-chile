@@ -253,25 +253,24 @@ export async function startAgent(
   const savedConfig = loadConfig();
   let resolvedToken = token || savedConfig?.token;
 
-  // Auto-auth: try browser-based flow first, fall back to manual paste
+  // Auto-auth: browser-based flow works with or without a TTY
   if (!resolvedToken) {
-    if (process.stdin.isTTY) {
-      resolvedToken = await browserAuth(resolvedWebUrl).catch(async (err) => {
-        if ((err as Error).message === "timeout") {
-          warn("Tiempo de espera agotado. Cambiando a autenticacion manual.");
-        } else {
-          warn(`No se pudo abrir el navegador: ${(err as Error).message}`);
-        }
+    resolvedToken = await browserAuth(resolvedWebUrl).catch(async (err) => {
+      if ((err as Error).message === "timeout") {
+        warn("Tiempo de espera agotado.");
+      } else {
+        warn(`No se pudo abrir el navegador: ${(err as Error).message}`);
+      }
+      // Fall back to manual paste only when there is an interactive terminal
+      if (process.stdin.isTTY) {
         return interactiveAuth(resolvedWebUrl);
-      });
-    } else {
+      }
       console.error(
-        "Error: No agent token provided.\n" +
-          "  Pass --token <token> or run interactively to authenticate.\n" +
-          `  Or open ${resolvedWebUrl}/agent to get a token.`,
+        "Error: No se pudo autenticar automaticamente.\n" +
+          `  Visita ${resolvedWebUrl}/agent y usa --token <token>.`,
       );
       process.exit(1);
-    }
+    });
   }
 
   // Persist token if it was passed via flag or interactive auth
