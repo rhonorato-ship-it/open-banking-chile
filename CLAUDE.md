@@ -15,19 +15,29 @@ If the request mentions an institution name, ID, or its scraper file -- delegate
 - `falabella`, `Falabella`, `falabella.ts` -> `bank-falabella`
 - `fintual`, `Fintual`, `fintual.ts` -> `bank-fintual`
 - `itau`, `Itau`, `itau.ts` -> `bank-itau`
-- `mach`, `MACH`, `mach.ts` -> `bank-mach` (no agent file yet -- use scraping-expert)
+- `mach`, `MACH`, `mach.ts` -> `bank-mach`
 - `mercadopago`, `MercadoPago`, `mercadopago.ts` -> `bank-mercadopago`
 - `racional`, `Racional`, `racional.ts` -> `bank-racional`
 - `santander`, `Santander`, `santander.ts` -> `bank-santander`
 - `scotiabank`, `Scotiabank`, `scotiabank.ts` -> `bank-scotiabank`
-- `tenpo`, `Tenpo`, `tenpo.ts` -> `bank-tenpo` (no agent file yet -- use scraping-expert)
+- `tenpo`, `Tenpo`, `tenpo.ts` -> `bank-tenpo`
 
 ### Cross-cutting concerns
 - Scraping technique, API patterns, auth flow, cookie jar, fetch, Playwright -> `scraping-expert`
 - Feature scope, user flows, dashboard, database schema -> `product-manager`
 - Quality assurance, testing, verification, regression -> `qa-engineer`
 - Documentation, repo structure, agent updates, AGENTS.md -> `repo-architect`
-- Local sync agent, agent auth, Supabase Realtime, sync_tasks -> `scraping-expert`
+- Local sync agent, agent auth, Supabase Realtime, sync_tasks -> `realtime-engineer`
+
+### Domain-specific concerns
+- Movement categories, transfer detection, amount normalization -> `movement-classifier`
+- Credential encryption, token management, security audit -> `security-auditor`
+- API endpoint design, SSE streaming, error responses -> `api-architect`
+- Dashboard UI, components, design system, accessibility -> `ux-designer`
+- Deduplication, hash stability, data migration -> `data-integrity`
+- Charts, analytics, aggregation, coach recommendations -> `analytics-engineer`
+- RUT, CLP, Chilean dates, bank quirks -> `financial-domain`
+- Sprint compliance, plan gate enforcement -> `plan-keeper`
 
 ---
 
