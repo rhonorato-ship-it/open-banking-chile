@@ -122,8 +122,11 @@ Or use the `/add-bank` command for a guided workflow.
 | `realtime-engineer` | SSE, Supabase Realtime, presence, sync |
 | `financial-domain` | RUT, CLP, dates, bank quirks |
 | `plan-keeper` | Sprint gate -- default BLOCKED, verifies scope + regression on prior work |
+| `roadmap-keeper` | Roadmap governance -- sole authority over ROADMAP.md, challenges off-roadmap work |
 
 **Post-iteration:** qa-engineer (default FAIL, adversarial audit), then repo-architect (docs). Both mandatory. Plan-keeper gates all sprint work (scope + regression).
+
+**Roadmap:** All work must trace to an R-number in `ROADMAP.md`. Roadmap-keeper is the sole modifier (enforced via hook). History in `ROADMAP_HISTORY.md`.
 
 **Skills:** `.claude/skills/` -- scraping (5), financial (5), security (3), infra (4), ux (2), conventions (2).
 

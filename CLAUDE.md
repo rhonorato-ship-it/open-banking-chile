@@ -38,6 +38,18 @@ If the request mentions an institution name, ID, or its scraper file -- delegate
 - Charts, analytics, aggregation, coach recommendations -> `analytics-engineer`
 - RUT, CLP, Chilean dates, bank quirks -> `financial-domain`
 - Sprint compliance, plan gate enforcement -> `plan-keeper`
+- Roadmap changes, off-roadmap work requests -> `roadmap-keeper`
+
+---
+
+## Roadmap governance (MANDATORY)
+
+All development must trace to an R-number in `ROADMAP.md`. Before starting any work:
+1. Check `ROADMAP.md` for the matching R-number
+2. If not found: delegate to `roadmap-keeper` to add it (requires user approval with risk assessment)
+3. If user says "overlook the roadmap": accept, but log exception in `ROADMAP_HISTORY.md`
+
+**ROADMAP.md is a controlled document.** Only `roadmap-keeper` may modify it (enforced via PreToolUse hook). The roadmap-keeper will challenge changes that conflict with existing work and require express confirmation.
 
 ---
 
