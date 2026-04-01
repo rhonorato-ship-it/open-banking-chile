@@ -111,7 +111,7 @@ Or use the `/add-bank` command for a guided workflow.
 | `bank-{id}` (x15) | Bank name, ID, or scraper mentioned |
 | `scraping-expert` | API patterns, auth flows, cookie jar, Playwright |
 | `product-manager` | Feature scope, UX, database schema |
-| `qa-engineer` | After code changes -- build, types, compliance |
+| `qa-engineer` | After code changes -- default FAIL, must prove PASS with evidence |
 | `repo-architect` | After major iterations -- docs, agent files |
 | `movement-classifier` | Category, transfer detection, normalization |
 | `security-auditor` | Auth, encryption, token changes |
@@ -121,9 +121,9 @@ Or use the `/add-bank` command for a guided workflow.
 | `analytics-engineer` | Charts, aggregation, coach rules |
 | `realtime-engineer` | SSE, Supabase Realtime, presence, sync |
 | `financial-domain` | RUT, CLP, dates, bank quirks |
-| `plan-keeper` | Sprint compliance gate |
+| `plan-keeper` | Sprint gate -- default BLOCKED, verifies scope + regression on prior work |
 
-**Post-iteration:** qa-engineer first (bugs), then repo-architect (docs). Mandatory.
+**Post-iteration:** qa-engineer (default FAIL, adversarial audit), then repo-architect (docs). Both mandatory. Plan-keeper gates all sprint work (scope + regression).
 
 **Skills:** `.claude/skills/` -- scraping (5), financial (5), security (3), infra (4), ux (2), conventions (2).
 

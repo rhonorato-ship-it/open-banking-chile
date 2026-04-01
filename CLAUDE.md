@@ -78,10 +78,10 @@ Every change to this project follows this lifecycle. Phases are NOT optional -- 
 - First sync must fetch at least 24 months of history
 - **Gate**: Code compiles. No `require()` in ESM. No top-level heavy imports.
 
-### Phase 4: QA (ALWAYS required)
-**Goal**: Verify the change works and doesn't break anything.
+### Phase 4: QA (ALWAYS required — `qa-engineer` agent is the gate)
+**Goal**: Prove the change works and doesn't break anything. Default: FAIL until proven PASS.
 
-#### 4a. Build checks (always, even for trivial changes)
+#### 4a. Build + types (always, even trivial changes)
 ```bash
 npm run build                        # Must succeed, bundle < 200KB
 cd web && npx tsc --noEmit           # Must succeed, 0 type errors
@@ -90,21 +90,21 @@ cd web && npx tsc --noEmit           # Must succeed, 0 type errors
 #### 4b. Functional checks (small+ changes)
 - Run the scraper with real credentials: `node dist/cli.js --bank {id} --pretty`
 - For web changes: test on localhost before deploying
-- For agent changes: test with `node dist/agent.js` or `npx open-banking-chile serve`
 
-#### 4c. Full QA audit (medium+ changes)
-- Delegate to `qa-engineer` agent for the full checklist:
-  1. Build verification
-  2. Diff review (no require(), no dead code, no hardcoded secrets)
-  3. AGENTS.md compliance (modes match code, endpoints match constants)
-  4. Dedup stability (hashes are deterministic across syncs)
-  5. Movement contract (amounts, dates, sources, balance)
-  6. Scrape route compatibility (API-mode runs on Vercel, browser-mode returns "use local agent")
-  7. 2FA flow (agentic Gmail search -> manual SSE -> UI input -> POST /api/2fa -> pending_2fa -> poll)
-  8. Agent flow (sync_tasks Realtime -> claim -> scrape -> upload -> done)
-  9. Bundle size (< 200KB)
+#### 4c. Full QA audit (medium+ changes — MANDATORY, no exceptions)
+- Delegate to `qa-engineer` agent. The QA agent runs ALL mandatory checks (see `qa-engineer.md`).
+- QA agent's default verdict is FAIL. Every check must be proven PASS with command output or file evidence.
+- **Blocking issues cannot be waived.** 3+ warnings on the same file escalate to a block.
+- QA agent enforces: `skills/conventions/coding-style.md`, `skills/conventions/performance.md`, `skills/infra/error-handling.md`, `skills/financial/movement-contract.md`, `skills/security/credential-encryption.md`
 
-- **Gate**: ALL checks pass. Do NOT proceed to Phase 5 with failing checks.
+- **Gate**: QA agent verdict is APPROVED. Any BLOCKED issue = stop. Fix before proceeding.
+
+### Phase 4d: Plan-keeper gate (for planned/sprint work)
+- If work was part of a plan, delegate to `plan-keeper` agent.
+- Plan-keeper verifies: (1) scope matches plan, (2) deliverables match specs, (3) no regressions on previous sprints.
+- Plan-keeper's default verdict is BLOCKED. Must prove scope compliance AND regression-free.
+- Unplanned changes require explicit user approval before plan-keeper will pass.
+- **Gate**: Plan-keeper verdict is APPROVED. Both QA and plan-keeper must pass.
 
 ### Phase 5: Codification (medium+ changes)
 **Goal**: Update all documentation to match the code.
@@ -125,13 +125,14 @@ cd web && npx tsc --noEmit           # Must succeed, 0 type errors
 - For local agent syncs: sync should complete in < 120 seconds
 
 ### SDLC violations to watch for
-These are the most common shortcuts that cause regressions:
-- Committing without deploying -> user sees stale production
-- Deploying without running QA -> broken production
-- Updating code without updating AGENTS.md -> stale API patterns
-- Adding a new bank without updating bank agent file -> agent gives wrong advice
-- Skipping the design phase -> wrong scraping pattern chosen
-- Not testing with real credentials -> auth flow bugs only caught in production
-- Top-level imports of heavy modules -> 45s cold starts on Vercel
-- Not capturing balance -> dashboard shows stale/missing balance data
-- Not fetching 24 months on first sync -> user sees incomplete history
+- Committing without deploying -> stale production
+- Deploying without QA -> broken production
+- Code changes without AGENTS.md update -> stale docs
+- New bank without agent file -> agent gives wrong advice
+- Skipping design phase -> wrong scraping pattern
+- Top-level heavy imports -> 45s cold starts on Vercel
+- Missing balance in scraper -> dashboard shows stale data
+- Not fetching 24 months on first sync -> incomplete history
+- QA agent accepting "SKIP" on mandatory checks -> quality erosion
+- Plan-keeper not checking previous sprint regression -> silent breakage
+- Unplanned scope changes without user approval -> scope creep
