@@ -1,9 +1,19 @@
 #!/usr/bin/env node
 import { config } from "dotenv";
+import { createInterface } from "readline";
 import { banks, listBanks, getBank } from "./index.js";
 import { Spinner, defaultChromeProfilePath } from "./utils.js";
 import type { BankMovement } from "./types.js";
 config();
+
+// ─── 2FA prompt for TTY ──────────────────────────────────────
+
+function promptTTY(question: string): Promise<string> {
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  return new Promise((resolve) => {
+    rl.question(question, (answer) => { rl.close(); resolve(answer.trim()); });
+  });
+}
 
 // ─── Date helpers ─────────────────────────────────────────────
 
@@ -213,6 +223,7 @@ Ejemplos:
         ...(owner && { owner }),
         ...(userDataDir && { userDataDir }),
         onProgress: isTTY ? (step) => spinner.update(`${bank.name}: ${step}`) : undefined,
+        onTwoFactorCode: isTTY ? async () => { spinner.stop("⏳ 2FA requerido"); return promptTTY("Ingresa el codigo 2FA: "); } : undefined,
       });
 
       if (!result.success) {
@@ -318,6 +329,7 @@ Ejemplos:
     ...(owner && { owner }),
     ...(userDataDir && { userDataDir }),
     onProgress: isTTY ? (step) => spinner.update(step) : undefined,
+    onTwoFactorCode: isTTY ? async () => { spinner.stop("⏳ 2FA requerido"); return promptTTY("Ingresa el codigo 2FA: "); } : undefined,
   });
 
   if (!result.success) {
